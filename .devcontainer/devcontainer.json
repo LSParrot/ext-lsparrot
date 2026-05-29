@@ -1,0 +1,22 @@
+{
+  "name": "LSParrot",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "maelvalais.autoconf",
+        "ms-azuretools.vscode-docker",
+        "editorconfig.editorconfig",
+        "markis.code-coverage",
+        "openai.chatgpt",
+        "Anthropic.claude-code"
+      ]
+    }
+  },
+  "dockerComposeFile": "./../compose.yaml",
+  "service": "shell",
+  "workspaceFolder": "/workspace",
+  "initializeCommand": "git submodule update --init --recursive",
+  "postCreateCommand": "ln -sf \"$(pwd)/pskel.sh\" /usr/local/bin/pskel"
+}
