@@ -1,0 +1,14 @@
+{
+  "name": "zeriyoshi/analyze_test_fixture",
+  "autoload": {
+    "psr-4": {
+      "Zeriyoshi\\AnalyzeTest\\": "src/"
+    },
+    "psr-0": {
+      "Legacy_AnalyzeTest_": "legacy/"
+    },
+    "classmap": [
+      "src/Fixture/ClassMappedFixture.php"
+    ]
+  }
+}

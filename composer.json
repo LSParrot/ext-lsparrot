@@ -1,0 +1,47 @@
+{
+    "name": "lsparrot/ext-lsparrot",
+    "type": "php-ext",
+    "license": "0BSD",
+    "description": "PHP extension for LSParrot LSP support",
+    "require": {
+        "php": "~8.1.0 || ~8.2.0 || ~8.3.0 || ~8.4.1 || ~8.5.0"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.2",
+        "vimeo/psalm": "^6.16",
+        "symfony/console": "^6.4 || ^7.4",
+        "symfony/filesystem": "^6.4 || ^7.4",
+        "symfony/string": "^6.4 || ^7.4",
+        "sebastian/diff": "^5.1 || ^6.0"
+    },
+    "php-ext": {
+        "extension-name": "lsparrot",
+        "configure-options": [
+            {
+                "name": "enable-lsparrot",
+                "needs-value": false,
+                "description": "whether to enable lsparrot support"
+            }
+        ],
+        "build-path": "ext",
+        "download-url-method": [
+            "pre-packaged-binary",
+            "pre-packaged-source",
+            "composer-default"
+        ]
+    },
+    "autoload": {
+      "psr-4": {
+        "Zeriyoshi\\AnalyzeTest\\": "example/src/"
+      },
+      "psr-0": {
+        "Legacy_AnalyzeTest_": "example/legacy/"
+      }
+    },
+    "config": {
+      "bin-dir": "vendor_extra/bin_extra",
+      "platform": {
+        "php": "8.1.34"
+      }
+    }
+}

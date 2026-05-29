@@ -1,0 +1,353 @@
+name: Release PHP Extension
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  CreateDraftRelease:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ github.ref }}
+      - name: Validate release tag
+        env:
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s\n' "${CURRENT_TAG}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release tag must be a numeric version tag without a v prefix." >&2
+            exit 1
+          fi
+      - name: Generate release notes
+        env:
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          TAGS_FILE="${RUNNER_TEMP}/release-tags.txt"
+          PREVIOUS_TAG=""
+          LAST_TAG=""
+
+          git tag --list "[0-9]*.[0-9]*.[0-9]*" --sort=v:refname |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' > "${TAGS_FILE}" || true
+
+          while IFS= read -r TAG; do
+            if test "${TAG}" = "${CURRENT_TAG}"; then
+              PREVIOUS_TAG="${LAST_TAG}"
+              break
+            fi
+            LAST_TAG="${TAG}"
+          done < "${TAGS_FILE}"
+
+          rm -f "${TAGS_FILE}"
+
+          if test -n "${PREVIOUS_TAG}"; then
+            RANGE="${PREVIOUS_TAG}..${CURRENT_TAG}"
+            CHANGES="$(git log "${RANGE}" --pretty=format:'- %s (%h)' || true)"
+            DIFFSTAT="$(git diff --stat "${RANGE}" || true)"
+          else
+            RANGE="${CURRENT_TAG}"
+            CHANGES="$(git log "${CURRENT_TAG}" --pretty=format:'- %s (%h)' || true)"
+            DIFFSTAT="$(git show --stat --format= "${CURRENT_TAG}" || true)"
+          fi
+
+          {
+            echo "## Changes"
+            echo
+            if test -n "${PREVIOUS_TAG}"; then
+              echo "Changes since ${PREVIOUS_TAG}:"
+              echo
+              echo "Compare: https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+            else
+              echo "Changes included in this release:"
+            fi
+            echo
+            if test -n "${CHANGES}"; then
+              printf '%s\n' "${CHANGES}"
+            else
+              echo "- No commit changes found."
+            fi
+            echo
+            echo "## Diffstat"
+            echo
+            if test -n "${DIFFSTAT}"; then
+              echo '```'
+              printf '%s\n' "${DIFFSTAT}"
+              echo '```'
+            else
+              echo "No file changes found."
+            fi
+          } > release-notes.md
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release edit "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" \
+              --notes-file release-notes.md \
+              --draft=true
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" \
+              --notes-file release-notes.md \
+              --draft \
+              --verify-tag
+          fi
+  UpdateVersionOnMain:
+    name: Update extension version on main
+    needs: CreateDraftRelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Set extension version
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          git pull --ff-only origin main
+          perl -0pi -e 's/# define PHP_LSPARROT_VERSION "[^"]*"/# define PHP_LSPARROT_VERSION "$ENV{RELEASE_VERSION}"/g' ext/php_lsparrot.h
+          grep -F "# define PHP_LSPARROT_VERSION \"${RELEASE_VERSION}\"" ext/php_lsparrot.h
+      - name: Commit and push extension version
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          if git diff --quiet -- ext/php_lsparrot.h; then
+            echo "PHP_LSPARROT_VERSION is already ${RELEASE_VERSION} on main."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ext/php_lsparrot.h
+          git commit -m "chore: release ${RELEASE_VERSION}"
+          git push origin HEAD:main
+  AddPieBinaries:
+    name: Add PIE binaries (${{ matrix.operating-system }}, PHP ${{ matrix.php-version }}, ${{ matrix.zts-mode }})
+    needs:
+      - CreateDraftRelease
+      - UpdateVersionOnMain
+    runs-on: ${{ matrix.operating-system }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        operating-system:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15
+          - macos-15-intel
+        php-version:
+          - "8.2"
+          - "8.3"
+          - "8.4"
+          - "8.5"
+        zts-mode:
+          - nts
+          - ts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup PHP
+        uses: shivammathur/setup-php@7c071dfe9dc99bdf297fa79cb49ea005b9fcadbc # 2.37.1
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: none
+          tools: composer:v2
+        env:
+          phpts: ${{ matrix.zts-mode }}
+      - name: Set extension version
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          perl -0pi -e 's/# define PHP_LSPARROT_VERSION "[^"]*"/# define PHP_LSPARROT_VERSION "$ENV{RELEASE_VERSION}"/g' ext/php_lsparrot.h
+          grep -F "# define PHP_LSPARROT_VERSION \"${RELEASE_VERSION}\"" ext/php_lsparrot.h
+      - name: Build and upload PIE binary
+        id: pie-builder
+        uses: php/pie-ext-binary-builder@5298761950f63c7e9565ed7004e922b346e4386c # 0.0.3
+        with:
+          release-tag: ${{ github.ref_name }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          configure-flags: "--enable-lsparrot"
+          build-path: "ext"
+      - name: Upload PIE binary workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pie-${{ matrix.operating-system }}-php-${{ matrix.php-version }}-${{ matrix.zts-mode }}
+          path: ${{ steps.pie-builder.outputs.package-path }}
+          if-no-files-found: error
+          retention-days: 1
+  GetWindowsExtensionMatrix:
+    name: Get Windows extension matrix
+    needs: CreateDraftRelease
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.extension-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Get extension matrix
+        id: extension-matrix
+        uses: php/php-windows-builder/extension-matrix@e03e5d39879adaeb61ed2225f0f4eae7db8c1df8 # 1.8.1
+        with:
+          php-version-list: "8.2,8.3,8.4,8.5"
+  BuildWindows:
+    name: Build Windows binary (${{ matrix.php-version }}, ${{ matrix.arch }}, ${{ matrix.ts }})
+    needs:
+      - GetWindowsExtensionMatrix
+      - UpdateVersionOnMain
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.GetWindowsExtensionMatrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Set extension version
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          $path = "ext\php_lsparrot.h"
+          $content = [System.IO.File]::ReadAllText($path)
+          $content = [System.Text.RegularExpressions.Regex]::Replace($content, '# define PHP_LSPARROT_VERSION "[^"]*"', "# define PHP_LSPARROT_VERSION `"$env:RELEASE_VERSION`"")
+          [System.IO.File]::WriteAllText($path, $content)
+          Select-String -Path $path -SimpleMatch "# define PHP_LSPARROT_VERSION `"$env:RELEASE_VERSION`""
+      - name: Stage extension source for Windows builder
+        shell: pwsh
+        run: |
+          Copy-Item -Path ext\* -Destination . -Recurse -Force
+      - name: Build extension
+        uses: php/php-windows-builder/extension@e03e5d39879adaeb61ed2225f0f4eae7db8c1df8 # 1.8.1
+        with:
+          php-version: ${{ matrix.php-version }}
+          arch: ${{ matrix.arch }}
+          ts: ${{ matrix.ts }}
+          args: "--enable-lsparrot"
+  ReleaseWindows:
+    name: Upload Windows binaries to release
+    needs: BuildWindows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Upload Windows artifacts to release
+        uses: php/php-windows-builder/release@e03e5d39879adaeb61ed2225f0f4eae7db8c1df8 # 1.8.1
+        with:
+          release: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+  PublishRelease:
+    name: Publish release
+    needs:
+      - AddPieBinaries
+      - ReleaseWindows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release edit "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false
+  PublishPackagist:
+    name: Register or update Packagist
+    needs: PublishRelease
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Register or update package
+        env:
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          if test -z "${PACKAGIST_TOKEN}"; then
+            echo "PACKAGIST_TOKEN is not configured." >&2
+            exit 1
+          fi
+
+          PACKAGE_NAME="$(jq -r '.name // empty' composer.json)"
+          if test -z "${PACKAGE_NAME}"; then
+            echo "composer.json does not define a package name." >&2
+            exit 1
+          fi
+
+          REPOSITORY_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          BODY="$(jq -nc --arg repository "${REPOSITORY_URL}" '{repository: $repository}')"
+          USER_AGENT="LSParrot GitHub Actions (${GITHUB_REPOSITORY})"
+          PACKAGE_STATUS="$(curl -sS \
+            -o /dev/null \
+            -w '%{http_code}' \
+            -A "${USER_AGENT}" \
+            "https://packagist.org/packages/${PACKAGE_NAME}.json" || true)"
+
+          if test "${PACKAGE_STATUS}" = "200"; then
+            ENDPOINT="https://packagist.org/api/update-package"
+          elif test "${PACKAGE_STATUS}" = "404"; then
+            ENDPOINT="https://packagist.org/api/create-package"
+          else
+            echo "Packagist package lookup returned HTTP ${PACKAGE_STATUS}." >&2
+            exit 1
+          fi
+
+          RESPONSE_FILE="${RUNNER_TEMP}/packagist-response.json"
+          HTTP_STATUS="$(curl -sS -o "${RESPONSE_FILE}" -w '%{http_code}' \
+            -A "${USER_AGENT}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${PACKAGIST_TOKEN}" \
+            "${ENDPOINT}" \
+            -d "${BODY}")"
+
+          if test "${HTTP_STATUS}" -ge 200 && test "${HTTP_STATUS}" -lt 300; then
+            cat "${RESPONSE_FILE}"
+            exit 0
+          fi
+
+          if test "${ENDPOINT}" = "https://packagist.org/api/create-package"; then
+            echo "Packagist create-package returned HTTP ${HTTP_STATUS}; trying update-package." >&2
+            cat "${RESPONSE_FILE}" >&2
+            curl --fail-with-body -sS \
+              -A "${USER_AGENT}" \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${PACKAGIST_TOKEN}" \
+              "https://packagist.org/api/update-package" \
+              -d "${BODY}"
+            exit 0
+          fi
+
+          echo "Packagist update-package returned HTTP ${HTTP_STATUS}." >&2
+          cat "${RESPONSE_FILE}" >&2
+          exit 1
