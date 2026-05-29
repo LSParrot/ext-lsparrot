@@ -1,0 +1,12 @@
+PHP_ARG_ENABLE([lsparrot],
+  [whether to enable lsparrot support],
+  [AS_HELP_STRING([--enable-lsparrot],
+    [Enable lsparrot support])],
+  [no])
+
+if test "$PHP_LSPARROT" != "no"; then
+  PHP_NEW_EXTENSION([lsparrot],
+    [php_lsparrot.c lsp_abstraction.c lsp_server.c lsp_server_core.c lsp_server_process.c lsp_server_symbols.c lsp_server_phpdoc.c lsp_server_phpdoc_members.c lsp_server_project_symbols.c lsp_server_inference.c lsp_server_feature_utils.c lsp_server_member_cache.c lsp_server_override.c lsp_server_completion.c lsp_server_hover.c lsp_server_definition.c lsp_server_signature.c lsp_server_refactor.c lsp_server_code_actions.c lsp_server_semantic_tokens.c lsp_server_runner.c lsp_server_documents.c lsp_server_analyzer_config.c lsp_server_analyzers.c lsp_server_phpstan.c lsp_server_psalm.c lsp_server_psalm_ls.c lsp_server_index.c lsp_server_protocol.c],
+    [$ext_shared],,
+    [-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1])
+fi

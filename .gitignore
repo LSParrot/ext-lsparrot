@@ -1,0 +1,11 @@
+/ext/*.dep
+/ext/*~
+/vscode/
+/vendor/
+/vendor_extra/
+**/.lsparrot/
+*.DS_Store
+lcov.info
+AGENTS.md
+CLAUDE.md
+composer.lock

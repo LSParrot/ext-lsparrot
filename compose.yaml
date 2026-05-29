@@ -1,0 +1,17 @@
+services:
+  shell:
+    image: ${SHELL_IMAGE:-shell}
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    # for debugging (gdb, strace, etc.)
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    privileged: true
+    environment:
+      CONFIGURE_OPTS: "${CONFIGURE_OPTS:-} --enable-ftp"
+    volumes:
+      - .:/workspace:cached
+    tty: true
