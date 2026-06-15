@@ -490,6 +490,81 @@ static inline void lsp_add_reflection_method_completions(lsp_server *server, zva
 	zend_string_release(member_prefix);
 }
 
+static inline zend_class_entry *lsp_lookup_runtime_class(zend_string *class_name)
+{
+	zend_class_entry *ce;
+	zend_string *lookup_name;
+
+	if (ZSTR_LEN(class_name) == 0) {
+		return NULL;
+	}
+
+	if (ZSTR_VAL(class_name)[0] == '\\') {
+		if (ZSTR_LEN(class_name) == 1) {
+			return NULL;
+		}
+		lookup_name = zend_string_init(ZSTR_VAL(class_name) + 1, ZSTR_LEN(class_name) - 1, 0);
+	} else {
+		lookup_name = zend_string_copy(class_name);
+	}
+
+	ce = zend_lookup_class(lookup_name);
+	zend_string_release(lookup_name);
+
+	return ce;
+}
+
+static inline void lsp_add_reflection_class_method_completions(lsp_server *server, zval *items, zend_class_entry *ce, zend_string *member_prefix, bool public_only, bool static_only, bool include_constructor)
+{
+	const char *source = lsp_primary_analyzer_source(server);
+	zend_function *function;
+	zend_string *method_name, *label, *detail;
+	uint32_t flags;
+
+	ZEND_HASH_FOREACH_STR_KEY_PTR(&ce->function_table, method_name, function) {
+		if (!function) {
+			continue;
+		}
+
+		flags = function->common.fn_flags;
+		if ((flags & ZEND_ACC_PRIVATE) != 0 ||
+			(public_only && (flags & ZEND_ACC_PUBLIC) == 0) ||
+			(static_only && (flags & ZEND_ACC_STATIC) == 0)
+		) {
+			continue;
+		}
+
+		label = function->common.function_name ? function->common.function_name : method_name;
+		if (!label) {
+			continue;
+		}
+
+		if (!include_constructor && zend_string_equals_literal(label, "__construct")) {
+			continue;
+		}
+
+		if (!lsp_matches_prefix_string(label, member_prefix)) {
+			continue;
+		}
+
+		detail = strpprintf(0, "%s(...)", ZSTR_VAL(label));
+		lsp_add_completion_item_ex(items, label, 2, detail, source);
+		zend_string_release(detail);
+	} ZEND_HASH_FOREACH_END();
+}
+
+extern void lsp_add_parent_reflection_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix)
+{
+	zend_class_entry *ce;
+
+	ce = lsp_lookup_runtime_class(class_name);
+	if (!ce || ce->type != ZEND_INTERNAL_CLASS) {
+		return;
+	}
+
+	lsp_add_reflection_class_method_completions(server, items, ce, member_prefix, false, false, true);
+}
+
 extern void lsp_add_inherited_public_project_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix)
 {
 	zend_string *current, *next;

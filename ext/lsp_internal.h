@@ -772,6 +772,7 @@ void lsp_add_inherited_project_class_member_completions(lsp_server *server, zval
 void lsp_add_inherited_public_project_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
 void lsp_add_static_project_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
 void lsp_add_inherited_static_project_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
+void lsp_add_parent_reflection_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
 void lsp_add_current_class_phpdoc_member_completions(lsp_server *server, zval *items, lsp_document *document, size_t class_start, zend_string *member_prefix, bool static_access);
 void lsp_add_current_static_member_completions(zval *items, lsp_document *document, size_t body_start, size_t body_end, zend_long body_depth, zend_string *member_prefix);
 void lsp_add_inferred_member_completions(lsp_server *server, zval *items, lsp_document *document, size_t offset, zend_string *prefix);

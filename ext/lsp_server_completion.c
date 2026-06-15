@@ -169,6 +169,7 @@ static inline bool lsp_add_static_member_completions(lsp_server *server, zval *i
 
 	if (parent_class_access) {
 		lsp_add_inherited_static_project_class_member_completions(server, items, class_name, member_prefix);
+		lsp_add_parent_reflection_class_member_completions(server, items, class_name, member_prefix);
 	} else {
 		lsp_add_static_project_class_member_completions(server, items, class_name, member_prefix);
 	}

@@ -2092,6 +2092,746 @@ static inline zend_string *lsp_resolve_array_access_expression_class(lsp_server 
 	return class_name;
 }
 
+static inline bool lsp_inference_modifier_at(const char *value, size_t start, size_t end, const char *modifier, size_t *next)
+{
+	size_t length;
+
+	length = strlen(modifier);
+	if (start + length > end || strncasecmp(value + start, modifier, length) != 0) {
+		return false;
+	}
+
+	if (start + length < end && lsp_doc_is_identifier_char(value[start + length])) {
+		return false;
+	}
+
+	*next = start + length;
+
+	return true;
+}
+
+static inline zend_string *lsp_inference_property_type_before_variable_fallback(zend_string *text, size_t variable_offset)
+{
+	const char *modifiers[7] = {"public", "protected", "private", "readonly", "static", "final", "var"}, *value = ZSTR_VAL(text);
+	size_t declaration_start, type_start, type_end, modifier_index, next, scan;
+	bool stripped;
+
+	if (variable_offset > ZSTR_LEN(text)) {
+		return NULL;
+	}
+
+	declaration_start = variable_offset;
+	while (declaration_start > 0 &&
+		value[declaration_start - 1] != ';' &&
+		value[declaration_start - 1] != '{' &&
+		value[declaration_start - 1] != '}'
+	) {
+		declaration_start--;
+	}
+
+	type_start = declaration_start;
+	type_end = variable_offset;
+	while (type_start < type_end && isspace((unsigned char) value[type_start])) {
+		type_start++;
+	}
+
+	while (type_end > type_start && isspace((unsigned char) value[type_end - 1])) {
+		type_end--;
+	}
+
+	for (scan = type_start; scan + 1 < type_end; scan++) {
+		if (value[scan] == '*' && value[scan + 1] == '/') {
+			type_start = scan + 2;
+		}
+	}
+
+	while (type_start < type_end && isspace((unsigned char) value[type_start])) {
+		type_start++;
+	}
+
+	do {
+		stripped = false;
+		for (modifier_index = 0; modifier_index < sizeof(modifiers) / sizeof(modifiers[0]); modifier_index++) {
+			if (!lsp_inference_modifier_at(value, type_start, type_end, modifiers[modifier_index], &next)) {
+				continue;
+			}
+
+			type_start = next;
+			while (type_start < type_end && isspace((unsigned char) value[type_start])) {
+				type_start++;
+			}
+
+			stripped = true;
+			break;
+		}
+	} while (stripped);
+
+	if (type_end <= type_start || (type_end - type_start == 1 && value[type_start] == '?')) {
+		return NULL;
+	}
+
+	return zend_string_init(value + type_start, type_end - type_start, 0);
+}
+
+static inline void lsp_inference_append_ast_name(smart_str *buffer, zend_ast *ast)
+{
+	zend_string *name;
+
+	name = lsp_ast_string_value(ast);
+	if (!name) {
+		return;
+	}
+
+	if (ast->attr == ZEND_NAME_FQ) {
+		smart_str_appendc(buffer, '\\');
+	} else if (ast->attr == ZEND_NAME_RELATIVE) {
+		smart_str_appends(buffer, "namespace\\");
+	}
+
+	smart_str_append(buffer, name);
+}
+
+static inline void lsp_inference_append_ast_type(smart_str *buffer, zend_ast *type_ast)
+{
+	zend_ast_list *list;
+	uint32_t i;
+	char separator;
+	bool parenthesize;
+
+	if (!type_ast) {
+		return;
+	}
+
+	if (type_ast->kind == ZEND_AST_TYPE_UNION || type_ast->kind == ZEND_AST_TYPE_INTERSECTION) {
+		list = zend_ast_get_list(type_ast);
+		separator = type_ast->kind == ZEND_AST_TYPE_UNION ? '|' : '&';
+		for (i = 0; i < list->children; i++) {
+			if (i > 0) {
+				smart_str_appendc(buffer, separator);
+			}
+
+			parenthesize = type_ast->kind == ZEND_AST_TYPE_UNION &&
+				list->child[i] &&
+				list->child[i]->kind == ZEND_AST_TYPE_INTERSECTION
+			;
+			if (parenthesize) {
+				smart_str_appendc(buffer, '(');
+			}
+
+			lsp_inference_append_ast_type(buffer, list->child[i]);
+
+			if (parenthesize) {
+				smart_str_appendc(buffer, ')');
+			}
+		}
+
+		return;
+	}
+
+	if ((type_ast->attr & ZEND_TYPE_NULLABLE) != 0) {
+		smart_str_appendc(buffer, '?');
+	}
+
+	if (type_ast->kind == ZEND_AST_TYPE) {
+		switch (type_ast->attr & ~ZEND_TYPE_NULLABLE) {
+			case IS_ARRAY:
+				smart_str_appends(buffer, "array");
+				return;
+			case IS_CALLABLE:
+				smart_str_appends(buffer, "callable");
+				return;
+			case IS_STATIC:
+				smart_str_appends(buffer, "static");
+				return;
+			case IS_MIXED:
+				smart_str_appends(buffer, "mixed");
+				return;
+			default:
+				return;
+		}
+	}
+
+	lsp_inference_append_ast_name(buffer, type_ast);
+}
+
+static inline zend_string *lsp_inference_ast_type_string(zend_ast *type_ast)
+{
+	smart_str buffer = {0};
+
+	if (!type_ast) {
+		return NULL;
+	}
+
+	lsp_inference_append_ast_type(&buffer, type_ast);
+	smart_str_0(&buffer);
+
+	if (!buffer.s || ZSTR_LEN(buffer.s) == 0) {
+		if (buffer.s) {
+			zend_string_release(buffer.s);
+		}
+
+		return NULL;
+	}
+
+	return buffer.s;
+}
+
+static inline bool lsp_inference_ast_property_name_matches(zend_ast *property_ast, zend_string *property_name)
+{
+	zend_string *name;
+
+	if (!property_ast || property_ast->kind != ZEND_AST_PROP_ELEM) {
+		return false;
+	}
+
+	name = lsp_ast_string_value(property_ast->child[0]);
+	if (!name) {
+		return false;
+	}
+
+	return ZSTR_LEN(name) == ZSTR_LEN(property_name) &&
+		strncmp(ZSTR_VAL(name), ZSTR_VAL(property_name), ZSTR_LEN(name)) == 0
+	;
+}
+
+static inline zend_string *lsp_resolve_ast_property_group_declared_class(zend_string *contents, zend_ast *prop_group, zend_string *property_name)
+{
+	zend_ast_list *properties;
+	zend_ast *type_ast, *property_ast;
+	zend_string *type, *class_name;
+	uint32_t i;
+
+	if (!prop_group || prop_group->kind != ZEND_AST_PROP_GROUP || !prop_group->child[1] || !zend_ast_is_list(prop_group->child[1])) {
+		return NULL;
+	}
+
+	type_ast = prop_group->child[0];
+	if (!type_ast) {
+		return NULL;
+	}
+
+	properties = zend_ast_get_list(prop_group->child[1]);
+	for (i = 0; i < properties->children; i++) {
+		property_ast = properties->child[i];
+		if (!lsp_inference_ast_property_name_matches(property_ast, property_name)) {
+			continue;
+		}
+
+		type = lsp_inference_ast_type_string(type_ast);
+		if (!type) {
+			return NULL;
+		}
+
+		class_name = lsp_resolve_class_name(contents, type);
+		zend_string_release(type);
+
+		return class_name;
+	}
+
+	return NULL;
+}
+
+static inline zend_string *lsp_resolve_ast_declared_class_name(zend_string *contents, zend_string *raw_name)
+{
+	zend_string *namespace_name, *declared;
+
+	namespace_name = lsp_document_namespace(contents);
+	if (namespace_name != zend_empty_string) {
+		declared = strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(raw_name));
+		zend_string_release(namespace_name);
+
+		return declared;
+	}
+
+	return zend_string_copy(raw_name);
+}
+
+static inline zend_string *lsp_resolve_ast_class_property_declared_class(zend_string *contents, zend_ast *class_ast, zend_string *receiver_class, zend_string *property_name)
+{
+	zend_ast_decl *decl;
+	zend_ast_list *statements;
+	zend_ast *statement;
+	zend_string *raw_name, *declared, *class_name;
+	uint32_t i;
+
+	if (!class_ast || class_ast->kind != ZEND_AST_CLASS) {
+		return NULL;
+	}
+
+	decl = (zend_ast_decl *) class_ast;
+	raw_name = decl->name ? zend_string_copy(decl->name) : NULL;
+	if (!raw_name) {
+		return NULL;
+	}
+
+	declared = lsp_resolve_ast_declared_class_name(contents, raw_name);
+	zend_string_release(raw_name);
+	if (ZSTR_LEN(declared) != ZSTR_LEN(receiver_class) ||
+		strncasecmp(ZSTR_VAL(declared), ZSTR_VAL(receiver_class), ZSTR_LEN(declared)) != 0
+	) {
+		zend_string_release(declared);
+
+		return NULL;
+	}
+
+	zend_string_release(declared);
+	if (!decl->child[2] || !zend_ast_is_list(decl->child[2])) {
+		return NULL;
+	}
+
+	statements = zend_ast_get_list(decl->child[2]);
+	for (i = 0; i < statements->children; i++) {
+		statement = statements->child[i];
+		if (!statement || statement->kind != ZEND_AST_PROP_GROUP) {
+			continue;
+		}
+
+		class_name = lsp_resolve_ast_property_group_declared_class(contents, statement, property_name);
+		if (class_name) {
+			return class_name;
+		}
+	}
+
+	return NULL;
+}
+
+static inline zend_string *lsp_resolve_property_declared_class_in_ast(zend_string *contents, zend_ast *ast, zend_string *receiver_class, zend_string *property_name)
+{
+	zend_ast_list *list;
+	zend_string *class_name;
+	uint32_t i, count;
+
+	if (!ast) {
+		return NULL;
+	}
+
+	class_name = lsp_resolve_ast_class_property_declared_class(contents, ast, receiver_class, property_name);
+	if (class_name) {
+		return class_name;
+	}
+
+	if (zend_ast_is_list(ast)) {
+		list = zend_ast_get_list(ast);
+		for (i = 0; i < list->children; i++) {
+			class_name = lsp_resolve_property_declared_class_in_ast(contents, list->child[i], receiver_class, property_name);
+			if (class_name) {
+				return class_name;
+			}
+		}
+
+		return NULL;
+	}
+
+	if (zend_ast_is_special(ast) || php_ver_abstract.ast_is_opaque_node(ast->kind)) {
+		return NULL;
+	}
+
+	count = zend_ast_get_num_children(ast);
+	for (i = 0; i < count; i++) {
+		class_name = lsp_resolve_property_declared_class_in_ast(contents, ast->child[i], receiver_class, property_name);
+		if (class_name) {
+			return class_name;
+		}
+	}
+
+	return NULL;
+}
+
+static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_string *contents, zend_string *receiver_class, zend_string *property_name)
+{
+	zend_long body_depth = 0;
+	zend_string *variable, *type, *class_name;
+	zval tokens_zv, *token;
+	HashTable *tokens;
+	uint32_t i, count;
+	size_t class_start = 0, body_start = 0, body_end = 0, token_offset;
+	bool property_matches;
+
+	ZVAL_UNDEF(&tokens_zv);
+	if (!lsp_find_class_header_for_name(contents, receiver_class, &class_start, &body_start, &body_end, &body_depth)) {
+		return NULL;
+	}
+
+	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
+		return NULL;
+	}
+
+	tokens = Z_ARRVAL(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token ||
+			Z_TYPE_P(token) != IS_ARRAY ||
+			!lsp_token_in_bounds(token, body_start, body_end) ||
+			!lsp_token_at_depth(contents, token, body_depth) ||
+			!lsp_token_name_equals(token, "T_VARIABLE") ||
+			!lsp_token_is_property_declaration(tokens, i, contents, body_depth)
+		) {
+			continue;
+		}
+
+		variable = lsp_token_string(token, "text");
+		property_matches = variable &&
+			ZSTR_LEN(variable) == ZSTR_LEN(property_name) + 1 &&
+			ZSTR_VAL(variable)[0] == '$' &&
+			strncmp(ZSTR_VAL(variable) + 1, ZSTR_VAL(property_name), ZSTR_LEN(property_name)) == 0
+		;
+		if (!property_matches) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		type = lsp_inference_property_type_before_variable_fallback(contents, token_offset);
+		if (!type) {
+			zval_ptr_dtor(&tokens_zv);
+
+			return NULL;
+		}
+
+		class_name = lsp_resolve_class_name(contents, type);
+		zend_string_release(type);
+		zval_ptr_dtor(&tokens_zv);
+
+		return class_name;
+	}
+
+	zval_ptr_dtor(&tokens_zv);
+
+	return NULL;
+}
+
+static inline zend_string *lsp_resolve_property_declared_class_in_text(zend_string *contents, zend_string *receiver_class, zend_string *property_name)
+{
+	zend_arena *ast_arena;
+	zend_ast *ast;
+	zend_string *class_name;
+
+	ast = lsp_compile_string_to_ast_silent(contents, ZSTR_EMPTY_ALLOC(), &ast_arena);
+	if (ast) {
+		class_name = lsp_resolve_property_declared_class_in_ast(contents, ast, receiver_class, property_name);
+		lsp_compiled_ast_destroy(ast, ast_arena);
+
+		return class_name;
+	}
+
+	return lsp_resolve_property_declared_class_in_tokens(contents, receiver_class, property_name);
+}
+
+static inline zend_string *lsp_resolve_project_property_declared_class(lsp_server *server, lsp_document *document, zend_string *receiver_class, zend_string *property_name)
+{
+	lsp_document *class_document;
+	zend_string *current_class, *path, *contents, *class_name;
+	bool owns_contents;
+
+	current_class = lsp_inference_declared_class_name(document->text);
+	if (current_class) {
+		if (zend_string_equals(current_class, receiver_class)) {
+			class_name = lsp_resolve_property_declared_class_in_text(document->text, receiver_class, property_name);
+			zend_string_release(current_class);
+			if (class_name) {
+				return class_name;
+			}
+		} else {
+			zend_string_release(current_class);
+		}
+	}
+
+	path = lsp_find_project_symbol_path(server, LSP_SYMBOL_CLASS, receiver_class);
+	if (!path) {
+		return NULL;
+	}
+
+	class_document = lsp_document_for_path(server, path);
+	contents = class_document ? zend_string_copy(class_document->text) : lsp_read_file(path);
+	zend_string_release(path);
+	owns_contents = class_document || contents != zend_empty_string;
+	if (!owns_contents) {
+		return NULL;
+	}
+
+	class_name = lsp_resolve_property_declared_class_in_text(contents, receiver_class, property_name);
+	zend_string_release(contents);
+
+	return class_name;
+}
+
+static inline zend_string *lsp_resolve_ast_variable_class(lsp_server *server, lsp_document *document, zend_ast *ast, size_t context_offset)
+{
+	zend_string *name, *variable, *class_name;
+
+	if (!ast || ast->kind != ZEND_AST_VAR) {
+		return NULL;
+	}
+
+	name = lsp_ast_string_value(ast->child[0]);
+	if (!name) {
+		return NULL;
+	}
+
+	if (zend_string_equals_literal(name, "this")) {
+		return lsp_inference_declared_class_name(document->text);
+	}
+
+	variable = strpprintf(0, "$%s", ZSTR_VAL(name));
+	class_name = lsp_infer_receiver_class(server, document, variable, context_offset);
+	zend_string_release(variable);
+
+	return class_name;
+}
+
+static inline zend_string *lsp_resolve_expression_ast_class(lsp_server *server, lsp_document *document, zend_ast *ast, size_t context_offset, uint32_t depth)
+{
+	zend_string *receiver_class, *property_name, *method_name, *resolved, *raw_class;
+
+	if (!ast || depth > 32) {
+		return NULL;
+	}
+
+	if (ast->kind == ZEND_AST_VAR) {
+		return lsp_resolve_ast_variable_class(server, document, ast, context_offset);
+	}
+
+	if (ast->kind == ZEND_AST_PROP || ast->kind == ZEND_AST_NULLSAFE_PROP) {
+		property_name = lsp_ast_string_value(ast->child[1]);
+		if (!property_name) {
+			return NULL;
+		}
+
+		receiver_class = lsp_resolve_expression_ast_class(server, document, ast->child[0], context_offset, depth + 1);
+		if (!receiver_class) {
+			return NULL;
+		}
+
+		resolved = lsp_resolve_project_property_declared_class(server, document, receiver_class, property_name);
+		zend_string_release(receiver_class);
+
+		return resolved;
+	}
+
+	if (ast->kind == ZEND_AST_METHOD_CALL || ast->kind == ZEND_AST_NULLSAFE_METHOD_CALL) {
+		method_name = lsp_ast_string_value(ast->child[1]);
+		if (!method_name) {
+			return NULL;
+		}
+
+		receiver_class = lsp_resolve_expression_ast_class(server, document, ast->child[0], context_offset, depth + 1);
+		if (!receiver_class) {
+			return NULL;
+		}
+
+		resolved = lsp_resolve_project_method_return_class(server, document, receiver_class, receiver_class, method_name);
+		zend_string_release(receiver_class);
+
+		return resolved;
+	}
+
+	if (ast->kind == ZEND_AST_STATIC_CALL) {
+		method_name = lsp_ast_string_value(ast->child[1]);
+		raw_class = lsp_ast_string_value(ast->child[0]);
+		if (!method_name || !raw_class) {
+			return NULL;
+		}
+
+		if (zend_string_equals_literal_ci(raw_class, "self") || zend_string_equals_literal_ci(raw_class, "static")) {
+			receiver_class = lsp_inference_declared_class_name(document->text);
+		} else {
+			receiver_class = lsp_resolve_class_name(document->text, raw_class);
+		}
+
+		if (!receiver_class) {
+			return NULL;
+		}
+
+		resolved = lsp_resolve_project_method_return_class(server, document, receiver_class, receiver_class, method_name);
+		zend_string_release(receiver_class);
+
+		return resolved;
+	}
+
+	if (ast->kind == ZEND_AST_ASSIGN || ast->kind == ZEND_AST_ASSIGN_REF || ast->kind == ZEND_AST_ASSIGN_OP) {
+		return lsp_resolve_expression_ast_class(server, document, ast->child[1], context_offset, depth + 1);
+	}
+
+	if (ast->kind == ZEND_AST_DIM) {
+		return NULL;
+	}
+
+	return NULL;
+}
+
+static inline zend_ast *lsp_inference_return_expression_from_ast(zend_ast *ast)
+{
+	zend_ast_list *list;
+	uint32_t i;
+
+	if (!ast) {
+		return NULL;
+	}
+
+	if (ast->kind == ZEND_AST_RETURN) {
+		return ast->child[0];
+	}
+
+	if (zend_ast_is_list(ast)) {
+		list = zend_ast_get_list(ast);
+		for (i = 0; i < list->children; i++) {
+			ast = lsp_inference_return_expression_from_ast(list->child[i]);
+			if (ast) {
+				return ast;
+			}
+		}
+
+		return NULL;
+	}
+
+	return NULL;
+}
+
+static inline size_t lsp_inference_expression_start_before(zend_string *text, size_t expression_end)
+{
+	const char *value = ZSTR_VAL(text);
+	size_t start;
+
+	start = expression_end > ZSTR_LEN(text) ? ZSTR_LEN(text) : expression_end;
+	while (start > 0 &&
+		value[start - 1] != ';' &&
+		value[start - 1] != '{' &&
+		value[start - 1] != '}' &&
+		value[start - 1] != '\n'
+	) {
+		start--;
+	}
+
+	while (start < expression_end && isspace((unsigned char) value[start])) {
+		start++;
+	}
+
+	return start;
+}
+
+static inline zend_string *lsp_resolve_expression_slice_ast_class(lsp_server *server, lsp_document *document, size_t expression_end, size_t context_offset)
+{
+	const char *value;
+	zend_arena *ast_arena;
+	zend_ast *ast, *expr;
+	zend_string *snippet, *class_name;
+	size_t expression_start;
+
+	if (expression_end > ZSTR_LEN(document->text)) {
+		expression_end = ZSTR_LEN(document->text);
+	}
+
+	expression_start = lsp_inference_expression_start_before(document->text, expression_end);
+	if (expression_start >= expression_end) {
+		return NULL;
+	}
+
+	value = ZSTR_VAL(document->text);
+	snippet = strpprintf(0, "<?php return %.*s;", (int) (expression_end - expression_start), value + expression_start);
+	ast = lsp_compile_string_to_ast_silent(snippet, ZSTR_EMPTY_ALLOC(), &ast_arena);
+	zend_string_release(snippet);
+	if (!ast) {
+		return NULL;
+	}
+
+	expr = lsp_inference_return_expression_from_ast(ast);
+	class_name = lsp_resolve_expression_ast_class(server, document, expr, context_offset, 0);
+	lsp_compiled_ast_destroy(ast, ast_arena);
+
+	return class_name;
+}
+
+static inline bool lsp_property_access_ending_at_fallback(zend_string *text, size_t expression_end, zend_string **property_name, size_t *receiver_end)
+{
+	const char *value = ZSTR_VAL(text);
+	size_t i, property_start, property_end;
+
+	*property_name = NULL;
+	*receiver_end = 0;
+	if (expression_end > ZSTR_LEN(text)) {
+		expression_end = ZSTR_LEN(text);
+	}
+
+	i = expression_end;
+	while (i > 0 && isspace((unsigned char) value[i - 1])) {
+		i--;
+	}
+
+	property_end = i;
+	while (i > 0 && lsp_doc_is_identifier_char(value[i - 1])) {
+		i--;
+	}
+
+	property_start = i;
+	if (property_start == property_end) {
+		return false;
+	}
+
+	while (i > 0 && isspace((unsigned char) value[i - 1])) {
+		i--;
+	}
+
+	if (i >= 3 && value[i - 3] == '?' && value[i - 2] == '-' && value[i - 1] == '>') {
+		*receiver_end = i - 3;
+	} else if (i >= 2 && value[i - 2] == '-' && value[i - 1] == '>') {
+		*receiver_end = i - 2;
+	} else {
+		return false;
+	}
+
+	*property_name = zend_string_init(value + property_start, property_end - property_start, 0);
+
+	return true;
+}
+
+static inline zend_string *lsp_resolve_property_access_expression_class_fallback(lsp_server *server, lsp_document *document, size_t expression_end, size_t context_offset)
+{
+	zend_string *property_name, *variable, *receiver_class, *resolved;
+	size_t receiver_end;
+
+	if (!lsp_property_access_ending_at_fallback(document->text, expression_end, &property_name, &receiver_end)) {
+		return NULL;
+	}
+
+	if (!lsp_variable_ending_at(document->text, receiver_end, &variable)) {
+		zend_string_release(property_name);
+
+		return NULL;
+	}
+
+	if (zend_string_equals_literal(variable, "$this")) {
+		receiver_class = lsp_inference_declared_class_name(document->text);
+	} else {
+		receiver_class = lsp_infer_receiver_class(server, document, variable, context_offset);
+	}
+
+	zend_string_release(variable);
+	if (!receiver_class) {
+		zend_string_release(property_name);
+
+		return NULL;
+	}
+
+	resolved = lsp_resolve_project_property_declared_class(server, document, receiver_class, property_name);
+	zend_string_release(receiver_class);
+	zend_string_release(property_name);
+
+	return resolved;
+}
+
+static inline zend_string *lsp_resolve_property_access_expression_class(lsp_server *server, lsp_document *document, size_t expression_end, size_t context_offset)
+{
+	zend_string *resolved;
+
+	resolved = lsp_resolve_expression_slice_ast_class(server, document, expression_end, context_offset);
+	if (resolved) {
+		return resolved;
+	}
+
+	return lsp_resolve_property_access_expression_class_fallback(server, document, expression_end, context_offset);
+}
+
 static inline zend_string *lsp_resolve_expression_class_ending_at(lsp_server *server, lsp_document *document, size_t expression_end, size_t context_offset, uint32_t depth)
 {
 	const char *value;
@@ -2162,6 +2902,11 @@ static inline zend_string *lsp_resolve_expression_class_ending_at(lsp_server *se
 		zend_string_release(receiver_class);
 		zend_string_release(method_name);
 
+		return resolved;
+	}
+
+	resolved = lsp_resolve_property_access_expression_class(server, document, i, context_offset);
+	if (resolved) {
 		return resolved;
 	}
 
