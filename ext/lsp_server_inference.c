@@ -1862,7 +1862,22 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 		return class_name;
 	}
 
-	return lsp_infer_method_call_assignment_class(server, document, receiver, offset);
+	class_name = lsp_infer_method_call_assignment_class(server, document, receiver, offset);
+	if (class_name) {
+		return class_name;
+	}
+
+	type = lsp_parameter_declared_type_for_variable(document, receiver, offset);
+	if (type) {
+		class_name = lsp_resolve_class_name(document->text, type);
+		zend_string_release(type);
+
+		if (class_name) {
+			return class_name;
+		}
+	}
+
+	return NULL;
 }
 
 static inline bool lsp_static_method_call_before_offset(lsp_document *document, size_t offset, zend_string **method_name, zend_string **class_name)
@@ -2210,7 +2225,12 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 		return type;
 	}
 
-	return lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
+	type = lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
+	if (type) {
+		return type;
+	}
+
+	return lsp_parameter_declared_type_for_variable(document, variable, offset);
 }
 
 extern zend_string *lsp_infer_variable_phpdoc_type(lsp_document *document, zend_string *variable, size_t offset)
@@ -2244,7 +2264,12 @@ extern zend_string *lsp_infer_variable_declared_type(lsp_server *server, lsp_doc
 		return type;
 	}
 
-	return lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
+	type = lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
+	if (type) {
+		return type;
+	}
+
+	return lsp_parameter_declared_type_for_variable(document, variable, offset);
 }
 
 static inline bool lsp_this_method_array_access_member_context(lsp_server *server, lsp_document *document, size_t offset, zend_string *prefix, zend_string **class_name, zend_string **member_prefix)

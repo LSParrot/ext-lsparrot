@@ -387,6 +387,52 @@ static inline zend_string *lsp_property_type_before_variable(zend_string *text, 
 	return zend_string_init(value + type_start, type_end - type_start, 0);
 }
 
+extern zend_string *lsp_parameter_declared_type_for_variable(lsp_document *document, zend_string *variable, size_t offset)
+{
+	zend_long body_depth;
+	zend_string *label;
+	zval *tokens_zv, *token;
+	HashTable *tokens;
+	uint32_t i, count;
+	size_t param_start, param_end, body_start, body_end, token_offset;
+
+	if (Z_TYPE(document->lsparrot) != IS_ARRAY) {
+		return NULL;
+	}
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY) {
+		return NULL;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	if (!lsp_find_function_scope_at(tokens, document->text, offset, &param_start, &param_end, &body_start, &body_end, &body_depth)) {
+		return NULL;
+	}
+
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_VARIABLE")) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		if (token_offset <= param_start || token_offset >= param_end) {
+			continue;
+		}
+
+		label = lsp_token_string(token, "text");
+		if (!label || !zend_string_equals(label, variable)) {
+			continue;
+		}
+
+		return lsp_parameter_type_before_variable(document->text, token_offset, param_start);
+	}
+
+	return NULL;
+}
+
 static inline zend_string *lsp_scope_variable_detail(lsp_server *server, lsp_document *document, zend_string *label, size_t offset, zend_string *declared_type, bool parameter)
 {
 	zend_string *type, *detail;

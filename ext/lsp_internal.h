@@ -744,6 +744,7 @@ bool lsp_token_is_char(zval *token, char value);
 bool lsp_token_in_bounds(zval *token, size_t start, size_t end);
 bool lsp_token_at_depth(zend_string *text, zval *token, zend_long depth);
 bool lsp_token_is_property_declaration(HashTable *tokens, uint32_t index, zend_string *text, zend_long body_depth);
+zend_string *lsp_parameter_declared_type_for_variable(lsp_document *document, zend_string *variable, size_t offset);
 zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset);
 zend_string *lsp_infer_variable_phpdoc_type(lsp_document *document, zend_string *variable, size_t offset);
 zend_string *lsp_infer_variable_declared_type(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset);

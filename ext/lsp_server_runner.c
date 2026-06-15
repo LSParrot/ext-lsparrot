@@ -27,9 +27,62 @@ static const char lsp_runner_script_source[] =
 	"<?php\n"
 	"error_reporting(E_ERROR | E_PARSE);\n"
 	"$in = fopen('php://stdin', 'rb');\n"
-	"$autoload = $argv[1] ?? '';\n"
-	"if ($autoload !== '' && is_file($autoload)) {\n"
-	"    require_once $autoload;\n"
+	"$projectRoot = realpath((string) ($argv[1] ?? ''));\n"
+	"if (!is_string($projectRoot) || $projectRoot === '') { exit(1); }\n"
+	"$analyzer = (string) ($argv[2] ?? '');\n"
+	"$autoload = (string) ($argv[3] ?? '');\n"
+	"function lsp_runner_path_is_same_or_under(string $path, string $root): bool {\n"
+	"    $path = rtrim(str_replace('\\\\', '/', $path), '/');\n"
+	"    $root = rtrim(str_replace('\\\\', '/', $root), '/');\n"
+	"    if (DIRECTORY_SEPARATOR === '\\\\') { $path = strtolower($path); $root = strtolower($root); }\n"
+	"    return $path === $root || strncmp($path, $root . '/', strlen($root) + 1) === 0;\n"
+	"}\n"
+	"function lsp_runner_real_project_file(string $path, string $projectRoot): ?string {\n"
+	"    if ($path === '' || str_contains($path, \"\\0\")) { return null; }\n"
+	"    $real = realpath($path);\n"
+	"    if (!is_string($real) || !is_file($real) || !lsp_runner_path_is_same_or_under($real, $projectRoot)) { return null; }\n"
+	"    return $real;\n"
+	"}\n"
+	"function lsp_runner_real_project_dir(string $path, string $projectRoot): ?string {\n"
+	"    if ($path === '' || str_contains($path, \"\\0\")) { return $projectRoot; }\n"
+	"    $real = realpath($path);\n"
+	"    if (!is_string($real) || !is_dir($real) || !lsp_runner_path_is_same_or_under($real, $projectRoot)) { return null; }\n"
+	"    return $real;\n"
+	"}\n"
+	"function lsp_runner_analyzer_basename_allowed(string $target, string $analyzer): bool {\n"
+	"    $name = basename($target);\n"
+	"    if (DIRECTORY_SEPARATOR === '\\\\') { $name = strtolower($name); }\n"
+	"    if ($analyzer === 'phpstan') { return $name === 'phpstan' || $name === 'phpstan.bat' || $name === 'phpstan.cmd'; }\n"
+	"    if ($analyzer === 'psalm') { return $name === 'psalm' || $name === 'psalm.bat' || $name === 'psalm.cmd'; }\n"
+	"    return false;\n"
+	"}\n"
+	"function lsp_runner_php_binary_name(string $path): bool {\n"
+	"    return preg_match('/^php(?:[0-9.]+)?(?:\\\\.exe)?$/i', basename($path)) === 1;\n"
+	"}\n"
+	"function lsp_runner_command_target(array $argvList, string $projectRoot, string $analyzer): ?array {\n"
+	"    if (!isset($argvList[0]) || !is_string($argvList[0])) { return null; }\n"
+	"    $targetIndex = 0;\n"
+	"    if (lsp_runner_php_binary_name($argvList[0])) {\n"
+	"        $targetIndex = -1;\n"
+	"        foreach ($argvList as $index => $arg) {\n"
+	"            if ($index === 0 || !is_string($arg)) { continue; }\n"
+	"            $real = lsp_runner_real_project_file($arg, $projectRoot);\n"
+	"            if ($real !== null && lsp_runner_analyzer_basename_allowed($real, $analyzer) && lsp_runner_target_is_php_script($real)) {\n"
+	"                $targetIndex = $index;\n"
+	"                break;\n"
+	"            }\n"
+	"        }\n"
+	"    }\n"
+	"    if ($targetIndex < 0 || !is_string($argvList[$targetIndex])) { return null; }\n"
+	"    $target = lsp_runner_real_project_file($argvList[$targetIndex], $projectRoot);\n"
+	"    if ($target === null || !lsp_runner_analyzer_basename_allowed($target, $analyzer) || !lsp_runner_target_is_php_script($target)) { return null; }\n"
+	"    $scriptArgv = array_slice($argvList, $targetIndex);\n"
+	"    $scriptArgv[0] = $target;\n"
+	"    return [$target, $scriptArgv, $targetIndex];\n"
+	"}\n"
+	"$autoloadReal = lsp_runner_real_project_file($autoload, $projectRoot);\n"
+	"if ($autoloadReal !== null) {\n"
+	"    require_once $autoloadReal;\n"
 	"}\n"
 	"$canFork = function_exists('pcntl_fork') && function_exists('pcntl_waitpid')\n"
 	"    && function_exists('pcntl_wexitstatus') && DIRECTORY_SEPARATOR === '/';\n"
@@ -62,15 +115,14 @@ static const char lsp_runner_script_source[] =
 	"    if (strncmp($head, '<?php', 5) === 0) { return true; }\n"
 	"    if (strncmp($head, '#!', 2) === 0) {\n"
 	"        $firstLine = strtok($head, \"\\n\");\n"
-	"        return $firstLine !== false && preg_match('/\\\\bphp[0-9.]*$/', trim($firstLine)) === 1;\n"
+	"        return $firstLine !== false && preg_match('/(?:^|[\\\\s\\\\/])php[0-9.]*(?:\\\\s|$)/', trim($firstLine)) === 1;\n"
 	"    }\n"
 	"    return false;\n"
 	"}\n"
-	"function lsp_runner_run_fork(array $argvList, string $cwd): ?array {\n"
-	"    $target = $argvList[0] ?? '';\n"
-	"    if (!is_string($target) || $target === '' || !is_file($target) || !lsp_runner_target_is_php_script($target)) {\n"
-	"        return null;\n"
-	"    }\n"
+	"function lsp_runner_run_fork(array $argvList, string $cwd, string $projectRoot, string $analyzer): ?array {\n"
+	"    $commandTarget = lsp_runner_command_target($argvList, $projectRoot, $analyzer);\n"
+	"    if ($commandTarget === null) { return null; }\n"
+	"    [$target, $scriptArgv] = $commandTarget;\n"
 	"    $stdoutFile = tempnam(sys_get_temp_dir(), 'lspr');\n"
 	"    $stderrFile = tempnam(sys_get_temp_dir(), 'lspr');\n"
 	"    if ($stdoutFile === false || $stderrFile === false) { return null; }\n"
@@ -84,10 +136,12 @@ static const char lsp_runner_script_source[] =
 	"        $childOut = fopen($stdoutFile, 'wb');\n"
 	"        $childErr = fopen($stderrFile, 'wb');\n"
 	"        if ($cwd !== '') { @chdir($cwd); }\n"
-	"        $_SERVER['argv'] = $argvList;\n"
-	"        $_SERVER['argc'] = count($argvList);\n"
-	"        $GLOBALS['argv'] = $argvList;\n"
-	"        $GLOBALS['argc'] = count($argvList);\n"
+	"        $_SERVER['argv'] = $scriptArgv;\n"
+	"        $_SERVER['argc'] = count($scriptArgv);\n"
+	"        $GLOBALS['argv'] = $scriptArgv;\n"
+	"        $GLOBALS['argc'] = count($scriptArgv);\n"
+	"        $argv = $scriptArgv;\n"
+	"        $argc = count($scriptArgv);\n"
 	"        try {\n"
 	"            include $target;\n"
 	"        } catch (Throwable $error) {\n"
@@ -103,9 +157,12 @@ static const char lsp_runner_script_source[] =
 	"    @unlink($stderrFile);\n"
 	"    return [pcntl_wifexited($status) ? pcntl_wexitstatus($status) : 255, $output];\n"
 	"}\n"
-	"function lsp_runner_run_proc(array $argvList, string $cwd): array {\n"
+	"function lsp_runner_run_proc(array $argvList, string $cwd, string $projectRoot, string $analyzer): array {\n"
+	"    $commandTarget = lsp_runner_command_target($argvList, $projectRoot, $analyzer);\n"
+	"    if ($commandTarget === null) { return [127, '']; }\n"
+	"    $argvList[$commandTarget[2]] = $commandTarget[0];\n"
 	"    $null = DIRECTORY_SEPARATOR === '\\\\' ? 'NUL' : '/dev/null';\n"
-	"    $proc = @proc_open($argvList, [0 => ['file', $null, 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $cwd !== '' ? $cwd : null);\n"
+	"    $proc = @proc_open($argvList, [0 => ['file', $null, 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $cwd !== '' ? $cwd : $projectRoot);\n"
 	"    if (!is_resource($proc)) { return [127, '']; }\n"
 	"    stream_set_blocking($pipes[1], false);\n"
 	"    stream_set_blocking($pipes[2], false);\n"
@@ -136,14 +193,15 @@ static const char lsp_runner_script_source[] =
 	"    $job = lsp_runner_read_frame($in);\n"
 	"    if ($job === null) { exit(0); }\n"
 	"    $argvList = $job['argv'] ?? null;\n"
-	"    $cwd = (string) ($job['cwd'] ?? '');\n"
+	"    $cwd = lsp_runner_real_project_dir((string) ($job['cwd'] ?? ''), $projectRoot);\n"
+	"    if ($cwd === null) { $cwd = $projectRoot; }\n"
 	"    $id = $job['id'] ?? 0;\n"
 	"    if (!is_array($argvList) || $argvList === []) {\n"
 	"        lsp_runner_write_frame(['id' => $id, 'exitCode' => 127, 'output' => '']);\n"
 	"        continue;\n"
 	"    }\n"
-	"    $result = $canFork ? lsp_runner_run_fork($argvList, $cwd) : null;\n"
-	"    if ($result === null) { $result = lsp_runner_run_proc($argvList, $cwd); }\n"
+	"    $result = $canFork ? lsp_runner_run_fork($argvList, $cwd, $projectRoot, $analyzer) : null;\n"
+	"    if ($result === null) { $result = lsp_runner_run_proc($argvList, $cwd, $projectRoot, $analyzer); }\n"
 	"    lsp_runner_write_frame(['id' => $id, 'exitCode' => $result[0], 'output' => $result[1]]);\n"
 	"}\n"
 ;
@@ -250,6 +308,8 @@ static inline lsp_runner_session *lsp_runner_session_start(const char *analyzer,
 	lsp_command_add(&command, "-dopcache.enable_cli=1");
 	lsp_command_add_zstr(&command, opcache_flag);
 	lsp_command_add_zstr(&command, script_path);
+	lsp_command_add_zstr(&command, project_root);
+	lsp_command_add(&command, analyzer);
 	if (lsp_is_regular_file(autoload)) {
 		lsp_command_add_zstr(&command, autoload);
 	}
@@ -442,12 +502,59 @@ static inline zend_string *lsp_runner_wait_response(lsp_runner_session *session,
 	}
 }
 
+static inline bool lsp_runner_analyzer_basename_matches(zend_string *path, const char *analyzer)
+{
+	const char *base;
+	size_t base_length, analyzer_length;
+
+	base = lsp_path_basename(path);
+	base_length = strlen(base);
+	analyzer_length = strlen(analyzer);
+	if (base_length == analyzer_length && strcasecmp(base, analyzer) == 0) {
+		return true;
+	}
+	if (base_length == analyzer_length + 4 && strncasecmp(base, analyzer, analyzer_length) == 0) {
+		return strcasecmp(base + analyzer_length, ".bat") == 0 || strcasecmp(base + analyzer_length, ".cmd") == 0;
+	}
+
+	return false;
+}
+
+static inline bool lsp_runner_command_can_use_project_runner(const char *analyzer, zend_string *project_root, lsp_command *command)
+{
+	zend_string *argument;
+	uint32_t i;
+	bool result;
+
+	result = false;
+	for (i = 0; i < command->count; i++) {
+		argument = zend_string_init(command->argv[i], strlen(command->argv[i]), 0);
+		if (
+			lsp_path_is_same_or_under(argument, project_root) &&
+			lsp_is_regular_file(argument) &&
+			lsp_runner_analyzer_basename_matches(argument, analyzer)
+		) {
+			result = true;
+		}
+		zend_string_release(argument);
+		if (result) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 extern zend_string *lsp_runner_run_capture(lsp_server *server, const char *analyzer, zend_string *project_root, lsp_command *command, zend_string *cwd, double timeout)
 {
 	lsp_runner_session *session;
 	zend_string *job, *frame, *output;
 	zend_long job_id;
 	bool sent;
+
+	if (!lsp_runner_command_can_use_project_runner(analyzer, project_root, command)) {
+		return lsp_run_command_capture(command, cwd, timeout);
+	}
 
 	session = lsp_runner_session_ensure(server, analyzer, project_root);
 	if (!session) {

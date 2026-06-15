@@ -15,15 +15,10 @@
 
 #if defined(_WIN32)
 static LONG lsp_process_windows_pipe_counter = 0;
-#else
-extern char **environ;
-#endif
 
-static inline void lsp_process_append_shell_quoted(smart_str *line, const char *value)
+static inline void lsp_process_append_windows_quoted_arg(smart_str *line, const char *value)
 {
 	const char *p;
-
-#if defined(_WIN32)
 	size_t backslashes;
 
 	smart_str_appendc(line, '"');
@@ -52,17 +47,6 @@ static inline void lsp_process_append_shell_quoted(smart_str *line, const char *
 		backslashes--;
 	}
 	smart_str_appendc(line, '"');
-#else
-	smart_str_appendc(line, '\'');
-	for (p = value; *p; p++) {
-		if (*p == '\'') {
-			smart_str_appendl(line, "'\\''", sizeof("'\\''") - 1);
-		} else {
-			smart_str_appendc(line, *p);
-		}
-	}
-	smart_str_appendc(line, '\'');
-#endif
 }
 
 static inline zend_string *lsp_process_command_line(lsp_command *command)
@@ -75,41 +59,16 @@ static inline zend_string *lsp_process_command_line(lsp_command *command)
 			smart_str_appendc(&line, ' ');
 		}
 
-		lsp_process_append_shell_quoted(&line, command->argv[i]);
+		lsp_process_append_windows_quoted_arg(&line, command->argv[i]);
 	}
 
 	smart_str_0(&line);
 
 	return line.s ? line.s : zend_empty_string;
 }
+#endif
 
 #if !defined(_WIN32)
-static inline zend_string *lsp_process_shell_line(lsp_command *command, zend_string *cwd)
-{
-	smart_str line = {0};
-	uint32_t i;
-
-	if (cwd && ZSTR_LEN(cwd) > 0) {
-		smart_str_appendl(&line, "cd ", sizeof("cd ") - 1);
-		lsp_process_append_shell_quoted(&line, ZSTR_VAL(cwd));
-		smart_str_appendl(&line, " && exec ", sizeof(" && exec ") - 1);
-	} else {
-		smart_str_appendl(&line, "exec ", sizeof("exec ") - 1);
-	}
-
-	for (i = 0; i < command->count; i++) {
-		if (i > 0) {
-			smart_str_appendc(&line, ' ');
-		}
-
-		lsp_process_append_shell_quoted(&line, command->argv[i]);
-	}
-
-	smart_str_0(&line);
-
-	return line.s ? line.s : zend_empty_string;
-}
-
 static inline bool lsp_process_pipe_pair(lsp_pipe_handle *read_pipe, lsp_pipe_handle *write_pipe)
 {
 	int fds[2];
@@ -143,18 +102,93 @@ static inline bool lsp_process_set_nonblock(lsp_pipe_handle pipe)
 	return fcntl((int) pipe, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-static inline bool lsp_process_spawn_shell_with_actions(zend_string *line, posix_spawn_file_actions_t *actions, lsp_process_id *process)
+static inline void lsp_process_child_dup2_or_exit(int source, int target)
 {
-	char *argv[4];
-	int result;
+	if (source == target) {
+		return;
+	}
 
-	argv[0] = (char *) "sh";
-	argv[1] = (char *) "-c";
-	argv[2] = ZSTR_VAL(line);
-	argv[3] = NULL;
-	result = posix_spawnp(process, "sh", actions, NULL, argv, environ);
+	if (dup2(source, target) < 0) {
+		_exit(127);
+	}
+}
 
-	return result == 0;
+static inline void lsp_process_child_close_fd(int fd)
+{
+	if (fd > STDERR_FILENO) {
+		close(fd);
+	}
+}
+
+static inline void lsp_process_child_chdir_or_exit(zend_string *cwd)
+{
+	if (cwd && ZSTR_LEN(cwd) > 0 && chdir(ZSTR_VAL(cwd)) != 0) {
+		_exit(127);
+	}
+}
+
+static inline bool lsp_process_fork_exec_piped(
+	lsp_command *command,
+	zend_string *cwd,
+	lsp_pipe_handle input_read,
+	lsp_pipe_handle input_write,
+	lsp_pipe_handle output_read,
+	lsp_pipe_handle output_write,
+	lsp_pipe_handle error_read,
+	lsp_pipe_handle error_write,
+	lsp_process_id *process
+)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0) {
+		return false;
+	}
+
+	if (pid == 0) {
+		lsp_process_child_dup2_or_exit((int) input_read, STDIN_FILENO);
+		lsp_process_child_dup2_or_exit((int) output_write, STDOUT_FILENO);
+		lsp_process_child_dup2_or_exit((int) error_write, STDERR_FILENO);
+		lsp_process_child_close_fd((int) input_read);
+		lsp_process_child_close_fd((int) input_write);
+		lsp_process_child_close_fd((int) output_read);
+		lsp_process_child_close_fd((int) output_write);
+		lsp_process_child_close_fd((int) error_read);
+		lsp_process_child_close_fd((int) error_write);
+		lsp_process_child_chdir_or_exit(cwd);
+		execvp(command->argv[0], command->argv);
+		_exit(127);
+	}
+
+	*process = pid;
+
+	return true;
+}
+
+static inline bool lsp_process_fork_exec_to_file(lsp_command *command, zend_string *cwd, int input, int output, lsp_process_id *process)
+{
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0) {
+		return false;
+	}
+
+	if (pid == 0) {
+		lsp_process_child_dup2_or_exit(input, STDIN_FILENO);
+		lsp_process_child_dup2_or_exit(output, STDOUT_FILENO);
+		lsp_process_child_dup2_or_exit(output, STDERR_FILENO);
+		lsp_process_child_close_fd(input);
+		lsp_process_child_close_fd(output);
+		lsp_process_child_chdir_or_exit(cwd);
+		execvp(command->argv[0], command->argv);
+		_exit(127);
+	}
+
+	*process = pid;
+
+	return true;
 }
 #endif
 
@@ -589,10 +623,8 @@ extern bool lsp_process_spawn_piped(lsp_command *command, zend_string *cwd, lsp_
 	HANDLE child_input_read, child_input_write, child_output_read, child_output_write, child_error_read, child_error_write;
 	bool ok;
 #else
-	posix_spawn_file_actions_t actions;
-	zend_string *line;
 	lsp_pipe_handle input_read, input_write, output_read, output_write, error_read, error_write;
-	bool actions_initialized, ok;
+	bool ok;
 #endif
 
 	memset(pipes, 0, sizeof(*pipes));
@@ -661,14 +693,12 @@ extern bool lsp_process_spawn_piped(lsp_command *command, zend_string *cwd, lsp_
 
 	return true;
 #else
-	actions_initialized = false;
 	input_read = LSP_INVALID_PIPE_HANDLE;
 	input_write = LSP_INVALID_PIPE_HANDLE;
 	output_read = LSP_INVALID_PIPE_HANDLE;
 	output_write = LSP_INVALID_PIPE_HANDLE;
 	error_read = LSP_INVALID_PIPE_HANDLE;
 	error_write = LSP_INVALID_PIPE_HANDLE;
-	line = NULL;
 	if (!lsp_process_pipe_pair(&input_read, &input_write) ||
 		!lsp_process_pipe_pair(&output_read, &output_write) ||
 		!lsp_process_pipe_pair(&error_read, &error_write)
@@ -676,28 +706,21 @@ extern bool lsp_process_spawn_piped(lsp_command *command, zend_string *cwd, lsp_
 		goto fail;
 	}
 
-	if (posix_spawn_file_actions_init(&actions) != 0) {
-		goto fail;
-	}
-	actions_initialized = true;
-	posix_spawn_file_actions_adddup2(&actions, (int) input_read, STDIN_FILENO);
-	posix_spawn_file_actions_adddup2(&actions, (int) output_write, STDOUT_FILENO);
-	posix_spawn_file_actions_adddup2(&actions, (int) error_write, STDERR_FILENO);
-	posix_spawn_file_actions_addclose(&actions, (int) input_write);
-	posix_spawn_file_actions_addclose(&actions, (int) output_read);
-	posix_spawn_file_actions_addclose(&actions, (int) error_read);
-	line = lsp_process_shell_line(command, cwd);
-	if (line == zend_empty_string) {
-		goto fail;
-	}
-
-	ok = lsp_process_spawn_shell_with_actions(line, &actions, &pipes->process);
+	ok = lsp_process_fork_exec_piped(
+		command,
+		cwd,
+		input_read,
+		input_write,
+		output_read,
+		output_write,
+		error_read,
+		error_write,
+		&pipes->process
+	);
 	if (!ok) {
 		goto fail;
 	}
 
-	posix_spawn_file_actions_destroy(&actions);
-	zend_string_release(line);
 	lsp_pipe_close(&input_read);
 	lsp_pipe_close(&output_write);
 	lsp_pipe_close(&error_write);
@@ -711,12 +734,6 @@ extern bool lsp_process_spawn_piped(lsp_command *command, zend_string *cwd, lsp_
 	return true;
 
 fail:
-	if (actions_initialized) {
-		posix_spawn_file_actions_destroy(&actions);
-	}
-	if (line && line != zend_empty_string) {
-		zend_string_release(line);
-	}
 	lsp_pipe_close(&input_read);
 	lsp_pipe_close(&input_write);
 	lsp_pipe_close(&output_read);
@@ -736,11 +753,8 @@ extern lsp_process_id lsp_process_spawn_to_file(lsp_command *command, zend_strin
 	HANDLE file, input;
 	lsp_process_id process;
 #else
-	posix_spawn_file_actions_t actions;
-	zend_string *line;
 	lsp_process_id process;
-	bool actions_initialized;
-	int result;
+	int input, output;
 #endif
 
 	if (!command->argv || command->count == 0) {
@@ -776,27 +790,25 @@ extern lsp_process_id lsp_process_spawn_to_file(lsp_command *command, zend_strin
 	return process;
 #else
 	process = LSP_INVALID_PROCESS_ID;
-	actions_initialized = false;
-	line = lsp_process_shell_line(command, cwd);
-	if (line == zend_empty_string) {
+	input = open("/dev/null", O_RDONLY);
+	if (input < 0) {
 		return LSP_INVALID_PROCESS_ID;
 	}
-	if (posix_spawn_file_actions_init(&actions) != 0) {
-		zend_string_release(line);
+
+	output = open(ZSTR_VAL(output_file), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (output < 0) {
+		close(input);
 
 		return LSP_INVALID_PROCESS_ID;
 	}
-	actions_initialized = true;
-	posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-	posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, ZSTR_VAL(output_file), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-	posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
-	result = lsp_process_spawn_shell_with_actions(line, &actions, &process) ? 0 : -1;
-	if (actions_initialized) {
-		posix_spawn_file_actions_destroy(&actions);
-	}
-	zend_string_release(line);
 
-	return result == 0 ? process : LSP_INVALID_PROCESS_ID;
+	if (!lsp_process_fork_exec_to_file(command, cwd, input, output, &process)) {
+		process = LSP_INVALID_PROCESS_ID;
+	}
+	close(input);
+	close(output);
+
+	return process;
 #endif
 }
 

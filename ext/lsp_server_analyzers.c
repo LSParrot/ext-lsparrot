@@ -225,7 +225,7 @@ extern zend_string *lsp_tool_project_candidate(zend_string *root, const char *na
 
 static inline bool lsp_tool_path_candidate_is_usable(zend_string *candidate)
 {
-	return lsp_path_is_executable_file(candidate);
+	return !lsp_path_is_windows_batch_file(candidate) && lsp_path_is_executable_file(candidate);
 }
 
 static inline zend_string *lsp_tool_path_candidate_in_dir(const char *dir, size_t dir_length, const char *name)
@@ -326,7 +326,6 @@ extern bool lsp_tool_available(const char *name, zend_string *root)
 
 extern bool lsp_tool_command(lsp_server *server, zend_string *root, const char *name, lsp_command *command)
 {
-	const char *comspec;
 	bool run_with_php = false;
 	zend_string *tool = lsp_find_tool(name, root, &run_with_php);
 	uint32_t i;
@@ -342,13 +341,6 @@ extern bool lsp_tool_command(lsp_server *server, zend_string *root, const char *
 			lsp_command_add_zstr(command, server->options.worker_php_args[i]);
 		}
 
-		lsp_command_add_zstr(command, tool);
-	} else if (lsp_path_is_windows_batch_file(tool)) {
-		comspec = getenv("COMSPEC");
-		lsp_command_add(command, comspec && *comspec ? comspec : "cmd.exe");
-		lsp_command_add(command, "/d");
-		lsp_command_add(command, "/s");
-		lsp_command_add(command, "/c");
 		lsp_command_add_zstr(command, tool);
 	} else {
 		lsp_command_add_zstr(command, tool);
