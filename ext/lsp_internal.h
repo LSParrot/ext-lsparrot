@@ -708,6 +708,7 @@ void lsp_phpdoc_add_variable_type_completions(lsp_server *server, zval *items, z
 void lsp_phpdoc_add_variable_type_completion_edits(lsp_server *server, zval *items, zend_string *text, zend_string *prefix, size_t prefix_start, size_t offset);
 void lsp_phpdoc_add_annotation_completions(zval *items, zend_string *text, size_t offset);
 zend_string *lsp_phpdoc_type_for_word(zend_string *text, zend_string *word);
+zend_string *lsp_phpdoc_type_for_word_range(zend_string *text, size_t start_offset, size_t end_offset, zend_string *word);
 zend_string *lsp_phpdoc_type_for_word_raw(zend_string *text, zend_string *word);
 zend_string *lsp_phpdoc_property_type_for_word(zend_string *text, zend_string *word, size_t offset);
 zend_string *lsp_phpdoc_property_type_for_word_raw(zend_string *text, zend_string *word, size_t offset);

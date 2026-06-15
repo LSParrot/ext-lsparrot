@@ -247,6 +247,134 @@ static inline bool lsp_find_function_scope_at(HashTable *tokens, zend_string *te
 	return found;
 }
 
+static inline bool lsp_find_function_index_by_param_start(HashTable *tokens, zend_string *text, size_t target_param_start, uint32_t *function_index)
+{
+	const char *value = ZSTR_VAL(text);
+	zval *token;
+	uint32_t i, count;
+	size_t token_offset, p, length;
+
+	count = zend_hash_num_elements(tokens);
+	length = ZSTR_LEN(text);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_FUNCTION")) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		p = token_offset;
+		while (p < length && value[p] != '(' && value[p] != '{' && value[p] != ';') {
+			p++;
+		}
+
+		if (p == target_param_start) {
+			*function_index = i;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static inline bool lsp_find_function_params_at(HashTable *tokens, zend_string *text, size_t offset, size_t *param_start, size_t *param_end, uint32_t *function_index)
+{
+	const char *value = ZSTR_VAL(text);
+	zval *token;
+	uint32_t i, count;
+	size_t token_offset, p, close_paren, length, best_param_start;
+	bool found;
+
+	count = zend_hash_num_elements(tokens);
+	length = ZSTR_LEN(text);
+	found = false;
+	best_param_start = 0;
+	*param_start = 0;
+	*param_end = 0;
+	*function_index = 0;
+
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_FUNCTION")) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		if (token_offset >= offset || token_offset >= length) {
+			continue;
+		}
+
+		p = token_offset;
+		while (p < length && value[p] != '(' && value[p] != '{' && value[p] != ';') {
+			p++;
+		}
+
+		if (p >= length || value[p] != '(' || !lsp_find_matching_close_paren(text, p, &close_paren)) {
+			continue;
+		}
+
+		if (offset <= p || offset >= close_paren || p <= best_param_start) {
+			continue;
+		}
+
+		*param_start = p;
+		*param_end = close_paren;
+		*function_index = i;
+		best_param_start = p;
+		found = true;
+	}
+
+	return found;
+}
+
+static inline bool lsp_function_phpdoc_range(HashTable *tokens, uint32_t function_index, size_t *doc_start, size_t *doc_end)
+{
+	zend_long i;
+	zend_string *comment;
+	zval *token;
+	size_t offset, length;
+
+	*doc_start = 0;
+	*doc_end = 0;
+	for (i = (zend_long) function_index - 1; i >= 0; i--) {
+		token = zend_hash_index_find(tokens, (zend_ulong) i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_DOC_COMMENT")) {
+			comment = lsp_token_string(token, "text");
+			if (!comment) {
+				return false;
+			}
+
+			offset = (size_t) lsp_token_long(token, "offset", 0);
+			length = (size_t) lsp_token_long(token, "length", (zend_long) ZSTR_LEN(comment));
+			*doc_start = offset;
+			*doc_end = offset + length;
+
+			return true;
+		}
+
+		if (lsp_token_is_char(token, ';') || lsp_token_is_char(token, '{') || lsp_token_is_char(token, '}')) {
+			break;
+		}
+	}
+
+	return false;
+}
+
+static inline zend_string *lsp_parameter_phpdoc_type_for_function(HashTable *tokens, zend_string *text, uint32_t function_index, zend_string *variable)
+{
+	size_t doc_start, doc_end;
+
+	if (!lsp_function_phpdoc_range(tokens, function_index, &doc_start, &doc_end)) {
+		return NULL;
+	}
+
+	return lsp_phpdoc_type_for_word_range(text, doc_start, doc_end, variable);
+}
+
 static inline bool lsp_parameter_modifier_at(const char *value, size_t start, size_t end, const char *modifier, size_t *next)
 {
 	size_t length;
@@ -390,11 +518,12 @@ static inline zend_string *lsp_property_type_before_variable(zend_string *text, 
 extern zend_string *lsp_parameter_declared_type_for_variable(lsp_document *document, zend_string *variable, size_t offset)
 {
 	zend_long body_depth;
-	zend_string *label;
+	zend_string *label, *type;
 	zval *tokens_zv, *token;
 	HashTable *tokens;
-	uint32_t i, count;
+	uint32_t i, count, function_index;
 	size_t param_start, param_end, body_start, body_end, token_offset;
+	bool has_parameter_context;
 
 	if (Z_TYPE(document->lsparrot) != IS_ARRAY) {
 		return NULL;
@@ -406,7 +535,14 @@ extern zend_string *lsp_parameter_declared_type_for_variable(lsp_document *docum
 	}
 
 	tokens = Z_ARRVAL_P(tokens_zv);
-	if (!lsp_find_function_scope_at(tokens, document->text, offset, &param_start, &param_end, &body_start, &body_end, &body_depth)) {
+	has_parameter_context = false;
+	if (lsp_find_function_scope_at(tokens, document->text, offset, &param_start, &param_end, &body_start, &body_end, &body_depth)) {
+		has_parameter_context = lsp_find_function_index_by_param_start(tokens, document->text, param_start, &function_index);
+	} else if (lsp_find_function_params_at(tokens, document->text, offset, &param_start, &param_end, &function_index)) {
+		has_parameter_context = true;
+	}
+
+	if (!has_parameter_context) {
 		return NULL;
 	}
 
@@ -427,6 +563,11 @@ extern zend_string *lsp_parameter_declared_type_for_variable(lsp_document *docum
 			continue;
 		}
 
+		type = lsp_parameter_phpdoc_type_for_function(tokens, document->text, function_index, variable);
+		if (type) {
+			return type;
+		}
+
 		return lsp_parameter_type_before_variable(document->text, token_offset, param_start);
 	}
 
@@ -437,7 +578,10 @@ static inline zend_string *lsp_scope_variable_detail(lsp_server *server, lsp_doc
 {
 	zend_string *type, *detail;
 
-	type = declared_type ? zend_string_copy(declared_type) : lsp_infer_variable_type(server, document, label, offset);
+	type = parameter ? lsp_infer_variable_type(server, document, label, offset) : NULL;
+	if (!type) {
+		type = declared_type ? zend_string_copy(declared_type) : lsp_infer_variable_type(server, document, label, offset);
+	}
 	if (!type) {
 		type = lsp_infer_variable_declared_type(server, document, label, offset);
 	}

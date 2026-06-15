@@ -2950,6 +2950,11 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 {
 	zend_string *type;
 
+	type = lsp_parameter_declared_type_for_variable(document, variable, offset);
+	if (type) {
+		return type;
+	}
+
 	type = lsp_phpdoc_type_for_word(document->text, variable);
 	if (type) {
 		return type;
@@ -2975,7 +2980,7 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 		return type;
 	}
 
-	return lsp_parameter_declared_type_for_variable(document, variable, offset);
+	return NULL;
 }
 
 extern zend_string *lsp_infer_variable_phpdoc_type(lsp_document *document, zend_string *variable, size_t offset)

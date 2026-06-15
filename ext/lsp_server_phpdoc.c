@@ -1647,14 +1647,14 @@ extern void lsp_phpdoc_add_variable_type_completion_edits(lsp_server *server, zv
 	}
 }
 
-extern zend_string *lsp_phpdoc_type_for_word(zend_string *text, zend_string *word)
+static inline zend_string *lsp_phpdoc_type_for_word_between(zend_string *text, const char *cursor_start, const char *cursor_end, zend_string *word, bool normalize)
 {
-	const char *word_value = ZSTR_VAL(word), *cursor = ZSTR_VAL(text), *end = ZSTR_VAL(text) + ZSTR_LEN(text);
+	const char *word_value = ZSTR_VAL(word), *cursor = cursor_start, *end = cursor_end;
 	zend_string *variable, *type, *resolved;
 	size_t word_length = ZSTR_LEN(word);
 	bool match;
 
-	while (lsp_doc_find_next_type_ex(&cursor, end, &variable, &type, true)) {
+	while (lsp_doc_find_next_type_ex(&cursor, end, &variable, &type, normalize)) {
 		match = ZSTR_LEN(variable) == word_length && strncasecmp(ZSTR_VAL(variable), word_value, word_length) == 0;
 		if (!match && word_length > 0 && word_value[0] != '$') {
 			match = ZSTR_LEN(variable) == word_length + 1 && ZSTR_VAL(variable)[0] == '$' &&
@@ -1665,7 +1665,7 @@ extern zend_string *lsp_phpdoc_type_for_word(zend_string *text, zend_string *wor
 		zend_string_release(variable);
 
 		if (match) {
-			resolved = lsp_phpdoc_resolve_type_text(text, type, true);
+			resolved = lsp_phpdoc_resolve_type_text(text, type, normalize);
 			if (resolved) {
 				zend_string_release(type);
 				return resolved;
@@ -1679,36 +1679,35 @@ extern zend_string *lsp_phpdoc_type_for_word(zend_string *text, zend_string *wor
 	return NULL;
 }
 
-extern zend_string *lsp_phpdoc_type_for_word_raw(zend_string *text, zend_string *word)
+extern zend_string *lsp_phpdoc_type_for_word(zend_string *text, zend_string *word)
 {
-	const char *word_value = ZSTR_VAL(word), *cursor = ZSTR_VAL(text), *end = ZSTR_VAL(text) + ZSTR_LEN(text);
-	zend_string *variable, *type, *resolved;
-	size_t word_length = ZSTR_LEN(word);
-	bool match;
+	return lsp_phpdoc_type_for_word_between(text, ZSTR_VAL(text), ZSTR_VAL(text) + ZSTR_LEN(text), word, true);
+}
 
-	while (lsp_doc_find_next_type_ex(&cursor, end, &variable, &type, false)) {
-		match = ZSTR_LEN(variable) == word_length && strncasecmp(ZSTR_VAL(variable), word_value, word_length) == 0;
-		if (!match && word_length > 0 && word_value[0] != '$') {
-			match = ZSTR_LEN(variable) == word_length + 1 && ZSTR_VAL(variable)[0] == '$' &&
-				strncasecmp(ZSTR_VAL(variable) + 1, word_value, word_length) == 0
-			;
-		}
+extern zend_string *lsp_phpdoc_type_for_word_range(zend_string *text, size_t start_offset, size_t end_offset, zend_string *word)
+{
+	const char *value;
 
-		zend_string_release(variable);
-
-		if (match) {
-			resolved = lsp_phpdoc_resolve_type_text(text, type, false);
-			if (resolved) {
-				zend_string_release(type);
-				return resolved;
-			}
-			return type;
-		}
-
-		zend_string_release(type);
+	if (start_offset > ZSTR_LEN(text)) {
+		start_offset = ZSTR_LEN(text);
 	}
 
-	return NULL;
+	if (end_offset > ZSTR_LEN(text)) {
+		end_offset = ZSTR_LEN(text);
+	}
+
+	if (end_offset < start_offset) {
+		end_offset = start_offset;
+	}
+
+	value = ZSTR_VAL(text);
+
+	return lsp_phpdoc_type_for_word_between(text, value + start_offset, value + end_offset, word, true);
+}
+
+extern zend_string *lsp_phpdoc_type_for_word_raw(zend_string *text, zend_string *word)
+{
+	return lsp_phpdoc_type_for_word_between(text, ZSTR_VAL(text), ZSTR_VAL(text) + ZSTR_LEN(text), word, false);
 }
 
 extern zend_string *lsp_phpdoc_property_type_for_word(zend_string *text, zend_string *word, size_t offset)
