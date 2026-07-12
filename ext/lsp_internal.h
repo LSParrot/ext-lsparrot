@@ -521,9 +521,13 @@ static inline zend_string *lsp_ast_string_value(zend_ast *ast)
 void lsp_lsparrot_tokens_to_zval(zval *return_value, zend_string *source);
 bool lsp_doc_is_identifier_char(char c);
 zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type);
+zend_string *lsp_resolve_class_name_at(zend_string *text, zend_string *type, size_t offset);
+zend_string *lsp_document_namespace_at(zend_string *text, size_t offset);
+zend_string *lsp_document_namespace_at_ex(zend_string *text, size_t offset, bool *multiple);
 bool lsp_token_in_bounds(zval *token, size_t start, size_t end);
 bool lsp_token_at_depth(zend_string *text, zval *token, zend_long depth);
 bool lsp_find_first_class_bounds(zend_string *text, size_t *body_start, size_t *body_end, zend_long *body_depth);
+bool lsp_find_class_header_for_name(zend_string *text, zend_string *class_name, size_t *class_start, size_t *body_start, size_t *body_end, zend_long *body_depth);
 
 static inline bool lsp_keyword_at_slice(const char *value, size_t start, size_t end, const char *keyword, size_t *keyword_end)
 {
@@ -556,7 +560,7 @@ static inline void lsp_add_resolved_trait_name(zval *traits, zend_string *text, 
 	}
 
 	raw = zend_string_init(name_start, name_end - name_start, 0);
-	resolved = lsp_resolve_class_name(text, raw);
+	resolved = lsp_resolve_class_name_at(text, raw, (size_t) (name_start - ZSTR_VAL(text)));
 	zend_string_release(raw);
 	if (resolved) {
 		add_next_index_str(traits, resolved);
@@ -587,24 +591,22 @@ static inline void lsp_collect_trait_names_from_use_slice(zval *traits, zend_str
 	}
 }
 
-static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits)
+/* Collects trait names used inside one specific class body. traits must
+ * already be initialized as an array; entries append to it. */
+static inline void lsp_collect_class_trait_names_in_bounds(zend_string *text, size_t body_start, size_t body_end, zend_long body_depth, zval *traits)
 {
 	const char *value, *slice_start, *slice_end;
-	zend_long body_depth, offset;
+	zend_long offset;
 	zval tokens_zv, *token;
 	HashTable *tokens;
 	uint32_t i, count;
-	size_t body_start, body_end, text_length;
+	size_t text_length;
 
-	array_init(traits);
 	value = ZSTR_VAL(text);
 	text_length = ZSTR_LEN(text);
-	body_start = 0;
-	body_end = 0;
-	body_depth = 0;
 	ZVAL_UNDEF(&tokens_zv);
 	lsp_lsparrot_tokens_to_zval(&tokens_zv, text);
-	if (Z_TYPE(tokens_zv) != IS_ARRAY || !lsp_find_first_class_bounds(text, &body_start, &body_end, &body_depth)) {
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
 		if (!Z_ISUNDEF(tokens_zv)) {
 			zval_ptr_dtor(&tokens_zv);
 		}
@@ -639,6 +641,34 @@ static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits
 	}
 
 	zval_ptr_dtor(&tokens_zv);
+}
+
+/* Legacy shape: traits of the FIRST class in the file. Prefer the _for /
+ * _in_bounds variants — files can declare several classes. */
+static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits)
+{
+	zend_long body_depth = 0;
+	size_t body_start = 0, body_end = 0;
+
+	array_init(traits);
+	if (lsp_find_first_class_bounds(text, &body_start, &body_end, &body_depth)) {
+		lsp_collect_class_trait_names_in_bounds(text, body_start, body_end, body_depth, traits);
+	}
+}
+
+/* Traits of the class declaring the given (fully qualified) name; falls back
+ * to the first class when the name cannot be matched. */
+static inline void lsp_collect_class_trait_names_for(zend_string *text, zend_string *class_name, zval *traits)
+{
+	zend_long body_depth = 0;
+	size_t class_start = 0, body_start = 0, body_end = 0;
+
+	array_init(traits);
+	if (lsp_find_class_header_for_name(text, class_name, &class_start, &body_start, &body_end, &body_depth) ||
+		lsp_find_first_class_bounds(text, &body_start, &body_end, &body_depth)
+	) {
+		lsp_collect_class_trait_names_in_bounds(text, body_start, body_end, body_depth, traits);
+	}
 }
 
 void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, zend_string *uri);
@@ -767,6 +797,7 @@ bool lsp_method_is_public(HashTable *tokens, uint32_t index, zend_string *text, 
 bool lsp_path_value_contains_analysis_helper(const char *path, size_t path_length);
 zend_string *lsp_find_project_symbol_path(lsp_server *server, char expected_kind, zend_string *fqcn);
 bool lsp_member_access_class_context(lsp_server *server, lsp_document *document, size_t offset, zend_string *prefix, zend_string **class_name, zend_string **member_prefix);
+zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset);
 
 size_t lsp_method_signature_end(HashTable *tokens, uint32_t name_index, zend_string *text, zend_long body_depth);
 zend_string *lsp_function_signature_detail(zend_string *text, zval *name_token, HashTable *tokens, uint32_t name_index, zend_long body_depth, const char *prefix);
@@ -838,6 +869,8 @@ bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *cl
 bool lsp_find_function_scope_at(HashTable *tokens, zend_string *text, size_t offset, size_t *param_start, size_t *param_end, size_t *body_start, size_t *body_end, zend_long *body_depth);
 bool lsp_token_is_promoted_property(HashTable *tokens, uint32_t index, zend_string *text, zend_long body_depth, size_t *param_start);
 zend_string *lsp_document_import_bound_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
+zend_string *lsp_document_import_fqcn_for_bound_name(lsp_document *document, char kind, zend_string *name);
+zend_string *lsp_use_statement_class_name_at(zend_string *text, size_t offset);
 size_t lsp_document_import_insert_offset_cached(lsp_document *document, bool *after_existing_use);
 void lsp_document_collect_imports(zend_string *text, HashTable *imports);
 void lsp_perf_stats_record(lsp_server *server, zend_string *method, double elapsed_seconds);

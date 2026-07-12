@@ -3401,6 +3401,62 @@ extern zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type)
 	return resolved;
 }
 
+/* Offset-aware variant for files declaring several namespaces: unqualified
+ * names must resolve against the namespace governing the offset, not the
+ * file's first namespace. Single-namespace files (the overwhelmingly common
+ * case) delegate to the memoized lsp_resolve_class_name. Imports are still
+ * collected file-wide, an accepted approximation. */
+extern zend_string *lsp_resolve_class_name_at(zend_string *text, zend_string *type, size_t offset)
+{
+	zend_string *base, *resolved, *namespace_name;
+	bool multiple = false;
+
+	namespace_name = lsp_document_namespace_at_ex(text, offset, &multiple);
+	if (!multiple) {
+		if (namespace_name != zend_empty_string) {
+			zend_string_release(namespace_name);
+		}
+
+		return lsp_resolve_class_name(text, type);
+	}
+
+	base = lsp_type_class_name(type);
+	if (!base || lsp_type_is_builtin(base)) {
+		if (base) {
+			zend_string_release(base);
+		}
+		if (namespace_name != zend_empty_string) {
+			zend_string_release(namespace_name);
+		}
+
+		return NULL;
+	}
+
+	if (lsp_type_is_fully_qualified(type)) {
+		if (namespace_name != zend_empty_string) {
+			zend_string_release(namespace_name);
+		}
+
+		return base;
+	}
+
+	resolved = lsp_resolve_imported_class_name(text, base);
+	if (!resolved) {
+		if (namespace_name != zend_empty_string) {
+			resolved = strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(base));
+		} else {
+			resolved = zend_string_copy(base);
+		}
+	}
+
+	if (namespace_name != zend_empty_string) {
+		zend_string_release(namespace_name);
+	}
+	zend_string_release(base);
+
+	return resolved;
+}
+
 extern const char *lsp_primary_analyzer_source(lsp_server *server)
 {
 	if (server->phpstan_enabled) {

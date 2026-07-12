@@ -1461,7 +1461,7 @@ static inline zend_string *lsp_project_method_return_type_recursive(lsp_server *
 		return NULL;
 	}
 
-	lsp_collect_class_trait_names(contents, &traits);
+	lsp_collect_class_trait_names_for(contents, class_name, &traits);
 
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
 		if (Z_TYPE_P(trait_zv) != IS_STRING) {
@@ -1931,6 +1931,93 @@ static inline zend_string *lsp_infer_method_array_access_assignment_class(lsp_se
 	return NULL;
 }
 
+/* `$x = $recv->method(...)`: resolve $recv's class and the method's return
+ * class. The $this-> variant is handled by the dedicated scanner; this covers
+ * every other variable receiver. */
+static inline zend_string *lsp_infer_external_call_assignment_class(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text), *end, *match, *q, *recv_start, *method_start, *p;
+	zend_string *receiver, *method_name, *resolved;
+
+	end = value + lsp_current_statement_scan_limit(document->text, offset);
+	p = value;
+	while (p < end) {
+		match = strstr(p, ZSTR_VAL(variable));
+		if (!match || match >= end) {
+			break;
+		}
+
+		p = match + 1;
+		if (match > value && (lsp_doc_is_identifier_char(match[-1]) || match[-1] == '$')) {
+			continue;
+		}
+
+		q = match + ZSTR_LEN(variable);
+		if (q < end && lsp_doc_is_identifier_char(*q)) {
+			continue;
+		}
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		if (q >= end || *q != '=' || (q + 1 < end && (q[1] == '=' || q[1] == '>'))) {
+			continue;
+		}
+
+		q++;
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		if (q >= end || *q != '$') {
+			continue;
+		}
+
+		recv_start = q;
+		q++;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+
+		receiver = zend_string_init(recv_start, (size_t) (q - recv_start), 0);
+		if (zend_string_equals_literal(receiver, "$this")) {
+			zend_string_release(receiver);
+			continue;
+		}
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		if (q + 1 >= end || q[0] != '-' || q[1] != '>') {
+			zend_string_release(receiver);
+			continue;
+		}
+
+		q += 2;
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		method_start = q;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+		if (q == method_start || q >= end || *q != '(') {
+			zend_string_release(receiver);
+			continue;
+		}
+
+		method_name = zend_string_init(method_start, (size_t) (q - method_start), 0);
+		resolved = lsp_resolve_variable_method_return_class(server, document, receiver, method_name, offset);
+		zend_string_release(method_name);
+		zend_string_release(receiver);
+
+		if (resolved) {
+			return resolved;
+		}
+	}
+
+	return NULL;
+}
+
 /* `foreach ($container as $item)` / `as $key => $item`: infer $item's class
  * from the container's array-ish type (`Foo[]`, `array<Foo>`, ...). */
 static inline zend_string *lsp_infer_foreach_element_class(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset)
@@ -2041,13 +2128,13 @@ static inline zend_string *lsp_infer_foreach_element_class(lsp_server *server, l
 	return resolved;
 }
 
-static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
+extern zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
 {
 	zend_string *type, *class_name, *resolved;
 
 	type = lsp_phpdoc_type_for_word(document->text, receiver);
 	if (type) {
-		class_name = lsp_resolve_class_name(document->text, type);
+		class_name = lsp_resolve_class_name_at(document->text, type, offset);
 		zend_string_release(type);
 
 		if (class_name) {
@@ -2057,7 +2144,7 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 
 	type = lsp_phpdoc_property_type_for_word(document->text, receiver, offset);
 	if (type) {
-		class_name = lsp_resolve_class_name(document->text, type);
+		class_name = lsp_resolve_class_name_at(document->text, type, offset);
 		zend_string_release(type);
 
 		if (class_name) {
@@ -2070,7 +2157,7 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 		/* Resolve imports and the current namespace before consulting
 		 * loaded classes, so `use App\DateTime; new DateTime()` does not
 		 * get shadowed by the builtin sharing the short name. */
-		resolved = lsp_resolve_class_name(document->text, class_name);
+		resolved = lsp_resolve_class_name_at(document->text, class_name, offset);
 		if (resolved) {
 			zend_string_release(class_name);
 
@@ -2096,12 +2183,17 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 
 	type = lsp_parameter_declared_type_for_variable(document, receiver, offset);
 	if (type) {
-		class_name = lsp_resolve_class_name(document->text, type);
+		class_name = lsp_resolve_class_name_at(document->text, type, offset);
 		zend_string_release(type);
 
 		if (class_name) {
 			return class_name;
 		}
+	}
+
+	class_name = lsp_infer_external_call_assignment_class(server, document, receiver, offset);
+	if (class_name) {
+		return class_name;
 	}
 
 	return lsp_infer_foreach_element_class(server, document, receiver, offset);
@@ -3279,6 +3371,11 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 	}
 
 	type = lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
+	if (type) {
+		return type;
+	}
+
+	type = lsp_infer_external_call_assignment_class(server, document, variable, offset);
 	if (type) {
 		return type;
 	}

@@ -945,7 +945,8 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 			parent_class = lsp_class_extends_name(contents, class_start, body_start);
 
 			zval_ptr_dtor(&traits);
-			lsp_collect_class_trait_names(contents, &traits);
+			array_init(&traits);
+			lsp_collect_class_trait_names_in_bounds(contents, body_start, body_end, body_depth, &traits);
 		}
 
 		if (!Z_ISUNDEF(tokens_zv)) {
@@ -1353,7 +1354,8 @@ extern void lsp_add_this_member_completions(lsp_server *server, zval *items, lsp
 	}
 
 	/* Members brought in by the current class's own traits. */
-	lsp_collect_class_trait_names(document->text, &traits);
+	array_init(&traits);
+	lsp_collect_class_trait_names_in_bounds(document->text, body_start, body_end, body_depth, &traits);
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
 		if (Z_TYPE_P(trait_zv) == IS_STRING) {
 			lsp_add_inherited_project_class_member_completions(server, items, Z_STR_P(trait_zv), member_prefix);

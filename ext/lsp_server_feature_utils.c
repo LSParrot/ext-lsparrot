@@ -845,7 +845,7 @@ extern zend_string *lsp_class_extends_name(zend_string *text, size_t class_start
 		}
 
 		raw = zend_string_init(name_start, name_end - name_start, 0);
-		resolved = lsp_resolve_class_name(text, raw);
+		resolved = lsp_resolve_class_name_at(text, raw, (size_t) (name_start - value));
 		zend_string_release(raw);
 
 		return resolved;
@@ -883,7 +883,7 @@ extern zend_string *lsp_class_declared_name(zend_string *text, size_t class_star
 			}
 
 			raw = zend_string_init(name_start, name_end - name_start, 0);
-			resolved = lsp_resolve_class_name(text, raw);
+			resolved = lsp_resolve_class_name_at(text, raw, (size_t) (name_start - value));
 			zend_string_release(raw);
 
 			return resolved;

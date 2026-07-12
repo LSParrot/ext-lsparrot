@@ -111,7 +111,7 @@ static inline bool lsp_static_member_access_context(lsp_document *document, size
 		return true;
 	}
 
-	resolved = lsp_resolve_class_name(document->text, raw);
+	resolved = lsp_resolve_class_name_at(document->text, raw, offset);
 	if (resolved) {
 		zend_string_release(raw);
 		*class_name = resolved;

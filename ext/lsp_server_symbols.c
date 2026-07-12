@@ -1293,6 +1293,74 @@ extern zend_string *lsp_document_namespace(zend_string *text)
 	return namespace_name;
 }
 
+/* Namespace in effect at a byte offset. Files may declare several namespaces
+ * (semicolon or braced form); the one whose declaration most recently precedes
+ * the offset governs name resolution there. Falls back to the first namespace
+ * for offsets before any declaration, matching lsp_document_namespace. */
+extern zend_string *lsp_document_namespace_at_ex(zend_string *text, size_t offset, bool *multiple)
+{
+	zval tokens_zv, *token;
+	HashTable *tokens;
+	zend_string *namespace_name;
+	zend_long token_offset;
+	uint32_t i, count, namespace_count;
+	int64_t best_index, first_index;
+
+	*multiple = false;
+
+	ZVAL_UNDEF(&tokens_zv);
+	lsp_lsparrot_tokens_to_zval(&tokens_zv, text);
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
+		if (!Z_ISUNDEF(tokens_zv)) {
+			zval_ptr_dtor(&tokens_zv);
+		}
+
+		return zend_empty_string;
+	}
+
+	tokens = Z_ARRVAL(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	namespace_count = 0;
+	best_index = -1;
+	first_index = -1;
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_NAMESPACE")) {
+			continue;
+		}
+
+		namespace_count++;
+		if (first_index < 0) {
+			first_index = (int64_t) i;
+		}
+
+		token_offset = lsp_token_long(token, "offset", 0);
+		if (token_offset >= 0 && (size_t) token_offset <= offset) {
+			best_index = (int64_t) i;
+		}
+	}
+
+	*multiple = namespace_count > 1;
+	if (best_index < 0) {
+		best_index = first_index;
+	}
+
+	namespace_name = best_index < 0
+		? zend_empty_string
+		: lsp_document_namespace_from_tokens(tokens, (uint32_t) best_index + 1)
+	;
+	zval_ptr_dtor(&tokens_zv);
+
+	return namespace_name;
+}
+
+extern zend_string *lsp_document_namespace_at(zend_string *text, size_t offset)
+{
+	bool multiple;
+
+	return lsp_document_namespace_at_ex(text, offset, &multiple);
+}
+
 static inline bool lsp_symbol_has_namespace(const char *fqcn, size_t fqcn_length, const char **namespace_end)
 {
 	size_t i;
@@ -1525,6 +1593,24 @@ static inline zend_string *lsp_import_alias_set_key(uint32_t target_kind, const 
 	return key;
 }
 
+/* Reverse-lookup key: bound short name -> original-case FQCN. */
+static inline zend_string *lsp_import_reverse_key(uint32_t target_kind, const char *name, size_t length)
+{
+	zend_string *key;
+	size_t i;
+
+	key = zend_string_alloc(length + 3, 0);
+	ZSTR_VAL(key)[0] = 'R';
+	ZSTR_VAL(key)[1] = (char) ('0' + (target_kind % 10));
+	ZSTR_VAL(key)[2] = ':';
+	for (i = 0; i < length; i++) {
+		ZSTR_VAL(key)[i + 3] = (char) tolower((unsigned char) name[i]);
+	}
+	ZSTR_VAL(key)[length + 3] = '\0';
+
+	return key;
+}
+
 static inline void lsp_import_terminal_segment(const char *name, size_t length, const char **segment, size_t *segment_length)
 {
 	size_t i;
@@ -1592,6 +1678,11 @@ static inline void lsp_collect_use_statement_imports(zend_ast *use_ast, zend_str
 
 		key = lsp_import_alias_set_key(elem_kind, alias_value, alias_length);
 		zend_hash_add_empty_element(imports, key);
+		zend_string_release(key);
+
+		key = lsp_import_reverse_key(elem_kind, alias_value, alias_length);
+		ZVAL_STR(&bound, zend_string_copy(full_name));
+		zend_hash_update(imports, key, &bound);
 		zend_string_release(key);
 		zend_string_release(full_name);
 	}
@@ -1703,6 +1794,11 @@ static inline void lsp_collect_import_candidate(HashTable *imports, uint32_t tar
 
 	key = lsp_import_alias_set_key(target_kind, alias_value, alias_length);
 	zend_hash_add_empty_element(imports, key);
+	zend_string_release(key);
+
+	key = lsp_import_reverse_key(target_kind, alias_value, alias_length);
+	ZVAL_STR(&bound, zend_string_copy(full_name));
+	zend_hash_update(imports, key, &bound);
 	zend_string_release(key);
 	zend_string_release(full_name);
 }
@@ -1894,6 +1990,32 @@ extern zend_string *lsp_document_import_bound_name(lsp_document *document, char 
 	zend_string_release(key);
 
 	return value && Z_TYPE_P(value) == IS_STRING ? Z_STR_P(value) : NULL;
+}
+
+/* Reverse lookup: the FQCN whose import binds `name` for the given symbol
+ * kind (e.g. `use function App\helper;` binds "helper"). Returns a new
+ * string or NULL. */
+extern zend_string *lsp_document_import_fqcn_for_bound_name(lsp_document *document, char kind, zend_string *name)
+{
+	zend_string *key, *result = NULL;
+	zval *value;
+	uint32_t target_kind;
+
+	lsp_document_derived_ensure(document);
+	if (!document->derived_imports || zend_hash_num_elements(document->derived_imports) == 0) {
+		return NULL;
+	}
+
+	target_kind = lsp_symbol_import_ast_kind(kind);
+	key = lsp_import_reverse_key(target_kind, ZSTR_VAL(name), ZSTR_LEN(name));
+	value = zend_hash_find(document->derived_imports, key);
+	zend_string_release(key);
+
+	if (value && Z_TYPE_P(value) == IS_STRING) {
+		result = zend_string_copy(Z_STR_P(value));
+	}
+
+	return result;
 }
 
 extern bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length)

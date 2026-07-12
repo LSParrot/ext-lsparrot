@@ -14,6 +14,8 @@
 #include "lsp_internal.h"
 
 static inline bool lsp_refactor_add_scoped_matches(zval *items, zend_string *location_path, lsp_document *document, zend_string *word, size_t offset);
+static inline zval *lsp_refactor_prev_significant_token(HashTable *tokens, uint32_t index);
+static inline bool lsp_refactor_token_is_object_operator(zval *token);
 
 static inline bool lsp_refactor_string_equals_ci(const char *left, size_t left_length, const char *right, size_t right_length)
 {
@@ -966,6 +968,470 @@ static inline void lsp_refactor_add_file_rename_changes(zval *changes, zend_stri
 	add_assoc_zval_ex(changes, ZSTR_VAL(uri), ZSTR_LEN(uri), &text_edits);
 }
 
+/* ------------------------------------------------------------------------
+ * Type-directed method rename. A method rename applies within one
+ * inheritance family (declaring class, its ancestors/interfaces/traits, and
+ * every class connected to them), never to unrelated classes that merely
+ * declare a same-named method. Receivers that cannot be resolved keep the
+ * historical rename-by-name behavior so call sites are not silently missed.
+ * ------------------------------------------------------------------------ */
+
+static inline void lsp_rename_set_add(HashTable *set, zend_string *fqcn)
+{
+	zend_string *key = zend_string_tolower(fqcn);
+
+	zend_hash_add_empty_element(set, key);
+	zend_string_release(key);
+}
+
+static inline bool lsp_rename_set_has(HashTable *set, zend_string *fqcn)
+{
+	zend_string *key = zend_string_tolower(fqcn);
+	bool exists = zend_hash_exists(set, key);
+
+	zend_string_release(key);
+
+	return exists;
+}
+
+/* Parse comma-separated names after `keyword` in a class header slice and
+ * add their resolved FQCNs. */
+static inline void lsp_rename_collect_header_names(lsp_server *server, zend_string *contents, size_t class_start, size_t body_start, const char *keyword, HashTable *out, uint32_t depth);
+
+static void lsp_rename_collect_ancestors(lsp_server *server, zend_string *class_fqcn, HashTable *out, uint32_t depth)
+{
+	lsp_document *open_document;
+	zend_long body_depth = 0;
+	zend_string *path, *contents, *trait_name;
+	zval traits, *trait_zv;
+	size_t class_start = 0, body_start = 0, body_end = 0;
+	bool owns_contents;
+
+	if (depth > 8 || lsp_rename_set_has(out, class_fqcn)) {
+		return;
+	}
+
+	lsp_rename_set_add(out, class_fqcn);
+
+	path = lsp_find_project_symbol_path(server, LSP_SYMBOL_CLASS, class_fqcn);
+	if (!path) {
+		return;
+	}
+
+	open_document = lsp_document_for_path(server, path);
+	contents = open_document ? zend_string_copy(open_document->text) : lsp_read_file(path);
+	owns_contents = open_document || contents != zend_empty_string;
+	zend_string_release(path);
+	if (!owns_contents || contents == zend_empty_string) {
+		if (owns_contents) {
+			zend_string_release(contents);
+		}
+
+		return;
+	}
+
+	if (lsp_find_class_header_for_name(contents, class_fqcn, &class_start, &body_start, &body_end, &body_depth)) {
+		lsp_rename_collect_header_names(server, contents, class_start, body_start, "extends", out, depth);
+		lsp_rename_collect_header_names(server, contents, class_start, body_start, "implements", out, depth);
+
+		array_init(&traits);
+		lsp_collect_class_trait_names_in_bounds(contents, body_start, body_end, body_depth, &traits);
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
+			if (Z_TYPE_P(trait_zv) == IS_STRING) {
+				trait_name = Z_STR_P(trait_zv);
+				lsp_rename_collect_ancestors(server, trait_name, out, depth + 1);
+			}
+		} ZEND_HASH_FOREACH_END();
+		zval_ptr_dtor(&traits);
+	}
+
+	zend_string_release(contents);
+}
+
+static inline void lsp_rename_collect_header_names(lsp_server *server, zend_string *contents, size_t class_start, size_t body_start, const char *keyword, HashTable *out, uint32_t depth)
+{
+	const char *value = ZSTR_VAL(contents), *name_start;
+	zend_string *raw, *resolved;
+	size_t p, header_end, keyword_end, name_end;
+
+	header_end = body_start > 0 ? body_start - 1 : body_start;
+	for (p = class_start; p < header_end; p++) {
+		if (!lsp_keyword_at_slice(value, p, header_end, keyword, &keyword_end)) {
+			continue;
+		}
+
+		p = keyword_end;
+		for (;;) {
+			while (p < header_end && (isspace((unsigned char) value[p]) || value[p] == ',')) {
+				p++;
+			}
+
+			name_start = value + p;
+			while (p < header_end && (lsp_doc_is_identifier_char(value[p]) || value[p] == '\\')) {
+				p++;
+			}
+			name_end = p;
+			if (value + name_end <= name_start) {
+				break;
+			}
+
+			raw = zend_string_init(name_start, (size_t) (value + name_end - name_start), 0);
+			resolved = lsp_resolve_class_name(contents, raw);
+			zend_string_release(raw);
+			if (resolved) {
+				lsp_rename_collect_ancestors(server, resolved, out, depth + 1);
+				zend_string_release(resolved);
+			}
+
+			while (p < header_end && isspace((unsigned char) value[p])) {
+				p++;
+			}
+			if (p >= header_end || value[p] != ',') {
+				break;
+			}
+		}
+
+		return;
+	}
+}
+
+/* Is `candidate` in the family: itself or any ancestor intersects owner_set? */
+static inline bool lsp_rename_class_in_family(lsp_server *server, zend_string *candidate, HashTable *owner_set, HashTable *cache)
+{
+	HashTable *ancestors;
+	zend_string *key, *name;
+	zval *cached, ptr;
+	bool related = false;
+
+	key = zend_string_tolower(candidate);
+	cached = zend_hash_find(cache, key);
+	if (cached) {
+		ancestors = (HashTable *) Z_PTR_P(cached);
+	} else {
+		ancestors = emalloc(sizeof(HashTable));
+		zend_hash_init(ancestors, 8, NULL, NULL, 0);
+		lsp_rename_collect_ancestors(server, candidate, ancestors, 0);
+		ZVAL_PTR(&ptr, ancestors);
+		zend_hash_update(cache, key, &ptr);
+	}
+	zend_string_release(key);
+
+	ZEND_HASH_FOREACH_STR_KEY(ancestors, name) {
+		if (name && zend_hash_exists(owner_set, name)) {
+			related = true;
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return related;
+}
+
+/* The class whose method the cursor targets, or NULL when the cursor is not
+ * on a method declaration/access. */
+static inline zend_string *lsp_rename_method_owner(lsp_server *server, lsp_document *document, size_t offset, zend_string *word)
+{
+	const char *value = ZSTR_VAL(document->text);
+	zend_long body_depth = 0;
+	zend_string *owner, *member_prefix;
+	size_t word_start, before, kw_start, class_start = 0, body_start = 0, body_end = 0;
+	bool public_only;
+
+	word_start = offset > ZSTR_LEN(document->text) ? ZSTR_LEN(document->text) : offset;
+	while (word_start > 0 && lsp_doc_is_identifier_char(value[word_start - 1])) {
+		word_start--;
+	}
+
+	before = word_start;
+	while (before > 0 && isspace((unsigned char) value[before - 1])) {
+		before--;
+	}
+
+	/* Declaration: `function word`. */
+	kw_start = before;
+	while (kw_start > 0 && lsp_doc_is_identifier_char(value[kw_start - 1])) {
+		kw_start--;
+	}
+	if (before - kw_start == sizeof("function") - 1 &&
+		strncasecmp(value + kw_start, "function", sizeof("function") - 1) == 0
+	) {
+		if (!lsp_find_enclosing_class_header(document->text, offset, &class_start, &body_start, &body_end, &body_depth)) {
+			return NULL;
+		}
+
+		return lsp_class_declared_name(document->text, class_start, body_start);
+	}
+
+	/* Instance access: `...->word`. */
+	if (before >= 2 && value[before - 1] == '>' && (value[before - 2] == '-' ||
+		(before >= 3 && value[before - 2] == '?' && value[before - 3] == '-'))
+	) {
+		owner = NULL;
+		if (lsp_member_access_class_context(server, document, word_start + ZSTR_LEN(word), word, &owner, &member_prefix)) {
+			zend_string_release(member_prefix);
+
+			return owner;
+		}
+
+		if (lsp_find_enclosing_class_header(document->text, offset, &class_start, &body_start, &body_end, &body_depth)) {
+			return lsp_class_declared_name(document->text, class_start, body_start);
+		}
+
+		return NULL;
+	}
+
+	/* Static access: `Receiver::word`. */
+	if (before >= 2 && value[before - 1] == ':' && value[before - 2] == ':') {
+		if (lsp_static_member_receiver_class(document, offset, word, &owner, &public_only)) {
+			return owner;
+		}
+	}
+
+	return NULL;
+}
+
+/* Receiver-aware method rename inside one file's contents. */
+static inline void lsp_rename_add_method_changes_in_contents(lsp_server *server, zval *changes, lsp_document *open_document, zend_string *uri, zend_string *contents, zend_string *word, zend_string *new_text, HashTable *owner_set, HashTable *cache)
+{
+	const char *value = ZSTR_VAL(contents);
+	zend_long body_depth = 0;
+	zend_string *text, *receiver, *enclosing, *resolved;
+	zval tokens_zv, *token, *previous, text_edits, edit, range;
+	HashTable *tokens;
+	uint32_t i, count, added = 0;
+	size_t token_offset, recv_end, recv_start, class_start = 0, body_start = 0, body_end = 0;
+	bool include;
+
+	ZVAL_UNDEF(&tokens_zv);
+	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
+		if (!Z_ISUNDEF(tokens_zv)) {
+			zval_ptr_dtor(&tokens_zv);
+		}
+
+		return;
+	}
+
+	array_init(&text_edits);
+	tokens = Z_ARRVAL(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_STRING")) {
+			continue;
+		}
+
+		text = lsp_token_string(token, "text");
+		if (!text ||
+			ZSTR_LEN(text) != ZSTR_LEN(word) ||
+			strncasecmp(ZSTR_VAL(text), ZSTR_VAL(word), ZSTR_LEN(word)) != 0
+		) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		previous = lsp_refactor_prev_significant_token(tokens, i);
+		include = false;
+
+		if (previous && (lsp_token_name_equals(previous, "T_FUNCTION") || lsp_token_is_char(previous, '&'))) {
+			/* Declaration: rename when the declaring class is family. */
+			if (lsp_find_enclosing_class_header(contents, token_offset, &class_start, &body_start, &body_end, &body_depth)) {
+				enclosing = lsp_class_declared_name(contents, class_start, body_start);
+				if (enclosing) {
+					include = lsp_rename_class_in_family(server, enclosing, owner_set, cache);
+					zend_string_release(enclosing);
+				}
+			}
+		} else if (previous && lsp_refactor_token_is_object_operator(previous)) {
+			recv_end = (size_t) lsp_token_long(previous, "offset", 0);
+			while (recv_end > 0 && isspace((unsigned char) value[recv_end - 1])) {
+				recv_end--;
+			}
+			recv_start = recv_end;
+			while (recv_start > 0 && (lsp_doc_is_identifier_char(value[recv_start - 1]) || value[recv_start - 1] == '$')) {
+				recv_start--;
+			}
+
+			if (recv_end > recv_start && value[recv_start] == '$') {
+				receiver = zend_string_init(value + recv_start, recv_end - recv_start, 0);
+				if (zend_string_equals_literal(receiver, "$this")) {
+					include = true;
+					if (lsp_find_enclosing_class_header(contents, token_offset, &class_start, &body_start, &body_end, &body_depth)) {
+						enclosing = lsp_class_declared_name(contents, class_start, body_start);
+						if (enclosing) {
+							include = lsp_rename_class_in_family(server, enclosing, owner_set, cache);
+							zend_string_release(enclosing);
+						}
+					}
+				} else if (open_document) {
+					resolved = lsp_infer_receiver_class(server, open_document, receiver, token_offset);
+					include = !resolved || lsp_rename_class_in_family(server, resolved, owner_set, cache);
+					if (resolved) {
+						zend_string_release(resolved);
+					}
+				} else {
+					/* Unresolvable receiver in a closed file: keep the
+					 * historical rename-by-name behavior. */
+					include = true;
+				}
+				zend_string_release(receiver);
+			} else {
+				include = true;
+			}
+		} else if (previous && lsp_token_name_equals(previous, "T_DOUBLE_COLON")) {
+			recv_end = (size_t) lsp_token_long(previous, "offset", 0);
+			while (recv_end > 0 && isspace((unsigned char) value[recv_end - 1])) {
+				recv_end--;
+			}
+			recv_start = recv_end;
+			while (recv_start > 0 && (lsp_doc_is_identifier_char(value[recv_start - 1]) || value[recv_start - 1] == '\\')) {
+				recv_start--;
+			}
+
+			resolved = NULL;
+			if (recv_end > recv_start) {
+				receiver = zend_string_init(value + recv_start, recv_end - recv_start, 0);
+				if (zend_string_equals_literal_ci(receiver, "self") ||
+					zend_string_equals_literal_ci(receiver, "static") ||
+					zend_string_equals_literal_ci(receiver, "parent")
+				) {
+					if (lsp_find_enclosing_class_header(contents, token_offset, &class_start, &body_start, &body_end, &body_depth)) {
+						resolved = zend_string_equals_literal_ci(receiver, "parent")
+							? lsp_class_extends_name(contents, class_start, body_start)
+							: lsp_class_declared_name(contents, class_start, body_start)
+						;
+					}
+				} else {
+					resolved = lsp_resolve_class_name(contents, receiver);
+				}
+				zend_string_release(receiver);
+			}
+
+			include = !resolved || lsp_rename_class_in_family(server, resolved, owner_set, cache);
+			if (resolved) {
+				zend_string_release(resolved);
+			}
+		}
+
+		if (!include) {
+			continue;
+		}
+
+		array_init(&edit);
+		lsp_range_from_offsets(contents, token_offset, token_offset + ZSTR_LEN(text), &range);
+		add_assoc_zval(&edit, "range", &range);
+		add_assoc_str(&edit, "newText", zend_string_copy(new_text));
+		add_next_index_zval(&text_edits, &edit);
+		added++;
+	}
+
+	zval_ptr_dtor(&tokens_zv);
+
+	if (added == 0) {
+		zval_ptr_dtor(&text_edits);
+
+		return;
+	}
+
+	add_assoc_zval_ex(changes, ZSTR_VAL(uri), ZSTR_LEN(uri), &text_edits);
+}
+
+static inline void lsp_rename_ancestor_cache_destroy(HashTable *cache)
+{
+	zval *entry;
+	HashTable *ancestors;
+
+	ZEND_HASH_FOREACH_VAL(cache, entry) {
+		ancestors = (HashTable *) Z_PTR_P(entry);
+		if (ancestors) {
+			zend_hash_destroy(ancestors);
+			efree(ancestors);
+		}
+	} ZEND_HASH_FOREACH_END();
+	zend_hash_destroy(cache);
+}
+
+/* Full type-directed method rename across the project. Returns false when
+ * the cursor is not on a method, leaving the generic rename to run. */
+static inline bool lsp_refactor_add_method_rename_changes(lsp_server *server, zval *changes, lsp_document *primary_document, size_t offset, zend_string *word, zend_string *new_text)
+{
+	lsp_symbol_index_header *header;
+	lsp_document *open_document;
+	zend_string *owner, *path_string, *uri, *contents;
+	HashTable owner_set, cache, visited;
+	uint32_t i;
+	size_t fqcn_length, path_length;
+	char *cursor, *end, kind, *fqcn, *path;
+	bool owns_contents;
+
+	owner = lsp_rename_method_owner(server, primary_document, offset, word);
+	if (!owner) {
+		return false;
+	}
+
+	lsp_index_join_worker(server);
+
+	zend_hash_init(&owner_set, 8, NULL, NULL, 0);
+	zend_hash_init(&cache, 8, NULL, ZVAL_PTR_DTOR, 0);
+	lsp_rename_collect_ancestors(server, owner, &owner_set, 0);
+	zend_string_release(owner);
+
+	/* Primary document first. */
+	lsp_rename_add_method_changes_in_contents(server, changes, primary_document, primary_document->uri, primary_document->text, word, new_text, &owner_set, &cache);
+
+	if (server->symbol_index.available && server->symbol_index.addr) {
+		header = (lsp_symbol_index_header *) server->symbol_index.addr;
+		if (header->magic == LSP_SYMBOL_INDEX_MAGIC && header->used <= header->capacity) {
+			zend_hash_init(&visited, 128, NULL, NULL, 0);
+			zend_hash_add_empty_element(&visited, primary_document->path);
+			cursor = ((char *) server->symbol_index.addr) + sizeof(lsp_symbol_index_header);
+			end = ((char *) server->symbol_index.addr) + header->used;
+			for (i = 0; i < header->symbol_count && cursor < end; i++) {
+				kind = *cursor++;
+				fqcn = cursor;
+				fqcn_length = strlen(fqcn);
+				path = fqcn + fqcn_length + 1;
+				if (path >= end) {
+					break;
+				}
+
+				path_length = strlen(path);
+				cursor = path + path_length + 1;
+				(void) kind;
+				(void) fqcn_length;
+				if (cursor > end || lsp_path_value_contains_analysis_helper(path, path_length) || lsp_path_value_contains_vendor(path, path_length)) {
+					continue;
+				}
+
+				path_string = zend_string_init(path, path_length, 0);
+				if (zend_hash_exists(&visited, path_string)) {
+					zend_string_release(path_string);
+					continue;
+				}
+				zend_hash_add_empty_element(&visited, path_string);
+
+				open_document = lsp_document_for_path(server, path_string);
+				contents = open_document ? zend_string_copy(open_document->text) : lsp_read_file(path_string);
+				owns_contents = open_document || contents != zend_empty_string;
+				if (owns_contents && contents != zend_empty_string) {
+					uri = lsp_uri_from_path(path_string);
+					lsp_rename_add_method_changes_in_contents(server, changes, open_document, uri, contents, word, new_text, &owner_set, &cache);
+					zend_string_release(uri);
+				}
+				if (owns_contents) {
+					zend_string_release(contents);
+				}
+				zend_string_release(path_string);
+			}
+			zend_hash_destroy(&visited);
+		}
+	}
+
+	zend_hash_destroy(&owner_set);
+	lsp_rename_ancestor_cache_destroy(&cache);
+
+	return true;
+}
+
 static inline void lsp_refactor_add_project_rename_changes(lsp_server *server, zval *changes, lsp_document *primary_document, zend_string *word, zend_string *new_text)
 {
 	lsp_symbol_index_header *header;
@@ -1883,7 +2349,7 @@ extern void lsp_lsparrot_implementation(lsp_server *server, zval *return_value, 
 		}
 	}
 
-	target = lsp_resolve_class_name(document->text, word);
+	target = lsp_resolve_class_name_at(document->text, word, offset);
 	if (!target) {
 		target = zend_string_copy(word);
 	}
@@ -2074,11 +2540,13 @@ extern void lsp_lsparrot_rename(lsp_server *server, zval *return_value, lsp_docu
 	if (variable && lsp_refactor_add_scoped_variable_rename_changes(&changes, document, word, new_text, offset)) {
 		/* Local variable scoped rename: property declarations and other
 		 * functions' same-named locals stay untouched. */
+	} else if (!variable && lsp_refactor_add_method_rename_changes(server, &changes, document, offset, word, new_text)) {
+		/* Type-directed method rename handled everything. */
 	} else {
 		lsp_refactor_add_file_rename_changes(&changes, document->uri, document->text, word, new_text);
-	}
-	if (!variable) {
-		lsp_refactor_add_project_rename_changes(server, &changes, document, word, new_text);
+		if (!variable) {
+			lsp_refactor_add_project_rename_changes(server, &changes, document, word, new_text);
+		}
 	}
 
 	zend_string_release(new_text);

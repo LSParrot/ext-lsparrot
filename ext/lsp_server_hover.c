@@ -1130,7 +1130,7 @@ static inline zend_string *lsp_hover_symbol_markdown_for(lsp_server *server, zen
 	return markdown;
 }
 
-static inline zend_string *lsp_hover_project_symbol_markdown(lsp_server *server, lsp_document *document, zend_string *word)
+static inline zend_string *lsp_hover_project_symbol_markdown(lsp_server *server, lsp_document *document, zend_string *word, size_t offset)
 {
 	zend_string *resolved, *markdown;
 
@@ -1140,7 +1140,7 @@ static inline zend_string *lsp_hover_project_symbol_markdown(lsp_server *server,
 
 	lsp_index_join_worker(server);
 
-	resolved = lsp_resolve_class_name(document->text, word);
+	resolved = lsp_resolve_class_name_at(document->text, word, offset);
 
 	markdown = NULL;
 	if (resolved) {
@@ -1326,9 +1326,41 @@ extern void lsp_lsparrot_hover(lsp_server *server, zval *return_value, lsp_docum
 		return;
 	}
 
+	/* `use Foo\Bar;` / `use function Foo\bar;` statement names hover as
+	 * the imported symbol. */
+	markdown = NULL;
+	{
+		zend_string *import_name = lsp_use_statement_class_name_at(document->text, offset);
+
+		if (import_name) {
+			lsp_index_join_worker(server);
+			markdown = lsp_hover_symbol_markdown_for(server, import_name, LSP_SYMBOL_CLASS);
+			if (!markdown) {
+				markdown = lsp_hover_symbol_markdown_for(server, import_name, LSP_SYMBOL_FUNCTION);
+			}
+			if (!markdown) {
+				markdown = lsp_hover_symbol_markdown_for(server, import_name, LSP_SYMBOL_CONSTANT);
+			}
+			zend_string_release(import_name);
+		}
+	}
+
+	/* Bare call to a function imported via `use function`. */
+	if (!markdown) {
+		zend_string *imported_function = lsp_document_import_fqcn_for_bound_name(document, LSP_SYMBOL_FUNCTION, word);
+
+		if (imported_function) {
+			lsp_index_join_worker(server);
+			markdown = lsp_hover_symbol_markdown_for(server, imported_function, LSP_SYMBOL_FUNCTION);
+			zend_string_release(imported_function);
+		}
+	}
+
 	/* Member/static hovers first: a property or constant named like a PHP
 	 * builtin (Widget::MAX, $w->count) must not surface the builtin. */
-	markdown = lsp_hover_static_member_markdown(server, document, word, offset);
+	if (!markdown) {
+		markdown = lsp_hover_static_member_markdown(server, document, word, offset);
+	}
 	if (!markdown) {
 		markdown = lsp_hover_member_access_markdown(server, document, word, offset);
 	}
@@ -1342,7 +1374,7 @@ extern void lsp_lsparrot_hover(lsp_server *server, zval *return_value, lsp_docum
 		markdown = lsp_hover_builtin_symbol_markdown(word);
 	}
 	if (!markdown) {
-		markdown = lsp_hover_project_symbol_markdown(server, document, word);
+		markdown = lsp_hover_project_symbol_markdown(server, document, word, offset);
 	}
 	if (markdown) {
 		array_init(return_value);

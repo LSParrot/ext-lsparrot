@@ -57,7 +57,7 @@ static inline void lsp_definition_location_from_offsets(zend_string *path, zend_
 	add_assoc_zval(location, "range", &range);
 }
 
-static inline bool lsp_method_definition_in_contents(zend_string *path, zend_string *contents, zend_string *member_name, zval *return_value, zend_string **parent_class)
+static inline bool lsp_method_definition_in_contents(zend_string *path, zend_string *contents, zend_string *class_name, zend_string *member_name, zval *return_value, zend_string **parent_class)
 {
 	zend_long body_depth = 0;
 	zend_string *label;
@@ -65,13 +65,21 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 	HashTable *tokens;
 	uint32_t i, count, name_index;
 	size_t class_start = 0, body_start = 0, body_end = 0, name_offset, promoted_param_start;
+	bool class_found;
 
 	*parent_class = NULL;
 
 	ZVAL_UNDEF(&tokens_zv);
 	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
 
-	if (Z_TYPE(tokens_zv) != IS_ARRAY || !lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth)) {
+	/* Files may declare several classes; scan the one actually targeted and
+	 * only fall back to the first class when the name cannot be matched. */
+	class_found = class_name && lsp_find_class_header_for_name(contents, class_name, &class_start, &body_start, &body_end, &body_depth);
+	if (!class_found) {
+		class_found = lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth);
+	}
+
+	if (Z_TYPE(tokens_zv) != IS_ARRAY || !class_found) {
 		if (!Z_ISUNDEF(tokens_zv)) {
 			zval_ptr_dtor(&tokens_zv);
 		}
@@ -161,7 +169,7 @@ extern bool lsp_project_method_definition_for_class(lsp_server *server, zend_str
 	}
 
 	parent_class = NULL;
-	found = lsp_method_definition_in_contents(path, contents, member_name, return_value, &parent_class);
+	found = lsp_method_definition_in_contents(path, contents, class_name, member_name, return_value, &parent_class);
 	if (found) {
 		zend_string_release(contents);
 		zend_string_release(path);
@@ -173,7 +181,7 @@ extern bool lsp_project_method_definition_for_class(lsp_server *server, zend_str
 	}
 
 	/* Methods brought in by traits declare in the trait's own file. */
-	lsp_collect_class_trait_names(contents, &traits);
+	lsp_collect_class_trait_names_for(contents, class_name, &traits);
 	zend_string_release(contents);
 	zend_string_release(path);
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
@@ -373,7 +381,7 @@ static inline bool lsp_definition_constant_name_location(zend_string *path, zend
 	return false;
 }
 
-static inline bool lsp_static_member_definition_in_contents(zend_string *path, zend_string *contents, zend_string *member_name, bool public_only, zval *return_value, zend_string **parent_class)
+static inline bool lsp_static_member_definition_in_contents(zend_string *path, zend_string *contents, zend_string *class_name, zend_string *member_name, bool public_only, zval *return_value, zend_string **parent_class)
 {
 	zend_long body_depth = 0;
 	lsp_method_visibility visibility;
@@ -382,14 +390,20 @@ static inline bool lsp_static_member_definition_in_contents(zend_string *path, z
 	HashTable *tokens;
 	uint32_t i, count, name_index;
 	size_t class_start = 0, body_start = 0, body_end = 0, name_offset;
-	bool static_member;
+	bool static_member, class_found;
 
 	*parent_class = NULL;
 
 	ZVAL_UNDEF(&tokens_zv);
 	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
 
-	if (Z_TYPE(tokens_zv) != IS_ARRAY || !lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth)) {
+	/* Same multi-class rule as lsp_method_definition_in_contents. */
+	class_found = class_name && lsp_find_class_header_for_name(contents, class_name, &class_start, &body_start, &body_end, &body_depth);
+	if (!class_found) {
+		class_found = lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth);
+	}
+
+	if (Z_TYPE(tokens_zv) != IS_ARRAY || !class_found) {
 		if (!Z_ISUNDEF(tokens_zv)) {
 			zval_ptr_dtor(&tokens_zv);
 		}
@@ -494,7 +508,7 @@ static inline bool lsp_project_static_member_definition_for_class(lsp_server *se
 	}
 
 	parent_class = NULL;
-	found = lsp_static_member_definition_in_contents(path, contents, member_name, public_only, return_value, &parent_class);
+	found = lsp_static_member_definition_in_contents(path, contents, class_name, member_name, public_only, return_value, &parent_class);
 	zend_string_release(contents);
 	zend_string_release(path);
 	if (found) {
@@ -617,7 +631,7 @@ extern bool lsp_static_member_receiver_class(lsp_document *document, size_t offs
 		return *class_name != NULL;
 	}
 
-	resolved = lsp_resolve_class_name(document->text, receiver);
+	resolved = lsp_resolve_class_name_at(document->text, receiver, offset);
 	if (resolved) {
 		zend_string_release(receiver);
 		*class_name = resolved;
@@ -921,7 +935,7 @@ static inline bool lsp_project_member_definition(lsp_server *server, lsp_documen
 	return found;
 }
 
-static inline zend_string *lsp_use_statement_class_name_at(zend_string *text, size_t offset)
+extern zend_string *lsp_use_statement_class_name_at(zend_string *text, size_t offset)
 {
 	const char *value = ZSTR_VAL(text), *statement_start, *statement_end, *p, *name_start, *name_end, *alias_keyword;
 	size_t start, end, length = ZSTR_LEN(text);
@@ -1006,9 +1020,10 @@ static inline bool lsp_project_class_definition(lsp_server *server, zend_string 
 	zend_string *path, *contents, *label, *uri;
 	zval tokens_zv, *token, *name_token, range, start, end_range;
 	HashTable *tokens;
+	zend_long target_depth = 0;
 	uint32_t i, count, name_index;
-	size_t class_label_length, name_offset;
-	bool located = false;
+	size_t class_label_length, name_offset, target_class_start = 0, target_body_start = 0, target_body_end = 0;
+	bool located = false, have_target;
 
 	path = lsp_find_project_symbol_path(server, LSP_SYMBOL_CLASS, class_name);
 	if (!path) {
@@ -1020,6 +1035,10 @@ static inline bool lsp_project_class_definition(lsp_server *server, zend_string 
 		class_label = lsp_basename_from_fqcn(ZSTR_VAL(class_name), ZSTR_LEN(class_name), &class_label_length);
 		ZVAL_UNDEF(&tokens_zv);
 		lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
+
+		/* Several classes in the file can share the short name across
+		 * namespaces; anchor on the header whose resolved FQCN matches. */
+		have_target = lsp_find_class_header_for_name(contents, class_name, &target_class_start, &target_body_start, &target_body_end, &target_depth);
 
 		if (Z_TYPE(tokens_zv) == IS_ARRAY) {
 			tokens = Z_ARRVAL(tokens_zv);
@@ -1040,6 +1059,9 @@ static inline bool lsp_project_class_definition(lsp_server *server, zend_string 
 				 * cmd-hover in VSCode) show the declaration instead of a
 				 * single character at column zero. */
 				name_offset = (size_t) lsp_token_long(name_token, "offset", 0);
+				if (have_target && (name_offset < target_class_start || name_offset >= target_body_start)) {
+					continue;
+				}
 				lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(label), return_value);
 				located = true;
 				break;
@@ -1248,7 +1270,7 @@ extern void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_
 
 	class_name = lsp_use_statement_class_name_at(document->text, offset);
 	if (!class_name && ZSTR_LEN(word) > 0) {
-		class_name = lsp_resolve_class_name(document->text, word);
+		class_name = lsp_resolve_class_name_at(document->text, word, offset);
 	}
 
 	if (class_name) {
