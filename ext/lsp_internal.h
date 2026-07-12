@@ -130,11 +130,23 @@ typedef enum _lsp_psalm_transport {
 	LSP_PSALM_TRANSPORT_LANGUAGE_SERVER
 } lsp_psalm_transport;
 
+typedef enum _lsp_indent_style {
+	LSP_INDENT_STYLE_CLIENT = 0,
+	LSP_INDENT_STYLE_SPACE = 1,
+	LSP_INDENT_STYLE_TAB = 2,
+} lsp_indent_style;
+
 typedef struct _lsp_options {
 	size_t symbol_index_size;
 	zend_long worker_count;
 	zend_long phpstan_level;
 	zend_long psalm_level;
+	bool formatting_enabled;
+	bool formatting_reindent;
+	bool formatting_trim_trailing_whitespace;
+	bool formatting_insert_final_newline;
+	lsp_indent_style formatting_indent_style;
+	zend_long formatting_indent_size;
 	double analyzer_diagnostics_timeout;
 	double analyzer_type_query_timeout;
 	bool analyzer_auto;
@@ -839,7 +851,7 @@ void lsp_lsparrot_code_action(lsp_server *server, zval *return_value, lsp_docume
 void lsp_add_analyzer_quick_fixes(zval *actions, lsp_document *document, zval *params);
 void lsp_lsparrot_prepare_rename(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_rename(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
-void lsp_lsparrot_formatting(lsp_server *server, zval *return_value, lsp_document *document);
+void lsp_lsparrot_formatting(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_range_formatting(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_inlay_hint(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_semantic_tokens(lsp_server *server, zval *return_value, lsp_document *document);
@@ -954,6 +966,8 @@ void lsp_reschedule_psalm_project_analyzer(lsp_server *server, zend_string *proj
 bool lsp_scan_should_skip_dir_name(const char *name);
 zend_string *lsp_composer_config_string(zend_string *root, const char *key);
 zend_string *lsp_composer_vendor_dir(zend_string *project_root);
+zval *lsp_composer_json_decoded(zend_string *project_root);
+void lsp_composer_cache_clear(void);
 bool lsp_path_is_under_composer_vendor_dir(zend_string *path, zend_string *project_root);
 bool lsp_path_is_in_workspace_composer_vendor(zend_string *workspace_root, zend_string *path);
 void lsp_line_range(zval *range, zend_string *text, zend_long one_based_line);

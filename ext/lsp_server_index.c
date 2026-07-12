@@ -646,6 +646,43 @@ static inline char lsp_class_like_symbol_kind_for_file(zend_string *path, zend_s
 	return kind;
 }
 
+/* --- multi-worker initial indexing -----------------------------------------
+ * The initial project scan reads and lexes/compiles every reachable PHP file,
+ * which dominates start-up on large trees. The scan is split into a cheap
+ * discovery pass (directory walks + composer autoload maps, run once in the
+ * coordinating process) and an expensive per-file symbol extraction pass that
+ * fans out across worker processes. Discovery runs with the two collect sinks
+ * set, turning the existing scan functions into work-list producers; workers
+ * run with the emit sink set, streaming (kind, fqcn, path) records to a part
+ * file instead of touching the shared-memory index, which only the
+ * coordinator writes. */
+static zval *lsp_index_collect_files_sink = NULL;
+static zval *lsp_index_collect_classmap_sink = NULL;
+static FILE *lsp_index_emit_sink = NULL;
+
+static inline void lsp_index_emit_symbol(lsp_server *server, char kind, zend_string *fqcn, zend_string *path)
+{
+	uint32_t fqcn_length, path_length;
+
+	if (!lsp_index_emit_sink) {
+		lsp_symbol_index_add_symbol_kind(&server->symbol_index, kind, fqcn, path);
+
+		return;
+	}
+
+	fqcn_length = (uint32_t) ZSTR_LEN(fqcn);
+	path_length = (uint32_t) ZSTR_LEN(path);
+	if (fwrite(&kind, sizeof(kind), 1, lsp_index_emit_sink) != 1 ||
+		fwrite(&fqcn_length, sizeof(fqcn_length), 1, lsp_index_emit_sink) != 1 ||
+		fwrite(&path_length, sizeof(path_length), 1, lsp_index_emit_sink) != 1 ||
+		fwrite(ZSTR_VAL(fqcn), 1, fqcn_length, lsp_index_emit_sink) != fqcn_length ||
+		fwrite(ZSTR_VAL(path), 1, path_length, lsp_index_emit_sink) != path_length
+	) {
+		/* Truncated part files are detected (and discarded from that point)
+		 * by the reader; nothing useful to do here. */
+	}
+}
+
 static inline void lsp_scan_psr4_dir(lsp_server *server, zend_string *dir, uint32_t depth)
 {
 	const char *entry_name;
@@ -861,12 +898,32 @@ static inline void lsp_index_classmap(lsp_server *server, zend_string *composer_
 		return;
 	}
 
+	if (lsp_index_collect_classmap_sink) {
+		/* Discovery pass: defer the per-file kind detection to the workers. */
+		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(classmap), class_name, path_zv) {
+			zval pair;
+
+			if (!class_name || Z_TYPE_P(path_zv) != IS_STRING) {
+				continue;
+			}
+
+			array_init(&pair);
+			add_next_index_str(&pair, zend_string_copy(class_name));
+			add_next_index_str(&pair, zend_string_copy(Z_STR_P(path_zv)));
+			add_next_index_zval(lsp_index_collect_classmap_sink, &pair);
+		} ZEND_HASH_FOREACH_END();
+
+		zval_ptr_dtor(&classmap);
+		zend_string_release(classmap_path);
+		return;
+	}
+
 	zend_hash_init(&file_kinds, 64, NULL, ZVAL_PTR_DTOR, 0);
 	ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(classmap), class_name, path_zv) {
 		if (!class_name || Z_TYPE_P(path_zv) != IS_STRING) {
 			continue;
 		}
-		lsp_symbol_index_add_symbol_kind(&server->symbol_index, lsp_class_like_symbol_kind_for_file_memoized(&file_kinds, Z_STR_P(path_zv), class_name), class_name, Z_STR_P(path_zv));
+		lsp_index_emit_symbol(server, lsp_class_like_symbol_kind_for_file_memoized(&file_kinds, Z_STR_P(path_zv), class_name), class_name, Z_STR_P(path_zv));
 	} ZEND_HASH_FOREACH_END();
 	zend_hash_destroy(&file_kinds);
 
@@ -948,7 +1005,7 @@ static inline void lsp_index_function_symbol(lsp_server *server, zend_string *na
 		fqfn = zend_string_copy(name);
 	}
 
-	lsp_symbol_index_add_symbol_kind(&server->symbol_index, LSP_SYMBOL_FUNCTION, fqfn, path);
+	lsp_index_emit_symbol(server, LSP_SYMBOL_FUNCTION, fqfn, path);
 
 	zend_string_release(fqfn);
 }
@@ -963,7 +1020,7 @@ static inline void lsp_index_named_symbol(lsp_server *server, char kind, zend_st
 		fqcn = zend_string_copy(name);
 	}
 
-	lsp_symbol_index_add_symbol_kind(&server->symbol_index, kind, fqcn, path);
+	lsp_index_emit_symbol(server, kind, fqcn, path);
 
 	zend_string_release(fqcn);
 }
@@ -1274,6 +1331,12 @@ static inline void lsp_index_declared_symbols_in_file(lsp_server *server, zend_s
 {
 	zend_string *contents;
 
+	if (lsp_index_collect_files_sink) {
+		add_next_index_str(lsp_index_collect_files_sink, zend_string_copy(path));
+
+		return;
+	}
+
 	contents = lsp_read_file(path);
 	if (contents == zend_empty_string) {
 		return;
@@ -1411,6 +1474,254 @@ static inline void lsp_index_workspace_composer_projects(lsp_server *server, zen
 	lsp_dir_close(handle);
 }
 
+static inline void lsp_build_project_index_work(lsp_server *server)
+{
+	lsp_index_composer_project(server, server->root);
+	lsp_index_workspace_composer_projects(server, server->root, 0);
+}
+
+#if LSP_HAVE_POSIX_PROCESS
+#define LSP_INDEX_PARALLEL_MIN_WORK 32u
+#define LSP_INDEX_PARALLEL_MAX_WORKERS 16
+
+static inline zend_string *lsp_index_part_path(lsp_server *server, uint32_t worker_id, long stamp)
+{
+	return strpprintf(0, "%s/.lsparrot/index.part.%u.%ld", ZSTR_VAL(server->root), worker_id, stamp);
+}
+
+/* Deterministic classmap partition: entries that share a path land on the
+ * same worker so the per-file declaration memo stays effective. Workers and
+ * the coordinator recompute the identical assignment from iteration order. */
+static inline uint32_t lsp_index_classmap_bucket(HashTable *assignments, zend_string *path, uint32_t worker_count, uint32_t *next_bucket)
+{
+	zval *existing, bucket_zv;
+	uint32_t bucket;
+
+	existing = zend_hash_find(assignments, path);
+	if (existing) {
+		return (uint32_t) Z_LVAL_P(existing);
+	}
+
+	bucket = *next_bucket;
+	*next_bucket = (bucket + 1) % worker_count;
+	ZVAL_LONG(&bucket_zv, (zend_long) bucket);
+	zend_hash_add(assignments, path, &bucket_zv);
+
+	return bucket;
+}
+
+static inline void lsp_index_parallel_child_run(lsp_server *server, zval *files, zval *classmap_pairs, uint32_t worker_id, uint32_t worker_count, zend_string *part_path)
+{
+	HashTable assignments, file_kinds;
+	zval *pair_zv, *fqcn_zv, *path_zv, *file_zv;
+	uint32_t next_bucket = 0, index = 0;
+
+	lsp_index_emit_sink = fopen(ZSTR_VAL(part_path), "wb");
+	if (!lsp_index_emit_sink) {
+		_exit(1);
+	}
+
+	zend_hash_init(&assignments, 64, NULL, NULL, 0);
+	zend_hash_init(&file_kinds, 64, NULL, ZVAL_PTR_DTOR, 0);
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(classmap_pairs), pair_zv) {
+		if (Z_TYPE_P(pair_zv) != IS_ARRAY) {
+			continue;
+		}
+
+		fqcn_zv = zend_hash_index_find(Z_ARRVAL_P(pair_zv), 0);
+		path_zv = zend_hash_index_find(Z_ARRVAL_P(pair_zv), 1);
+		if (!fqcn_zv || !path_zv || Z_TYPE_P(fqcn_zv) != IS_STRING || Z_TYPE_P(path_zv) != IS_STRING) {
+			continue;
+		}
+
+		if (lsp_index_classmap_bucket(&assignments, Z_STR_P(path_zv), worker_count, &next_bucket) != worker_id) {
+			continue;
+		}
+
+		lsp_index_emit_symbol(server, lsp_class_like_symbol_kind_for_file_memoized(&file_kinds, Z_STR_P(path_zv), Z_STR_P(fqcn_zv)), Z_STR_P(fqcn_zv), Z_STR_P(path_zv));
+	} ZEND_HASH_FOREACH_END();
+	zend_hash_destroy(&file_kinds);
+	zend_hash_destroy(&assignments);
+
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(files), file_zv) {
+		if (Z_TYPE_P(file_zv) == IS_STRING && index % worker_count == worker_id) {
+			lsp_index_declared_symbols_in_file(server, Z_STR_P(file_zv));
+		}
+		index++;
+	} ZEND_HASH_FOREACH_END();
+
+	if (fclose(lsp_index_emit_sink) != 0) {
+		lsp_index_emit_sink = NULL;
+		_exit(1);
+	}
+	lsp_index_emit_sink = NULL;
+}
+
+static inline bool lsp_index_part_merge(lsp_server *server, zend_string *part_path)
+{
+	FILE *fp;
+	zend_string *fqcn, *path;
+	uint32_t fqcn_length, path_length;
+	char kind;
+
+	fp = fopen(ZSTR_VAL(part_path), "rb");
+	if (!fp) {
+		return false;
+	}
+
+	for (;;) {
+		if (fread(&kind, sizeof(kind), 1, fp) != 1) {
+			break;
+		}
+
+		if (fread(&fqcn_length, sizeof(fqcn_length), 1, fp) != 1 ||
+			fread(&path_length, sizeof(path_length), 1, fp) != 1 ||
+			fqcn_length > 64u * 1024u ||
+			path_length > 64u * 1024u
+		) {
+			fclose(fp);
+
+			return false;
+		}
+
+		fqcn = zend_string_alloc(fqcn_length, 0);
+		path = zend_string_alloc(path_length, 0);
+		if (fread(ZSTR_VAL(fqcn), 1, fqcn_length, fp) != fqcn_length ||
+			fread(ZSTR_VAL(path), 1, path_length, fp) != path_length
+		) {
+			zend_string_release(fqcn);
+			zend_string_release(path);
+			fclose(fp);
+
+			return false;
+		}
+
+		ZSTR_VAL(fqcn)[fqcn_length] = '\0';
+		ZSTR_VAL(path)[path_length] = '\0';
+		lsp_symbol_index_add_symbol_kind(&server->symbol_index, kind, fqcn, path);
+		zend_string_release(fqcn);
+		zend_string_release(path);
+	}
+
+	fclose(fp);
+
+	return true;
+}
+
+/* Fan the per-file extraction across worker processes. Returns false when the
+ * workload is too small, a fork fails, or a worker dies -- the caller then
+ * falls back to the serial scan. */
+static inline bool lsp_build_project_index_parallel(lsp_server *server)
+{
+	zval files, classmap_pairs;
+	zend_string *cache_dir, *part_path;
+	pid_t *pids;
+	zend_long configured;
+	long stamp;
+	uint32_t worker_count, work_count, i, j;
+	int status;
+	bool ok = true;
+
+	configured = lsp_analyzer_parallel_workers(server);
+	if (configured < 2) {
+		return false;
+	}
+	worker_count = configured > LSP_INDEX_PARALLEL_MAX_WORKERS ? LSP_INDEX_PARALLEL_MAX_WORKERS : (uint32_t) configured;
+
+	/* Discovery: run the normal scan with the collect sinks set, producing
+	 * the work lists without reading any PHP file. */
+	array_init(&files);
+	array_init(&classmap_pairs);
+	lsp_index_collect_files_sink = &files;
+	lsp_index_collect_classmap_sink = &classmap_pairs;
+	lsp_build_project_index_work(server);
+	lsp_index_collect_files_sink = NULL;
+	lsp_index_collect_classmap_sink = NULL;
+
+	work_count = zend_hash_num_elements(Z_ARRVAL(files)) + zend_hash_num_elements(Z_ARRVAL(classmap_pairs));
+	if (work_count < LSP_INDEX_PARALLEL_MIN_WORK) {
+		zval_ptr_dtor(&files);
+		zval_ptr_dtor(&classmap_pairs);
+
+		return false;
+	}
+
+	cache_dir = lsp_index_cache_dir(server);
+	lsp_mkdir_p(cache_dir);
+	zend_string_release(cache_dir);
+
+	/* Part names carry the coordinator's pid; computed before forking so the
+	 * children and the merge below agree on them. */
+	stamp = lsp_current_process_id();
+	pids = ecalloc(worker_count, sizeof(pid_t));
+	fflush(stdout);
+	fflush(stderr);
+
+	for (i = 0; i < worker_count; i++) {
+		pids[i] = fork();
+		if (pids[i] < 0) {
+			ok = false;
+			break;
+		}
+
+		if (pids[i] == 0) {
+			/* Worker: keep stray output away from the LSP transport, stream
+			 * symbol records to the part file, and exit without running any
+			 * inherited shutdown handlers. */
+			if (!freopen("/dev/null", "r", stdin) || !freopen("/dev/null", "w", stdout)) {
+				_exit(1);
+			}
+
+			part_path = lsp_index_part_path(server, i, stamp);
+			lsp_index_parallel_child_run(server, &files, &classmap_pairs, i, worker_count, part_path);
+			lsp_coverage_flush();
+			_exit(0);
+		}
+	}
+
+	/* Reap every started worker even after a failed fork. */
+	for (j = 0; j < worker_count; j++) {
+		if (pids[j] > 0) {
+			status = 0;
+			lsp_process_wait(pids[j], &status);
+			if (status != 0) {
+				ok = false;
+			}
+		}
+	}
+
+	if (ok) {
+		for (i = 0; i < worker_count; i++) {
+			part_path = lsp_index_part_path(server, i, stamp);
+			if (!lsp_index_part_merge(server, part_path)) {
+				ok = false;
+			}
+			VCWD_UNLINK(ZSTR_VAL(part_path));
+			zend_string_release(part_path);
+		}
+	} else {
+		for (i = 0; i < worker_count; i++) {
+			part_path = lsp_index_part_path(server, i, stamp);
+			VCWD_UNLINK(ZSTR_VAL(part_path));
+			zend_string_release(part_path);
+		}
+	}
+
+	efree(pids);
+	zval_ptr_dtor(&files);
+	zval_ptr_dtor(&classmap_pairs);
+
+	if (!ok) {
+		/* Partial merges may have landed; rebuild from scratch serially. */
+		lsp_symbol_index_reset(&server->symbol_index);
+
+		return false;
+	}
+
+	return true;
+}
+#endif
+
 static inline void lsp_build_project_index_sync(lsp_server *server)
 {
 	if (!server->symbol_index.available) {
@@ -1418,8 +1729,16 @@ static inline void lsp_build_project_index_sync(lsp_server *server)
 	}
 
 	lsp_symbol_index_reset(&server->symbol_index);
-	lsp_index_composer_project(server, server->root);
-	lsp_index_workspace_composer_projects(server, server->root, 0);
+
+#if LSP_HAVE_POSIX_PROCESS
+	if (lsp_build_project_index_parallel(server)) {
+		lsp_index_cache_save(server);
+
+		return;
+	}
+#endif
+
+	lsp_build_project_index_work(server);
 	lsp_index_cache_save(server);
 }
 

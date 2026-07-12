@@ -525,6 +525,38 @@ static inline void lsp_options_parse_psalm(lsp_options *options, zval *value)
 	options->psalm_max_response_wait_ms = wait_ms >= 0 ? wait_ms : options->psalm_max_response_wait_ms;
 }
 
+static inline void lsp_options_parse_formatting(lsp_options *options, zval *value)
+{
+	zend_string *style;
+	zend_long indent_size;
+
+	if (!value || Z_TYPE_P(value) != IS_ARRAY) {
+		return;
+	}
+
+	options->formatting_enabled = lsp_array_bool(value, "enabled", options->formatting_enabled);
+	options->formatting_reindent = lsp_array_bool(value, "reindent", options->formatting_reindent);
+	options->formatting_trim_trailing_whitespace = lsp_array_bool(value, "trimTrailingWhitespace", options->formatting_trim_trailing_whitespace);
+	options->formatting_insert_final_newline = lsp_array_bool(value, "insertFinalNewline", options->formatting_insert_final_newline);
+
+	/* 0 keeps following the client's tabSize per request. */
+	indent_size = lsp_array_long(value, "indentSize", options->formatting_indent_size);
+	if (indent_size >= 0 && indent_size <= 16) {
+		options->formatting_indent_size = indent_size;
+	}
+
+	style = lsp_array_string(value, "indentStyle");
+	if (style) {
+		if (zend_string_equals_literal_ci(style, "space") || zend_string_equals_literal_ci(style, "spaces")) {
+			options->formatting_indent_style = LSP_INDENT_STYLE_SPACE;
+		} else if (zend_string_equals_literal_ci(style, "tab") || zend_string_equals_literal_ci(style, "tabs")) {
+			options->formatting_indent_style = LSP_INDENT_STYLE_TAB;
+		} else if (zend_string_equals_literal_ci(style, "client")) {
+			options->formatting_indent_style = LSP_INDENT_STYLE_CLIENT;
+		}
+	}
+}
+
 extern void lsp_options_from_zval(lsp_options *options, zval *value)
 {
 	zend_long phpstan_level, psalm_level;
@@ -536,6 +568,12 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 	options->worker_count = 0;
 	options->phpstan_level = 6;
 	options->psalm_level = 6;
+	options->formatting_enabled = true;
+	options->formatting_reindent = true;
+	options->formatting_trim_trailing_whitespace = true;
+	options->formatting_insert_final_newline = true;
+	options->formatting_indent_style = LSP_INDENT_STYLE_CLIENT;
+	options->formatting_indent_size = 0;
 	options->memory_limit = zend_string_init("-1", sizeof("-1") - 1, 0);
 	options->analyzer_diagnostics_timeout = 60.0;
 	options->analyzer_type_query_timeout = 5.0;
@@ -597,6 +635,8 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 			options->analyzer_type_query_timeout = 5.0;
 		}
 	}
+
+	lsp_options_parse_formatting(options, lsp_array_find(value, "formatting"));
 
 	phpstan = lsp_array_find(value, "phpstan");
 	lsp_options_parse_phpstan(options, phpstan);

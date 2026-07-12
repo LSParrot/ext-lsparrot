@@ -76,8 +76,8 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	array_init(&rename);
 	add_assoc_bool(&rename, "prepareProvider", true);
 	add_assoc_zval(&capabilities, "renameProvider", &rename);
-	add_assoc_bool(&capabilities, "documentFormattingProvider", true);
-	add_assoc_bool(&capabilities, "documentRangeFormattingProvider", true);
+	add_assoc_bool(&capabilities, "documentFormattingProvider", server->options.formatting_enabled);
+	add_assoc_bool(&capabilities, "documentRangeFormattingProvider", server->options.formatting_enabled);
 	add_assoc_bool(&capabilities, "inlayHintProvider", true);
 	array_init(&semantic_tokens);
 	lsp_semantic_token_legend(&legend);
@@ -557,6 +557,9 @@ static inline void lsp_document_symbols(zval *return_value, lsp_document *docume
 
 static inline bool lsp_matches_query(const char *value, size_t value_length, zend_string *query)
 {
+	/* Case-insensitive subsequence match (every substring match is also a
+	 * subsequence match, so one pass decides). The query arrives pre-lowered
+	 * by the caller so the per-entry cost is a single tolower per byte. */
 	const char *query_value;
 	size_t i, query_length, query_offset = 0;
 
@@ -570,14 +573,8 @@ static inline bool lsp_matches_query(const char *value, size_t value_length, zen
 		return false;
 	}
 
-	for (i = 0; i + query_length <= value_length; i++) {
-		if (strncasecmp(value + i, query_value, query_length) == 0) {
-			return true;
-		}
-	}
-
 	for (i = 0; i < value_length && query_offset < query_length; i++) {
-		if (tolower((unsigned char) value[i]) == tolower((unsigned char) query_value[query_offset])) {
+		if (tolower((unsigned char) value[i]) == (unsigned char) query_value[query_offset]) {
 			query_offset++;
 		}
 	}
@@ -600,22 +597,52 @@ static inline void lsp_add_workspace_symbol(zval *items, zend_string *name, zend
 	add_next_index_zval(items, &item);
 }
 
-static inline void lsp_add_workspace_symbols_from_index_pass(lsp_server *server, zval *items, zend_string *query, bool vendor_symbols)
+/* Editors re-issue workspace/symbol on every keystroke of the picker, so the
+ * scan is capped and prioritized: one pass over the index emits project
+ * symbols directly (stopping at the cap) while vendor matches queue in a side
+ * list that only tops up remaining slots. */
+#define LSP_WORKSPACE_SYMBOL_LIMIT 256
+
+static inline void lsp_add_workspace_symbol_entry(lsp_symbol_index *region, const lsp_symbol_entry *entry, zval *items)
+{
+	zend_string *name, *uri, *path_string;
+	const char *fqcn, *path;
+
+	fqcn = lsp_symbol_entry_fqcn(region, entry);
+	path = lsp_symbol_entry_path(region, entry);
+	name = zend_string_init(fqcn, entry->fqcn_length, 0);
+	path_string = zend_string_init(path, entry->path_length, 0);
+	uri = lsp_path_to_uri(path_string);
+	lsp_add_workspace_symbol(items, name, lsp_symbol_workspace_kind((char) entry->kind), uri);
+	zend_string_release(uri);
+	zend_string_release(path_string);
+	zend_string_release(name);
+}
+
+static inline void lsp_add_workspace_symbols_from_index(lsp_server *server, zval *items, zend_string *query)
 {
 	const lsp_symbol_entry *entry;
 	lsp_symbol_index *region = &server->symbol_index;
-	zend_string *name, *uri, *path_string;
-	const char *fqcn, *path;
-	uint32_t i;
+	const char *fqcn;
+	uint32_t i, project_count, vendor_count, vendor_take;
+	uint32_t *vendor_matches;
 
 	lsp_symbol_index_table_ensure(region);
 
-	for (i = 0; i < region->entry_count; i++) {
+	vendor_matches = emalloc(sizeof(uint32_t) * LSP_WORKSPACE_SYMBOL_LIMIT);
+	project_count = 0;
+	vendor_count = 0;
+
+	for (i = 0; i < region->entry_count && project_count < LSP_WORKSPACE_SYMBOL_LIMIT; i++) {
 		entry = &region->entries[i];
-		if ((entry->flags & LSP_SYMBOL_ENTRY_DELETED) != 0 ||
-			((entry->flags & LSP_SYMBOL_ENTRY_VENDOR) != 0) != vendor_symbols
-		) {
+		if ((entry->flags & LSP_SYMBOL_ENTRY_DELETED) != 0) {
 			continue;
+		}
+
+		if ((entry->flags & LSP_SYMBOL_ENTRY_VENDOR) != 0) {
+			if (vendor_count >= LSP_WORKSPACE_SYMBOL_LIMIT) {
+				continue;
+			}
 		}
 
 		fqcn = lsp_symbol_entry_fqcn(region, entry);
@@ -623,31 +650,40 @@ static inline void lsp_add_workspace_symbols_from_index_pass(lsp_server *server,
 			continue;
 		}
 
-		path = lsp_symbol_entry_path(region, entry);
-		name = zend_string_init(fqcn, entry->fqcn_length, 0);
-		path_string = zend_string_init(path, entry->path_length, 0);
-		uri = lsp_path_to_uri(path_string);
-		lsp_add_workspace_symbol(items, name, lsp_symbol_workspace_kind((char) entry->kind), uri);
-		zend_string_release(uri);
-		zend_string_release(path_string);
-		zend_string_release(name);
+		if ((entry->flags & LSP_SYMBOL_ENTRY_VENDOR) != 0) {
+			vendor_matches[vendor_count++] = i;
+		} else {
+			lsp_add_workspace_symbol_entry(region, entry, items);
+			project_count++;
+		}
 	}
-}
 
-static inline void lsp_add_workspace_symbols_from_index(lsp_server *server, zval *items, zend_string *query)
-{
-	lsp_add_workspace_symbols_from_index_pass(server, items, query, false);
-	lsp_add_workspace_symbols_from_index_pass(server, items, query, true);
+	vendor_take = LSP_WORKSPACE_SYMBOL_LIMIT - project_count;
+	if (vendor_take > vendor_count) {
+		vendor_take = vendor_count;
+	}
+	for (i = 0; i < vendor_take; i++) {
+		lsp_add_workspace_symbol_entry(region, &region->entries[vendor_matches[i]], items);
+	}
+
+	efree(vendor_matches);
 }
 
 static inline void lsp_workspace_symbols(lsp_server *server, zval *params, zval *return_value)
 {
-	zend_string *query = lsp_array_string(params, "query");
+	zend_string *query, *lowered;
+
+	query = lsp_array_string(params, "query");
+	lowered = query ? zend_string_tolower(query) : NULL;
 
 	array_init(return_value);
 
 	lsp_index_join_worker(server);
-	lsp_add_workspace_symbols_from_index(server, return_value, query);
+	lsp_add_workspace_symbols_from_index(server, return_value, lowered);
+
+	if (lowered) {
+		zend_string_release(lowered);
+	}
 }
 
 static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zval *params, zval *return_value)
@@ -776,7 +812,7 @@ static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zv
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/formatting")) {
-		lsp_document_request_no_position(server, params, lsp_lsparrot_formatting, return_value);
+		lsp_document_request_params(server, params, lsp_lsparrot_formatting, return_value);
 
 		return true;
 	}

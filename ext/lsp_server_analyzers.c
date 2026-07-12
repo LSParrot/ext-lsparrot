@@ -69,44 +69,115 @@ static inline bool lsp_is_php_script(zend_string *path)
 	return result;
 }
 
-extern zend_string *lsp_composer_config_string(zend_string *root, const char *key)
+/* composer.json is consulted constantly (vendor-dir resolution walks path
+ * ancestors, analysis-path checks run per request), so decoded documents are
+ * memoized per project root and validated against the file's stat signature
+ * instead of being re-read and re-parsed on every call. */
+static HashTable lsp_composer_cache;
+static bool lsp_composer_cache_live = false;
+
+extern void lsp_composer_cache_clear(void)
 {
-	zend_string *composer_json, *contents, *result = NULL;
-	zval decoded, *config, *value;
+	if (lsp_composer_cache_live) {
+		zend_hash_destroy(&lsp_composer_cache);
+		lsp_composer_cache_live = false;
+	}
+}
 
-	composer_json = lsp_join_path2(root, "composer.json");
+static inline bool lsp_composer_cache_entry_is_fresh(zval *entry, zend_stat_t *st)
+{
+	zval *mtime, *nsec, *size;
 
-	if (!lsp_is_regular_file(composer_json)) {
+	if (!entry || Z_TYPE_P(entry) != IS_ARRAY) {
+		return false;
+	}
+
+	mtime = zend_hash_str_find(Z_ARRVAL_P(entry), "mtime", sizeof("mtime") - 1);
+	nsec = zend_hash_str_find(Z_ARRVAL_P(entry), "mtimeNsec", sizeof("mtimeNsec") - 1);
+	size = zend_hash_str_find(Z_ARRVAL_P(entry), "size", sizeof("size") - 1);
+
+	return mtime && Z_TYPE_P(mtime) == IS_LONG && Z_LVAL_P(mtime) == (zend_long) st->st_mtime &&
+		nsec && Z_TYPE_P(nsec) == IS_LONG && Z_LVAL_P(nsec) == lsp_stat_mtime_nsec(st) &&
+		size && Z_TYPE_P(size) == IS_LONG && Z_LVAL_P(size) == (zend_long) st->st_size
+	;
+}
+
+/* Returns the decoded composer.json for the project root, or NULL when the
+ * file is missing or invalid. The returned zval is BORROWED from the cache:
+ * treat it as read-only and do not release it. */
+extern zval *lsp_composer_json_decoded(zend_string *project_root)
+{
+	zend_string *composer_json, *contents;
+	zend_stat_t st;
+	zval *entry, *data, new_entry, decoded;
+
+	composer_json = lsp_join_path2(project_root, "composer.json");
+	if (VCWD_STAT(ZSTR_VAL(composer_json), &st) != 0 || !S_ISREG(st.st_mode)) {
+		if (lsp_composer_cache_live) {
+			zend_hash_del(&lsp_composer_cache, composer_json);
+		}
 		zend_string_release(composer_json);
 
 		return NULL;
 	}
 
-	contents = lsp_read_file(composer_json);
-	zend_string_release(composer_json);
-
-	if (contents == zend_empty_string) {
-		return NULL;
+	if (!lsp_composer_cache_live) {
+		zend_hash_init(&lsp_composer_cache, 8, NULL, ZVAL_PTR_DTOR, 0);
+		lsp_composer_cache_live = true;
 	}
 
+	entry = zend_hash_find(&lsp_composer_cache, composer_json);
+	if (entry && lsp_composer_cache_entry_is_fresh(entry, &st)) {
+		zend_string_release(composer_json);
+		data = zend_hash_str_find(Z_ARRVAL_P(entry), "data", sizeof("data") - 1);
+
+		return data && Z_TYPE_P(data) == IS_ARRAY ? data : NULL;
+	}
+
+	contents = lsp_read_file(composer_json);
 	ZVAL_UNDEF(&decoded);
-	php_json_decode_ex(&decoded, ZSTR_VAL(contents), ZSTR_LEN(contents), PHP_JSON_OBJECT_AS_ARRAY, 512);
-	zend_string_release(contents);
-	if (Z_TYPE(decoded) != IS_ARRAY) {
+	if (contents != zend_empty_string) {
+		php_json_decode_ex(&decoded, ZSTR_VAL(contents), ZSTR_LEN(contents), PHP_JSON_OBJECT_AS_ARRAY, 512);
+		zend_string_release(contents);
+	}
+
+	array_init(&new_entry);
+	add_assoc_long(&new_entry, "mtime", (zend_long) st.st_mtime);
+	add_assoc_long(&new_entry, "mtimeNsec", lsp_stat_mtime_nsec(&st));
+	add_assoc_long(&new_entry, "size", (zend_long) st.st_size);
+	if (Z_TYPE(decoded) == IS_ARRAY) {
+		add_assoc_zval(&new_entry, "data", &decoded);
+	} else {
+		/* Invalid or non-object composer.json: cache the miss so repeated
+		 * lookups stay cheap until the file changes. */
+		add_assoc_bool(&new_entry, "data", false);
 		if (!Z_ISUNDEF(decoded)) {
 			zval_ptr_dtor(&decoded);
 		}
+	}
 
+	entry = zend_hash_update(&lsp_composer_cache, composer_json, &new_entry);
+	zend_string_release(composer_json);
+	data = zend_hash_str_find(Z_ARRVAL_P(entry), "data", sizeof("data") - 1);
+
+	return data && Z_TYPE_P(data) == IS_ARRAY ? data : NULL;
+}
+
+extern zend_string *lsp_composer_config_string(zend_string *root, const char *key)
+{
+	zend_string *result = NULL;
+	zval *decoded, *config, *value;
+
+	decoded = lsp_composer_json_decoded(root);
+	if (!decoded) {
 		return NULL;
 	}
 
-	config = zend_hash_str_find(Z_ARRVAL(decoded), "config", sizeof("config") - 1);
+	config = zend_hash_str_find(Z_ARRVAL_P(decoded), "config", sizeof("config") - 1);
 	value = config && Z_TYPE_P(config) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(config), key, strlen(key)) : NULL;
 	if (value && Z_TYPE_P(value) == IS_STRING && Z_STRLEN_P(value) > 0) {
 		result = zend_string_copy(Z_STR_P(value));
 	}
-
-	zval_ptr_dtor(&decoded);
 
 	return result;
 }
