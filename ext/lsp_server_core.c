@@ -218,10 +218,37 @@ extern zend_string *lsp_uri_to_path(zend_string *uri)
 	return zend_string_copy(uri);
 }
 
+/* Percent-encode every path byte a file URI cannot carry verbatim. Without
+ * this, paths containing spaces, '#' or non-ASCII produce invalid URIs that
+ * clients refuse to open or fail to match against their own buffers. */
+static inline zend_string *lsp_uri_encode_path(const char *value, size_t length)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	smart_str encoded = {0};
+	size_t i;
+	unsigned char c;
+
+	for (i = 0; i < length; i++) {
+		c = (unsigned char) value[i];
+		if (isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/') {
+			smart_str_appendc(&encoded, (char) c);
+		} else {
+			smart_str_appendc(&encoded, '%');
+			smart_str_appendc(&encoded, hex[c >> 4]);
+			smart_str_appendc(&encoded, hex[c & 0x0F]);
+		}
+	}
+
+	smart_str_0(&encoded);
+
+	return encoded.s ? encoded.s : ZSTR_EMPTY_ALLOC();
+}
+
 extern zend_string *lsp_uri_from_path(zend_string *path)
 {
+	zend_string *encoded, *uri;
 #if defined(_WIN32)
-	zend_string *uri_path, *uri;
+	zend_string *uri_path;
 	size_t i;
 
 	uri_path = zend_string_init(ZSTR_VAL(path), ZSTR_LEN(path), 0);
@@ -231,19 +258,28 @@ extern zend_string *lsp_uri_from_path(zend_string *path)
 		}
 	}
 
-	if (ZSTR_LEN(uri_path) >= 2 && lsp_is_path_separator(ZSTR_VAL(uri_path)[0]) && lsp_is_path_separator(ZSTR_VAL(uri_path)[1])) {
-		uri = strpprintf(0, "file:%s", ZSTR_VAL(uri_path));
-	} else if (ZSTR_LEN(uri_path) >= 2 && isalpha((unsigned char) ZSTR_VAL(uri_path)[0]) && ZSTR_VAL(uri_path)[1] == ':') {
-		uri = strpprintf(0, "file:///%s", ZSTR_VAL(uri_path));
+	if (ZSTR_LEN(uri_path) >= 2 && isalpha((unsigned char) ZSTR_VAL(uri_path)[0]) && ZSTR_VAL(uri_path)[1] == ':') {
+		encoded = lsp_uri_encode_path(ZSTR_VAL(uri_path) + 2, ZSTR_LEN(uri_path) - 2);
+		uri = strpprintf(0, "file:///%.2s%s", ZSTR_VAL(uri_path), ZSTR_VAL(encoded));
 	} else {
-		uri = strpprintf(0, "file://%s", ZSTR_VAL(uri_path));
+		encoded = lsp_uri_encode_path(ZSTR_VAL(uri_path), ZSTR_LEN(uri_path));
+		if (ZSTR_LEN(uri_path) >= 2 && lsp_is_path_separator(ZSTR_VAL(uri_path)[0]) && lsp_is_path_separator(ZSTR_VAL(uri_path)[1])) {
+			uri = strpprintf(0, "file:%s", ZSTR_VAL(encoded));
+		} else {
+			uri = strpprintf(0, "file://%s", ZSTR_VAL(encoded));
+		}
 	}
 
+	zend_string_release(encoded);
 	zend_string_release(uri_path);
 
 	return uri;
 #else
-	return strpprintf(0, "file://%s", ZSTR_VAL(path));
+	encoded = lsp_uri_encode_path(ZSTR_VAL(path), ZSTR_LEN(path));
+	uri = strpprintf(0, "file://%s", ZSTR_VAL(encoded));
+	zend_string_release(encoded);
+
+	return uri;
 #endif
 }
 
@@ -601,6 +637,78 @@ extern void lsp_position_from_zval(zval *position, zend_long *line, zend_long *c
 	}
 }
 
+/* LSP positions are UTF-16 code units (the protocol default encoding), while
+ * documents are stored as UTF-8 bytes. Incoming character offsets have to be
+ * widened to byte offsets and outgoing byte offsets narrowed back to UTF-16
+ * units, or every feature drifts on lines containing multibyte text. */
+extern size_t lsp_utf16_units_to_byte_offset(const char *value, size_t line_start, size_t length, zend_long character)
+{
+	size_t offset = line_start, step;
+	zend_long units = 0;
+	unsigned char lead;
+
+	while (offset < length && units < character) {
+		lead = (unsigned char) value[offset];
+		if (lead == '\n' || lead == '\r') {
+			break;
+		}
+
+		if (lead < 0x80) {
+			step = 1;
+			units += 1;
+		} else if ((lead & 0xE0) == 0xC0) {
+			step = 2;
+			units += 1;
+		} else if ((lead & 0xF0) == 0xE0) {
+			step = 3;
+			units += 1;
+		} else if ((lead & 0xF8) == 0xF0) {
+			/* Astral plane characters use a surrogate pair in UTF-16. */
+			step = 4;
+			units += 2;
+		} else {
+			step = 1;
+			units += 1;
+		}
+
+		offset += step;
+		if (offset > length) {
+			offset = length;
+		}
+	}
+
+	return offset;
+}
+
+extern zend_long lsp_byte_offset_to_utf16_units(const char *value, size_t line_start, size_t end_offset)
+{
+	size_t offset = line_start;
+	zend_long units = 0;
+	unsigned char lead;
+
+	while (offset < end_offset) {
+		lead = (unsigned char) value[offset];
+		if (lead < 0x80) {
+			offset += 1;
+			units += 1;
+		} else if ((lead & 0xE0) == 0xC0) {
+			offset += 2;
+			units += 1;
+		} else if ((lead & 0xF0) == 0xE0) {
+			offset += 3;
+			units += 1;
+		} else if ((lead & 0xF8) == 0xF0) {
+			offset += 4;
+			units += 2;
+		} else {
+			offset += 1;
+			units += 1;
+		}
+	}
+
+	return units;
+}
+
 extern size_t lsp_offset_at(zend_string *text, zend_long line, zend_long character)
 {
 	const char *value = ZSTR_VAL(text), *next;
@@ -616,18 +724,18 @@ extern size_t lsp_offset_at(zend_string *text, zend_long line, zend_long charact
 		offset = (size_t) (next - value) + 1;
 	}
 
-	if ((size_t) character > length - offset) {
-		return length;
-	}
-
-	return offset + (size_t) character;
+	/* Also clamps an overshooting character to the end of its line instead
+	 * of walking into later lines. */
+	return lsp_utf16_units_to_byte_offset(value, offset, length, character);
 }
 
 static inline bool lsp_is_word_char(char c)
 {
 	unsigned char ch = (unsigned char) c;
 
-	return isalnum(ch) || ch == '_' || ch == '$' || ch == '\\';
+	/* Bytes >= 0x80 are legal in PHP identifiers ([\x80-\xff] in the lexer
+	 * grammar), which is how non-ASCII variable and class names appear. */
+	return isalnum(ch) || ch == '_' || ch == '$' || ch == '\\' || ch >= 0x80;
 }
 
 extern zend_string *lsp_prefix_at(zend_string *text, size_t offset)

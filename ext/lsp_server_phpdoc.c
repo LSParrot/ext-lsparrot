@@ -3350,12 +3350,12 @@ extern const char *lsp_primary_analyzer_source(lsp_server *server)
 
 extern bool lsp_doc_is_identifier_start(char c)
 {
-	return isalpha((unsigned char) c) || c == '_';
+	return isalpha((unsigned char) c) || c == '_' || (unsigned char) c >= 0x80;
 }
 
 extern bool lsp_doc_is_identifier_char(char c)
 {
-	return isalnum((unsigned char) c) || c == '_';
+	return isalnum((unsigned char) c) || c == '_' || (unsigned char) c >= 0x80;
 }
 
 extern char lsp_type_constraint_completion_kind(zend_string *text, size_t offset, zend_string *prefix)

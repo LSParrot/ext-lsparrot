@@ -1417,7 +1417,7 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 {
 	const char *value;
 	zval *label;
-	size_t i, hint_offset;
+	size_t i;
 	uint32_t depth, param_index;
 	bool escaped, need_hint;
 	char quote;
@@ -1428,7 +1428,6 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 	quote = '\0';
 	escaped = false;
 	need_hint = true;
-	hint_offset = open_offset + 1;
 	for (i = open_offset + 1; i < close_offset; i++) {
 		if (quote != '\0') {
 			if (escaped) {
@@ -1449,7 +1448,9 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 		if (need_hint && !isspace((unsigned char) value[i])) {
 			label = zend_hash_index_find(Z_ARRVAL_P(params), param_index);
 			if (label && Z_TYPE_P(label) == IS_STRING) {
-				lsp_inlay_add_hint(items, text, hint_offset, Z_STR_P(label));
+				/* Anchor at the argument itself, not at whitespace that may
+				 * follow the opening parenthesis or comma. */
+				lsp_inlay_add_hint(items, text, i, Z_STR_P(label));
 			}
 			need_hint = false;
 		}
@@ -1460,10 +1461,6 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 			depth--;
 		} else if (value[i] == ',' && depth == 0) {
 			param_index++;
-			hint_offset = i + 1;
-			while (hint_offset < close_offset && isspace((unsigned char) value[hint_offset])) {
-				hint_offset++;
-			}
 			need_hint = true;
 		}
 	}

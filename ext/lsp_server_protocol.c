@@ -132,8 +132,17 @@ static inline void lsp_did_change(lsp_server *server, zval *params)
 	version = lsp_array_long(td, "version", 0);
 	uri = lsp_array_string(td, "uri");
 
-	if (changes && Z_TYPE_P(changes) == IS_ARRAY) {
-		change = zend_hash_index_find(Z_ARRVAL_P(changes), 0);
+	/* Full-document sync is advertised, so every change event carries the
+	 * whole text and the LAST event in the batch is authoritative. A change
+	 * carrying a range would be an incremental event from a non-conforming
+	 * client; treating its fragment as the full document would corrupt the
+	 * buffer, so such events are ignored. */
+	if (changes && Z_TYPE_P(changes) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(changes)) > 0) {
+		change = zend_hash_index_find(Z_ARRVAL_P(changes), zend_hash_num_elements(Z_ARRVAL_P(changes)) - 1);
+	}
+
+	if (change && lsp_array_find(change, "range")) {
+		return;
 	}
 
 	text = lsp_array_string(change, "text");
@@ -490,186 +499,189 @@ static inline void lsp_workspace_symbols(lsp_server *server, zval *params, zval 
 	lsp_add_workspace_symbols_from_index(server, return_value, query);
 }
 
-static inline void lsp_server_handle(lsp_server *server, zend_string *method, zval *params, zval *return_value)
+static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zval *params, zval *return_value)
 {
 	if (zend_string_equals_literal(method, "initialize")) {
 		lsp_initialize(server, params, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "initialized")) {
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "lsparrot.php/status")) {
 		lsp_server_status(server, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "workspace/didChangeWatchedFiles")) {
 		lsp_did_change_watched_files(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "shutdown")) {
-		server->shutdown = true;
+		/* Per the spec the server stays alive after shutdown and only the
+		 * exit notification (or EOF) ends the loop. */
 		server->saw_shutdown = true;
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "exit")) {
 		server->shutdown = true;
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didOpen")) {
 		lsp_did_open(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didChange")) {
 		lsp_did_change(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didSave")) {
 		lsp_did_save(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didClose")) {
 		lsp_did_close(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/completion")) {
 		lsp_document_request(server, params, lsp_lsparrot_completion, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/hover")) {
 		lsp_document_request(server, params, lsp_lsparrot_hover, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/definition")) {
 		lsp_document_request(server, params, lsp_lsparrot_definition, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/references")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_references, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/documentHighlight")) {
 		lsp_document_request(server, params, lsp_lsparrot_document_highlight, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/implementation")) {
 		lsp_document_request(server, params, lsp_lsparrot_implementation, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/codeAction")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_code_action, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/prepareRename")) {
 		lsp_document_request(server, params, lsp_lsparrot_prepare_rename, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/rename")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_rename, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/formatting")) {
 		lsp_document_request_no_position(server, params, lsp_lsparrot_formatting, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/rangeFormatting")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_range_formatting, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/inlayHint")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_inlay_hint, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/codeLens")) {
 		lsp_document_request_no_position(server, params, lsp_lsparrot_code_lens, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/semanticTokens/full")) {
 		lsp_document_request_no_position(server, params, lsp_lsparrot_semantic_tokens, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/signatureHelp")) {
 		lsp_document_request(server, params, lsp_lsparrot_signature_help, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/documentSymbol")) {
 		lsp_document_request_no_server_no_position(server, params, lsp_document_symbols, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "workspace/symbol")) {
 		lsp_workspace_symbols(server, params, return_value);
 
-		return;
+		return true;
 	}
 
 	ZVAL_NULL(return_value);
+
+	return false;
 }
 
 extern void lsp_server_loop(lsp_server *server)
 {
 	double started_at;
 	zval message, *method_zv, *params, *id, result, empty_params;
-	bool has_id;
+	bool has_id, handled;
 
 	while (!server->shutdown && lsp_protocol_next_message(server, &message)) {
 		lsp_reap_analyzer_jobs(server);
@@ -697,14 +709,26 @@ extern void lsp_server_loop(lsp_server *server)
 			continue;
 		}
 
+		/* After shutdown only the exit notification is honored; requests get
+		 * InvalidRequest and other notifications are dropped. */
+		if (server->saw_shutdown && !zend_string_equals_literal(Z_STR_P(method_zv), "exit")) {
+			if (has_id) {
+				lsp_protocol_error(id, -32600, "Invalid Request");
+			}
+
+			zval_ptr_dtor(&message);
+
+			continue;
+		}
+
 		started_at = lsp_now_seconds();
 
 		if (!params || Z_TYPE_P(params) != IS_ARRAY) {
 			array_init(&empty_params);
-			lsp_server_handle(server, Z_STR_P(method_zv), &empty_params, &result);
+			handled = lsp_server_handle(server, Z_STR_P(method_zv), &empty_params, &result);
 			zval_ptr_dtor(&empty_params);
 		} else {
-			lsp_server_handle(server, Z_STR_P(method_zv), params, &result);
+			handled = lsp_server_handle(server, Z_STR_P(method_zv), params, &result);
 		}
 
 		lsp_perf_stats_record(server, Z_STR_P(method_zv), lsp_now_seconds() - started_at);
@@ -715,7 +739,11 @@ extern void lsp_server_loop(lsp_server *server)
 				lsp_protocol_error(id, -32603, "Internal error");
 			}
 		} else if (has_id) {
-			lsp_protocol_respond(id, &result);
+			if (handled) {
+				lsp_protocol_respond(id, &result);
+			} else {
+				lsp_protocol_error(id, -32601, "Method not found");
+			}
 		}
 		if (!Z_ISUNDEF(result)) {
 			zval_ptr_dtor(&result);

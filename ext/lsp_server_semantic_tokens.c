@@ -250,7 +250,7 @@ static inline zend_long lsp_semantic_token_column(zend_string *text, size_t offs
 		line_start--;
 	}
 
-	return (zend_long) (offset - line_start);
+	return lsp_byte_offset_to_utf16_units(value, line_start, offset);
 }
 
 extern void lsp_lsparrot_semantic_tokens(lsp_server *server, zval *return_value, lsp_document *document)
@@ -403,6 +403,11 @@ extern void lsp_lsparrot_semantic_tokens(lsp_server *server, zval *return_value,
 		}
 
 		if (type != LSP_SEM_NONE) {
+			/* Token lengths arrive in bytes; the wire format counts UTF-16
+			 * code units. */
+			if ((size_t) (offset + length) <= ZSTR_LEN(document->text)) {
+				length = lsp_byte_offset_to_utf16_units(ZSTR_VAL(document->text), (size_t) offset, (size_t) (offset + length));
+			}
 			lsp_semantic_emit(&emitter, line, column, length, type);
 		}
 

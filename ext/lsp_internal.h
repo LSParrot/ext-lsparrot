@@ -666,6 +666,8 @@ void lsp_options_from_zval(lsp_options *options, zval *value);
 void lsp_options_destroy(lsp_options *options);
 void lsp_position_from_zval(zval *position, zend_long *line, zend_long *character);
 size_t lsp_offset_at(zend_string *text, zend_long line, zend_long character);
+size_t lsp_utf16_units_to_byte_offset(const char *value, size_t line_start, size_t length, zend_long character);
+zend_long lsp_byte_offset_to_utf16_units(const char *value, size_t line_start, size_t end_offset);
 zend_string *lsp_prefix_at(zend_string *text, size_t offset);
 zend_string *lsp_word_at(zend_string *text, size_t offset);
 bool lsp_matches_prefix_string(zend_string *label, zend_string *prefix);

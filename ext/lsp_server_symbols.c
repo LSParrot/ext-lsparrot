@@ -1144,7 +1144,7 @@ static inline void lsp_offset_to_position(zend_string *text, size_t offset, zval
 
 	array_init(position);
 	add_assoc_long(position, "line", line);
-	add_assoc_long(position, "character", (zend_long) (length - line_start));
+	add_assoc_long(position, "character", lsp_byte_offset_to_utf16_units(value, line_start, length));
 }
 
 extern void lsp_range_from_offsets(zend_string *text, size_t start_offset, size_t end_offset, zval *range)
@@ -2038,7 +2038,7 @@ static inline void lsp_json_append_position(smart_str *out, zend_string *text, s
 	smart_str_appendl(out, "{\"line\":", sizeof("{\"line\":") - 1);
 	smart_str_append_long(out, line);
 	smart_str_appendl(out, ",\"character\":", sizeof(",\"character\":") - 1);
-	smart_str_append_long(out, (zend_long) (length - line_start));
+	smart_str_append_long(out, lsp_byte_offset_to_utf16_units(value, line_start, length));
 	smart_str_appendc(out, '}');
 }
 

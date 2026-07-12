@@ -545,10 +545,17 @@ static inline void lsp_rx_compact(void)
 	lsp_rx_offset = 0;
 }
 
+typedef enum _lsp_frame_result {
+	LSP_FRAME_INCOMPLETE = 0, /* need more bytes before anything can parse */
+	LSP_FRAME_MESSAGE,        /* a message was produced */
+	LSP_FRAME_SKIPPED,        /* a bad frame was consumed; try the next one */
+} lsp_frame_result;
+
 /* Parse one complete Content-Length framed message from the receive buffer.
- * Accepts both \r\n and bare \n header line endings. Returns false when the
- * buffered bytes do not yet contain a complete frame. */
-static inline bool lsp_transport_parse_frame(zval *message)
+ * Accepts both \r\n and bare \n header line endings. Distinguishes "not
+ * enough bytes yet" from "consumed a malformed/undecodable frame" so frames
+ * queued behind a bad one are still drained. */
+static inline lsp_frame_result lsp_transport_parse_frame(zval *message)
 {
 	const char *data, *line_start, *line_end, *headers_end = NULL;
 	char *body;
@@ -556,7 +563,7 @@ static inline bool lsp_transport_parse_frame(zval *message)
 	bool has_length = false;
 
 	if (!lsp_rx_buffer.s) {
-		return false;
+		return LSP_FRAME_INCOMPLETE;
 	}
 
 	data = ZSTR_VAL(lsp_rx_buffer.s) + lsp_rx_offset;
@@ -566,7 +573,7 @@ static inline bool lsp_transport_parse_frame(zval *message)
 	while ((size_t) (line_start - data) < available) {
 		line_end = memchr(line_start, '\n', available - (line_start - data));
 		if (!line_end) {
-			return false;
+			return LSP_FRAME_INCOMPLETE;
 		}
 
 		if (line_start == line_end || (line_end - line_start == 1 && line_start[0] == '\r')) {
@@ -588,14 +595,16 @@ static inline bool lsp_transport_parse_frame(zval *message)
 		if (headers_end) {
 			/* Skip a malformed frame header so the stream can resynchronize. */
 			lsp_rx_offset += headers_end - data;
+
+			return LSP_FRAME_SKIPPED;
 		}
 
-		return false;
+		return LSP_FRAME_INCOMPLETE;
 	}
 
 	header_size = headers_end - data;
 	if (available < header_size + content_length) {
-		return false;
+		return LSP_FRAME_INCOMPLETE;
 	}
 
 	/* The JSON scanner requires a NUL sentinel at body[length]; the framed
@@ -616,19 +625,22 @@ static inline bool lsp_transport_parse_frame(zval *message)
 		}
 		ZVAL_UNDEF(message);
 
-		return false;
+		return LSP_FRAME_SKIPPED;
 	}
 
-	return true;
+	return LSP_FRAME_MESSAGE;
 }
 
 static inline void lsp_transport_drain_frames(void)
 {
+	lsp_frame_result parsed;
 	zval message;
 
 	lsp_transport_ensure_initialized();
-	while (lsp_transport_parse_frame(&message)) {
-		add_next_index_zval(&lsp_pending_messages, &message);
+	while ((parsed = lsp_transport_parse_frame(&message)) != LSP_FRAME_INCOMPLETE) {
+		if (parsed == LSP_FRAME_MESSAGE) {
+			add_next_index_zval(&lsp_pending_messages, &message);
+		}
 	}
 }
 

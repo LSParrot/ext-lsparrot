@@ -524,7 +524,9 @@ extern void lsp_line_range(zval *range, zend_string *text, zend_long one_based_l
 	add_assoc_long(&start, "character", 0);
 	array_init(&end);
 	add_assoc_long(&end, "line", line);
-	add_assoc_long(&end, "character", (zend_long) (end_offset > start_offset ? end_offset - start_offset : 1));
+	add_assoc_long(&end, "character", end_offset > start_offset
+		? lsp_byte_offset_to_utf16_units(ZSTR_VAL(text), start_offset, end_offset)
+		: 1);
 	add_assoc_zval(range, "start", &start);
 	add_assoc_zval(range, "end", &end);
 }
