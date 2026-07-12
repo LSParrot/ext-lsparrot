@@ -107,15 +107,15 @@ LSParrot\start_lsp([
 5. **ファイルウォッチャはサーバーから動的登録されない**(`client/registerCapability` 送信経路なし)。拡張側で `FileSystemWatcher` を静的に構成して `workspace/didChangeWatchedFiles` を送ること。推奨 glob:
    - `**/*.php`(インデックス増分更新・キャッシュ無効化)
    - `**/composer.json`, `**/composer.lock`, `vendor/composer/autoload_*.php`(オートロードマップ変更)
-6. **マルチルート非対応**。`rootUri`(なければ `rootPath`)の1つ目のみ有効。`workspaceFolders` は読まれない。マルチルートワークスペースではフォルダ毎にサーバーインスタンスを起動する構成を推奨。
+6. **マルチルート対応**。`initialize` の `workspaceFolders` を全て読み、各フォルダをインデックス・アナライザ対象にする(最初のフォルダがインデックスキャッシュ `.lsparrot/` の置き場所)。`workspace/didChangeWorkspaceFolders` でフォルダ追加/削除に追従(インデックス再構築が走る)。1プロセスで全フォルダを扱えるため、フォルダ毎のサーバーインスタンスは不要。
 7. **診断は push のみ**(`textDocument/publishDiagnostics`)。didClose 時に空配列が来て Problems がクリアされる。pull 型(`textDocument/diagnostic`)は未実装。
 8. 未知のメソッドには `-32601` が返る。shutdown 後のリクエストは `-32600`、`exit` で終了(正常時 exit code 0)。
 
 ## 4. サーバーが提供する機能一覧(capability 登録の確認用)
 
-hover / definition / **declaration** / **typeDefinition** / references / documentHighlight / implementation / **foldingRange** / completion(resolve なし、trigger: `$ > : [ ( , SPACE @ - < { \`)/ signatureHelp(`(` `,`)/ documentSymbol(階層)/ workspaceSymbol(上限256件、プロジェクト優先)/ rename(prepare あり、型追跡でクラスファミリー限定)/ codeAction(quickfix, source.organizeImports)/ codeLens(resolve なし)/ inlayHint(パラメータ名)/ semanticTokens(full のみ、modifier なし)/ formatting・rangeFormatting(`formatting.enabled` 時)
+hover / definition / declaration / typeDefinition / references / documentHighlight / implementation / foldingRange / **callHierarchy**(prepare / incomingCalls / outgoingCalls)/ **typeHierarchy**(prepare / supertypes / subtypes)/ completion(resolve なし、trigger: `$ > : [ ( , SPACE @ - < { \`)/ signatureHelp(`(` `,`)/ documentSymbol(階層、テキスト世代キャッシュ)/ workspaceSymbol(上限256件、プロジェクト優先)/ rename(prepare あり、型追跡でクラスファミリー限定)/ codeAction(quickfix, source.organizeImports)/ codeLens(resolve なし)/ **inlayHint(パラメータ名 + 変数型ヒント、viewport range 限定・上限64件)**/ **semanticTokens(full = {delta:true} + range、modifier: static/readonly/deprecated/declaration)**/ formatting・rangeFormatting(`formatting.enabled` 時)/ **workspace.workspaceFolders(マルチルート、changeNotifications)**/ **workspace.fileOperations.willRename(**/*.php)**
 
-**declaration / typeDefinition / foldingRange / didChangeConfiguration は今回追加**。古いサーバーとの互換が必要なら capability の有無で分岐すること。
+古いサーバーとの互換が必要なら capability の有無で分岐すること。
 
 ## 5. 既知の制限・拡張側で吸収すべきギャップ
 
@@ -123,10 +123,8 @@ hover / definition / **declaration** / **typeDefinition** / references / documen
 |---|---|---|
 | フォーマッタはインデント整形+空白整理(PSR-12 の空白/改行規則までは適用しない) | 仕様 | README に明記。フル整形が必要なユーザーには php-cs-fixer / phpcbf の併用を案内(`editor.defaultFormatter` の切替) |
 | `$/progress` なし | 未実装 | `lsparrot.php/analyzerStatus` でスピナー実装(§1.1) |
-| semanticTokens は full のみ(range/delta なし)、modifier 空 | 未実装 | クライアント側対応不要(vscode-languageclient が吸収)。大ファイルで気になる場合は `semanticTokens` を無効化する設定を用意してもよい |
-| callHierarchy / typeHierarchy / selectionRange / documentLink / linkedEditingRange | 未実装 | capability に無いので VSCode は自動的に無効化する。対応不要 |
+| selectionRange / documentLink / linkedEditingRange | 未実装 | capability に無いので VSCode は自動的に無効化する。対応不要 |
 | completionItem/resolve なし(詳細は最初から inline) | 仕様 | 対応不要 |
-| インレイの型ヒント(変数型)は未実装(パラメータ名のみ) | 未実装 | サーバー側の将来課題 |
 | PHPStan/Psalm は didSave/didOpen 契機(didChange では走らない。psalm-ls の onChange を除く) | 仕様 | 「保存時に解析」であることを README に明記。`files.autoSave` との相性は良い |
 | PHPStan 診断は行単位レンジ(列情報が JSON にない)。Psalm は列付き | 仕様 | 対応不要(表示上の差のみ) |
 
@@ -136,6 +134,8 @@ hover / definition / **declaration** / **typeDefinition** / references / documen
 - 診断の severity: PHPStan → **Error(1)**、Psalm は `error`→1 / `warning`→2 / `info`→3。Psalm CLI 診断は `column_from/column_to` による**正確なレンジ**になった。
 - 診断 `code` に PHPStan identifier / Psalm issue type が入る。`Deprecated*` / `*deprecated*` は `tags: [Deprecated]`、`Unused*` / `deadCode*` は `tags: [Unnecessary]` が付く(VSCode が取り消し線/淡色表示)。
 - psalm-ls クラッシュ時は自動再起動(§1.1)。再起動後はサーバーが開いているドキュメントの didOpen を psalm-ls に再送するので拡張側の対応は不要。
+- **プロジェクト全体診断(PHPStan/Psalm CLI)はプロジェクト単位で並列実行**される(上限 = `workers.count`、既定 CPU 数)。モノレポで複数プロジェクトを保存しても直列化しない。
+- **willRenameFiles**: エクスプローラでの PHP ファイルのリネーム/移動時、クラス名の同期リネーム(プロジェクト全体)と PSR-4 に基づく `namespace` 書き換えの WorkspaceEdit が返る。`vscode-languageclient` の fileOperations サポートを有効にしておくこと。
 
 ## 7. 起動シーケンスの推奨
 
