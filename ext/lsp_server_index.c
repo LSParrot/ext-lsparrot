@@ -35,6 +35,7 @@ typedef struct _lsp_index_cache_header {
 } lsp_index_cache_header;
 
 static inline void lsp_index_declared_symbols_in_file(lsp_server *server, zend_string *path);
+static inline void lsp_index_wait_process_bounded(lsp_process_id pid, int *status);
 
 static inline bool lsp_path_contains_vendor(zend_string *path)
 {
@@ -1690,13 +1691,17 @@ static inline bool lsp_build_project_index_parallel(lsp_server *server)
 		}
 
 		if (pids[i] == 0) {
-			/* Worker: keep stray output away from the LSP transport, stream
-			 * symbol records to the part file, and exit without running any
-			 * inherited shutdown handlers. */
+			/* Worker: keep stray output away from the LSP transport, drop
+			 * inherited analyzer pipe references (extra fds delay EOF-based
+			 * exit detection in the parent), stream symbol records to the
+			 * part file, and exit without running any inherited shutdown
+			 * handlers. */
 			if (!freopen("/dev/null", "r", stdin) || !freopen("/dev/null", "w", stdout)) {
 				_exit(1);
 			}
 
+			lsp_runner_close_pipes_in_child(server);
+			lsp_psalm_ls_close_pipes_in_child(server);
 			part_path = lsp_index_part_path(server, i, stamp);
 			lsp_index_parallel_child_run(server, &files, &classmap_pairs, i, worker_count, part_path);
 			lsp_coverage_flush();
@@ -1708,10 +1713,16 @@ static inline bool lsp_build_project_index_parallel(lsp_server *server)
 	for (j = 0; j < worker_count; j++) {
 		if (pids[j] > 0) {
 			status = 0;
-			lsp_process_wait(pids[j], &status);
+			lsp_index_wait_process_bounded(pids[j], &status);
+#if defined(WIFEXITED)
+			if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+				ok = false;
+			}
+#else
 			if (status != 0) {
 				ok = false;
 			}
+#endif
 		}
 	}
 
@@ -1825,8 +1836,9 @@ static inline bool lsp_index_worker_start(lsp_server *server)
 
 	if (pid == 0) {
 		/* Child: detach from the LSP transport so no stray frames reach the
-		 * client, build + persist the index, and exit without running any
-		 * inherited shutdown handlers. */
+		 * client, drop inherited analyzer pipe references, build + persist
+		 * the index, and exit without running any inherited shutdown
+		 * handlers. */
 		if (!freopen("/dev/null", "r", stdin)) {
 			_exit(1);
 		}
@@ -1834,6 +1846,8 @@ static inline bool lsp_index_worker_start(lsp_server *server)
 			_exit(1);
 		}
 
+		lsp_runner_close_pipes_in_child(server);
+		lsp_psalm_ls_close_pipes_in_child(server);
 		lsp_build_project_index_sync(server);
 		lsp_coverage_flush();
 		_exit(0);
@@ -1862,6 +1876,27 @@ static inline void lsp_index_worker_finished(lsp_server *server)
 	lsp_analyzer_status("index", "idle", "Project index ready.");
 }
 
+/* Waiting on a worker must never hang the single-threaded request loop
+ * forever: a healthy build can be slow (large repos), so the cap is generous,
+ * but a wedged worker gets escalated SIGTERM -> SIGKILL and the caller falls
+ * back to the synchronous build. */
+#define LSP_INDEX_WORKER_WAIT_CAP_SECONDS 300.0
+
+static inline void lsp_index_wait_process_bounded(lsp_process_id pid, int *status)
+{
+	if (lsp_process_wait_timeout(pid, status, LSP_INDEX_WORKER_WAIT_CAP_SECONDS)) {
+		return;
+	}
+
+	lsp_process_terminate(pid);
+	if (!lsp_process_wait_timeout(pid, status, 2.0)) {
+		lsp_process_terminate_force(pid);
+		lsp_process_wait_timeout(pid, status, 2.0);
+	}
+
+	*status = -1;
+}
+
 extern void lsp_index_join_worker(lsp_server *server)
 {
 	int status = 0;
@@ -1870,7 +1905,7 @@ extern void lsp_index_join_worker(lsp_server *server)
 		return;
 	}
 
-	lsp_process_wait(server->index_worker_pid, &status);
+	lsp_index_wait_process_bounded(server->index_worker_pid, &status);
 	lsp_index_worker_finished(server);
 }
 
@@ -1898,7 +1933,10 @@ extern void lsp_index_stop_worker(lsp_server *server)
 	/* The cache write is atomic, so terminating mid-build is safe; the next
 	 * start simply rebuilds. */
 	lsp_process_terminate(server->index_worker_pid);
-	lsp_process_wait(server->index_worker_pid, &status);
+	if (!lsp_process_wait_timeout(server->index_worker_pid, &status, 5.0)) {
+		lsp_process_terminate_force(server->index_worker_pid);
+		lsp_process_wait_timeout(server->index_worker_pid, &status, 2.0);
+	}
 	server->index_worker_running = false;
 }
 

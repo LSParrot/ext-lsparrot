@@ -44,6 +44,28 @@ typedef struct _lsp_hier_frame {
 	bool valid;
 } lsp_hier_frame;
 
+/* PHP class/function names are case-insensitive; the tokenization fast-reject
+ * must match the same way or differently-cased references vanish silently. */
+static inline bool lsp_hier_contains_ci(zend_string *haystack, const char *needle, size_t needle_length)
+{
+	const char *p = ZSTR_VAL(haystack), *end = p + ZSTR_LEN(haystack);
+	char lower, upper;
+
+	if (needle_length == 0 || ZSTR_LEN(haystack) < needle_length) {
+		return false;
+	}
+
+	lower = (char) tolower((unsigned char) needle[0]);
+	upper = (char) toupper((unsigned char) needle[0]);
+	for (; p + needle_length <= end; p++) {
+		if ((*p == lower || *p == upper) && strncasecmp(p, needle, needle_length) == 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static inline zend_string *lsp_hier_basename(zend_string *path)
 {
 	const char *value = ZSTR_VAL(path), *slash;
@@ -61,17 +83,25 @@ static inline zend_string *lsp_hier_basename(zend_string *path)
 	return slash ? zend_string_init(slash + 1, ZSTR_LEN(path) - (size_t) (slash + 1 - value), 0) : zend_string_copy(path);
 }
 
-static inline void lsp_hier_item(zval *item, zend_string *name, zend_long kind, zend_string *path, zend_string *contents, size_t sel_start, size_t sel_end, zend_string *detail, zend_string *container)
+/* full_start/full_end give the whole declaration extent (signature + body)
+ * when known; pass 0/0 to fall back to the name span. selectionRange is
+ * always the bare name, per the LSP contract. */
+static inline void lsp_hier_item(zval *item, zend_string *name, zend_long kind, zend_string *path, zend_string *contents, size_t sel_start, size_t sel_end, size_t full_start, size_t full_end, zend_string *detail, zend_string *container)
 {
 	zend_string *uri;
 	zval range, selection, data;
+
+	if (full_end <= full_start || full_start > sel_start || full_end < sel_end) {
+		full_start = sel_start;
+		full_end = sel_end;
+	}
 
 	uri = lsp_uri_from_path(path);
 	array_init(item);
 	add_assoc_str(item, "name", zend_string_copy(name));
 	add_assoc_long(item, "kind", kind);
 	add_assoc_str(item, "uri", uri);
-	lsp_range_from_offsets(contents, sel_start, sel_end, &range);
+	lsp_range_from_offsets(contents, full_start, full_end, &range);
 	add_assoc_zval(item, "range", &range);
 	lsp_range_from_offsets(contents, sel_start, sel_end, &selection);
 	add_assoc_zval(item, "selectionRange", &selection);
@@ -344,24 +374,42 @@ extern void lsp_lsparrot_prepare_call_hierarchy(lsp_server *server, zval *return
 	container = NULL;
 	resolved = false;
 
-	/* Declaration under the cursor? */
+	/* Declaration under the cursor? Verified against the token stream: the
+	 * word's own token must be preceded by T_FUNCTION (a comment ending in
+	 * the word "function" must not count). */
 	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
 	if (tokens_zv && Z_TYPE_P(tokens_zv) == IS_ARRAY) {
-		/* `function <word>` immediately before the word marks a declaration:
-		 * anchor the item here. */
-		size_t scan = word_start;
+		HashTable *doc_tokens = Z_ARRVAL_P(tokens_zv);
+		zval *word_token, *prev_token;
+		uint32_t token_count = zend_hash_num_elements(doc_tokens), token_index;
+		bool is_declaration = false;
 
-		while (scan > 0 && isspace((unsigned char) ZSTR_VAL(document->text)[scan - 1])) {
-			scan--;
+		for (token_index = 0; token_index < token_count; token_index++) {
+			word_token = zend_hash_index_find(doc_tokens, token_index);
+			if (!word_token || Z_TYPE_P(word_token) != IS_ARRAY) {
+				continue;
+			}
+
+			if ((size_t) lsp_token_long(word_token, "offset", 0) != word_start) {
+				continue;
+			}
+
+			if (lsp_token_long(word_token, "id", 0) == T_STRING) {
+				prev_token = lsp_hier_sig_token(doc_tokens, (zend_long) token_index, -1);
+				is_declaration = prev_token && lsp_token_long(prev_token, "id", 0) == T_FUNCTION;
+			}
+
+			break;
 		}
-		if (scan >= sizeof("function") - 1 && strncasecmp(ZSTR_VAL(document->text) + scan - (sizeof("function") - 1), "function", sizeof("function") - 1) == 0) {
+
+		if (is_declaration) {
 			lsp_hier_enclosing_decl(Z_ARRVAL_P(tokens_zv), document->text, word_start, &func_frame, &class_frame);
 			if (class_frame.valid && class_frame.name) {
 				container = lsp_resolve_class_name_at(document->text, class_frame.name, word_start);
 			}
 
 			lsp_hier_item(&item, word, container ? LSP_HIER_KIND_METHOD : LSP_HIER_KIND_FUNCTION,
-				document->path, document->text, word_start, word_start + ZSTR_LEN(word), container, container);
+				document->path, document->text, word_start, word_start + ZSTR_LEN(word), 0, 0, container, container);
 			add_next_index_zval(return_value, &item);
 			resolved = true;
 		}
@@ -413,7 +461,9 @@ extern void lsp_lsparrot_prepare_call_hierarchy(lsp_server *server, zval *return
 					lsp_hier_find_function_decl(contents, word, receiver_class, &name_offset, &body_start, &body_end)
 				) {
 					lsp_hier_item(&item, word, LSP_HIER_KIND_METHOD, path, contents,
-						name_offset, name_offset + ZSTR_LEN(word), receiver_class, receiver_class);
+						name_offset, name_offset + ZSTR_LEN(word),
+						name_offset, body_end > name_offset ? body_end + 1 : 0,
+						receiver_class, receiver_class);
 					add_next_index_zval(return_value, &item);
 					resolved = true;
 				}
@@ -451,7 +501,9 @@ extern void lsp_lsparrot_prepare_call_hierarchy(lsp_server *server, zval *return
 				lsp_hier_find_function_decl(contents, word, NULL, &name_offset, &body_start, &body_end)
 			) {
 				lsp_hier_item(&item, word, LSP_HIER_KIND_FUNCTION, path, contents,
-					name_offset, name_offset + ZSTR_LEN(word), NULL, NULL);
+					name_offset, name_offset + ZSTR_LEN(word),
+					name_offset, body_end > name_offset ? body_end + 1 : 0,
+					NULL, NULL);
 				add_next_index_zval(return_value, &item);
 			}
 			if (contents != zend_empty_string) {
@@ -478,7 +530,7 @@ static inline void lsp_hier_scan_file_for_callers(lsp_server *server, zval *resu
 	uint32_t i, count;
 	size_t token_offset;
 
-	if (!strstr(ZSTR_VAL(contents), ZSTR_VAL(target))) {
+	if (!lsp_hier_contains_ci(contents, ZSTR_VAL(target), ZSTR_LEN(target))) {
 		return;
 	}
 
@@ -550,14 +602,14 @@ static inline void lsp_hier_scan_file_for_callers(lsp_server *server, zval *resu
 				lsp_hier_item(&item, func_frame.name,
 					container ? LSP_HIER_KIND_METHOD : LSP_HIER_KIND_FUNCTION,
 					path, contents, func_frame.name_offset, func_frame.name_offset + ZSTR_LEN(func_frame.name),
-					container, container);
+					0, 0, container, container);
 				if (container) {
 					zend_string_release(container);
 				}
 			} else {
 				/* Top-level code: attribute the call to the file. */
 				file_label = lsp_hier_basename(path);
-				lsp_hier_item(&item, file_label, LSP_HIER_KIND_FILE, path, contents, token_offset, token_offset + ZSTR_LEN(target), NULL, NULL);
+				lsp_hier_item(&item, file_label, LSP_HIER_KIND_FILE, path, contents, token_offset, token_offset + ZSTR_LEN(target), 0, 0, NULL, NULL);
 				zend_string_release(file_label);
 			}
 
@@ -692,7 +744,9 @@ static inline void lsp_hier_add_outgoing(lsp_server *server, HashTable *callees,
 		) {
 			lsp_hier_item(&item, callee,
 				callee_container ? LSP_HIER_KIND_METHOD : LSP_HIER_KIND_FUNCTION,
-				path, contents, name_offset, name_offset + ZSTR_LEN(callee), callee_container, callee_container);
+				path, contents, name_offset, name_offset + ZSTR_LEN(callee),
+				name_offset, body_end > name_offset ? body_end + 1 : 0,
+				callee_container, callee_container);
 			located = true;
 		}
 
@@ -994,7 +1048,8 @@ static inline bool lsp_hier_type_item_for_fqcn(lsp_server *server, zend_string *
 			}
 		}
 
-		lsp_hier_item(item, fqcn, lsp_hier_type_kind(kind), path, contents, name_offset, name_offset + base_length, NULL, NULL);
+		lsp_hier_item(item, fqcn, lsp_hier_type_kind(kind), path, contents, name_offset, name_offset + base_length,
+			class_start, body_end > class_start ? body_end + 1 : 0, NULL, NULL);
 		zend_string_release(short_name);
 		located = true;
 	}
@@ -1187,7 +1242,7 @@ extern void lsp_lsparrot_type_hierarchy_subtypes(lsp_server *server, zval *retur
 		if (owns_contents && contents != zend_empty_string &&
 			/* Fast reject: files that never mention the short name cannot
 			 * extend/implement it. */
-			strstr(ZSTR_VAL(contents), ZSTR_VAL(target) + (ZSTR_LEN(target) - target_base_length)) != NULL
+			lsp_hier_contains_ci(contents, target_base, target_base_length)
 		) {
 			class_start = 0;
 			body_start = 0;

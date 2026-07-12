@@ -82,6 +82,12 @@
 - `lsp_server_protocol.c` が肥大化(selectionRange/documentLink/folding を含む)。`lsp_server_navigation.c` 等への分割を検討。
 - Windows ビルド(config.w32)は形だけ維持。`LSP_HAVE_POSIX_PROCESS=0` 経路(並列インデックス・fork ワーカー無し)は未テスト。
 - テストの共通ハーネス関数が各 .phpt に複製されている。`lsp_test_helper.inc` に集約するリファクタ(EXPECTF に影響しないよう注意)。
+- **レビューで確認済み・意図的に見送った低優先度項目**(着手時はこのリストから):
+  - psalm-ls 再起動時の didOpen リプレイは「開いている全ドキュメント」を新セッションへ送るが、送信対象の判定(`lsp_psalm_ls_document_open` のスコープ判定)と再スキャン時の判定に使う述語が完全一致ではない。ルート境界ぎりぎりのファイルで片方だけ送られる可能性。述語を 1 関数に統一する。
+  - `textDocument/didClose` は psalm-ls 全セッションへブロードキャストしている。該当プロジェクトのセッションだけに送るのが正しいが、余分な didClose は psalm 側で無害(未知 URI は無視される)ため見送り。
+  - `semanticTokens/range` は行単位でトークンを切っており、開始/終了行の文字位置(character)までは絞らない。クライアントは範囲外トークンを無視するため実害なし。
+  - `lsp_server_hierarchy.c` はリクエスト内で同一ファイルを複数回読み直す経路がある(incomingCalls で候補ファイル→確認の 2 段階)。リクエスト単位のファイル内容キャッシュを入れると大規模プロジェクトで効く。
+  - `lsp_hier_enclosing_decl` のフレームに `name_offset` フィールドがあるが現在未使用(dead field)。次に触るとき削除してよい。
 
 ### P5 — 既知の意図的な非対応(再検討条件付き)
 - `namespace Foo;` 宣言自体の hover(価値低)。

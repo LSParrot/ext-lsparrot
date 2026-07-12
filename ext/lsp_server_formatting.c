@@ -560,7 +560,10 @@ static inline zend_string *lsp_format_document_lines(lsp_server *server, lsp_doc
 		lines[i].indent = -1;
 	}
 
-	reindent = options.reindent && lsp_format_plan_lines(document->text, line_starts, line_count, lines);
+	/* The plan must ALWAYS run: it is what marks string/heredoc/inline-HTML
+	 * interiors as locked so trimming can never alter runtime values. Only
+	 * the reindent decision depends on its verdict. */
+	reindent = lsp_format_plan_lines(document->text, line_starts, line_count, lines) && options.reindent;
 
 	if (to_line >= line_count) {
 		to_line = line_count > 0 ? line_count - 1 : 0;

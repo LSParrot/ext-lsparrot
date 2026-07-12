@@ -13,6 +13,8 @@
 
 #include "lsp_internal.h"
 
+#include <Zend/zend_language_parser.h>
+
 /* Multi-root workspace bookkeeping and workspace/willRenameFiles.
  *
  * Roots: the first workspace folder stays server->root (compatibility anchor
@@ -152,6 +154,27 @@ extern void lsp_workspace_did_change_folders(lsp_server *server, zval *params)
 	}
 
 	if (changed) {
+		/* server->root is treated as always in scope; when the client removed
+		 * the primary folder, promote the first remaining one so the stale
+		 * root stops being indexed and analyzed. */
+		if (zend_hash_num_elements(&server->workspace_roots) > 0 &&
+			!zend_hash_exists(&server->workspace_roots, server->root)
+		) {
+			zend_string *replacement = NULL, *candidate;
+
+			ZEND_HASH_FOREACH_STR_KEY(&server->workspace_roots, candidate) {
+				if (candidate) {
+					replacement = candidate;
+					break;
+				}
+			} ZEND_HASH_FOREACH_END();
+
+			if (replacement) {
+				zend_string_release(server->root);
+				server->root = zend_string_copy(replacement);
+			}
+		}
+
 		/* The symbol index and analyzers are root-derived; rebuild both. */
 		lsp_index_stop_worker(server);
 		lsp_build_project_index(server);
@@ -192,34 +215,47 @@ static inline zend_string *lsp_workspace_dirname(zend_string *path)
 	return zend_string_init(value, (size_t) (slash - value), 0);
 }
 
-/* Locate the declared class-like whose short name matches the file's
- * basename and return the byte offset of the name inside the header. */
+/* Locate the class-like whose DECLARED short name (the token right after the
+ * class/interface/trait/enum keyword -- never extends/implements clauses)
+ * matches the file's basename, returning the byte offset of that name.
+ * Anchoring on the keyword prevents `class Bar extends Baz` in Baz.php from
+ * hijacking a rename of Baz.php into renaming Baz project-wide. */
 static inline bool lsp_workspace_declared_name_offset(zend_string *contents, zend_string *short_name, size_t *name_offset)
 {
+	static const char *keywords[4] = { "class", "interface", "trait", "enum" };
 	zend_long body_depth = 0;
-	const char *value, *cursor, *header_end_ptr, *found;
-	size_t search_start = 0, class_start, body_start, body_end;
+	const char *value;
+	size_t search_start = 0, class_start, body_start, body_end, header_end, p, keyword_end, name_start, i;
 
 	value = ZSTR_VAL(contents);
 	while (lsp_find_class_header_from(contents, search_start, &class_start, &body_start, &body_end, &body_depth)) {
-		cursor = value + class_start;
-		header_end_ptr = value + (body_start > 0 ? body_start - 1 : body_start);
+		header_end = body_start > 0 ? body_start - 1 : body_start;
 
-		while (cursor < header_end_ptr) {
-			found = strstr(cursor, ZSTR_VAL(short_name));
-			if (!found || found >= header_end_ptr) {
+		for (p = class_start; p < header_end; p++) {
+			for (i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+				if (!lsp_keyword_at_slice(value, p, header_end, keywords[i], &keyword_end)) {
+					continue;
+				}
+
+				name_start = keyword_end;
+				while (name_start < header_end && isspace((unsigned char) value[name_start])) {
+					name_start++;
+				}
+
+				if (name_start + ZSTR_LEN(short_name) <= header_end &&
+					strncasecmp(value + name_start, ZSTR_VAL(short_name), ZSTR_LEN(short_name)) == 0 &&
+					!lsp_doc_is_identifier_char(value[name_start + ZSTR_LEN(short_name)])
+				) {
+					*name_offset = name_start;
+
+					return true;
+				}
+
+				/* Declared name differs: stop scanning this header (extends/
+				 * implements names must not match). */
+				p = header_end;
 				break;
 			}
-
-			if ((found == value || !lsp_doc_is_identifier_char(found[-1])) &&
-				!lsp_doc_is_identifier_char(found[ZSTR_LEN(short_name)])
-			) {
-				*name_offset = (size_t) (found - value);
-
-				return true;
-			}
-
-			cursor = found + 1;
 		}
 
 		search_start = body_end + 1;
@@ -303,7 +339,11 @@ static inline void lsp_workspace_psr4_consider(zend_string *project_root, zend_s
 
 	if (ZSTR_LEN(file_dir) > ZSTR_LEN(mapped_dir)) {
 		relative_start = ZSTR_LEN(mapped_dir) + 1;
-		smart_str_appendc(&ns, '\\');
+		/* A global-namespace mapping ("" prefix) must not produce a leading
+		 * backslash. */
+		if (ns.s && ZSTR_LEN(ns.s) > 0) {
+			smart_str_appendc(&ns, '\\');
+		}
 		for (p = relative_start; p < ZSTR_LEN(file_dir); p++) {
 			smart_str_appendc(&ns, ZSTR_VAL(file_dir)[p] == '/' ? '\\' : ZSTR_VAL(file_dir)[p]);
 		}
@@ -376,37 +416,88 @@ static inline zend_string *lsp_workspace_psr4_namespace_for_dir(lsp_server *serv
 	return best;
 }
 
-/* Replace the first `namespace X;` (or `namespace X {`) declaration name. */
-static inline bool lsp_workspace_namespace_decl_range(zend_string *contents, size_t *start_offset, size_t *end_offset)
+/* Locate the first namespace declaration via the token stream (a raw text
+ * scan would happily edit the word "namespace" inside a comment). Outputs the
+ * name span (for rewrites) and the whole-statement span including the
+ * trailing ';' and newline (for removals when the destination maps to the
+ * global namespace). */
+static inline bool lsp_workspace_namespace_decl_range(zend_string *contents, size_t *start_offset, size_t *end_offset, size_t *stmt_start, size_t *stmt_end)
 {
-	const char *value = ZSTR_VAL(contents);
-	size_t p, keyword_end, name_start;
+	zval tokens_zv, *token;
+	HashTable *tokens;
+	zend_string *text;
+	zend_long id;
+	uint32_t i, count;
+	size_t token_offset;
+	bool found = false, in_declaration = false;
 
-	for (p = 0; p + sizeof("namespace") - 1 < ZSTR_LEN(contents); p++) {
-		if (!lsp_keyword_at_slice(value, p, ZSTR_LEN(contents), "namespace", &keyword_end)) {
-			continue;
+	*start_offset = 0;
+	*end_offset = 0;
+	*stmt_start = 0;
+	*stmt_end = 0;
+
+	ZVAL_UNDEF(&tokens_zv);
+	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
+		if (!Z_ISUNDEF(tokens_zv)) {
+			zval_ptr_dtor(&tokens_zv);
 		}
 
-		name_start = keyword_end;
-		while (name_start < ZSTR_LEN(contents) && isspace((unsigned char) value[name_start])) {
-			name_start++;
-		}
-
-		if (name_start >= ZSTR_LEN(contents) || (!lsp_doc_is_identifier_start(value[name_start]) && value[name_start] != '\\')) {
-			continue;
-		}
-
-		*start_offset = name_start;
-		p = name_start;
-		while (p < ZSTR_LEN(contents) && (lsp_doc_is_identifier_char(value[p]) || value[p] == '\\')) {
-			p++;
-		}
-		*end_offset = p;
-
-		return *end_offset > *start_offset;
+		return false;
 	}
 
-	return false;
+	tokens = Z_ARRVAL(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		id = lsp_token_long(token, "id", 0);
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+
+		if (!in_declaration) {
+			if (id == T_NAMESPACE) {
+				in_declaration = true;
+				*stmt_start = token_offset;
+			}
+			continue;
+		}
+
+		if (id == T_WHITESPACE || id == T_COMMENT || id == T_DOC_COMMENT) {
+			continue;
+		}
+
+		if (id == ';' || id == '{') {
+			if (id == ';') {
+				*stmt_end = token_offset + 1;
+				/* Swallow one trailing newline so a removal leaves no blank
+				 * line behind. */
+				if (*stmt_end < ZSTR_LEN(contents) && ZSTR_VAL(contents)[*stmt_end] == '\n') {
+					(*stmt_end)++;
+				}
+			} else {
+				*stmt_end = 0;
+			}
+			break;
+		}
+
+		text = lsp_token_string(token, "text");
+		if (!text) {
+			break;
+		}
+
+		if (!found) {
+			*start_offset = token_offset;
+			found = true;
+		}
+		*end_offset = token_offset + ZSTR_LEN(text);
+	}
+
+	zval_ptr_dtor(&tokens_zv);
+
+	return found && *end_offset > *start_offset;
 }
 
 static inline void lsp_workspace_append_text_edit(zval *changes, zend_string *uri, zend_string *contents, size_t start_offset, size_t end_offset, zend_string *new_text)
@@ -431,7 +522,7 @@ extern void lsp_lsparrot_will_rename_files(lsp_server *server, zval *return_valu
 	lsp_document *document;
 	zval *files, *file, *changes_zv, rename_params, rename_result, position, *result_changes, *edits, changes;
 	zend_string *old_uri, *new_uri, *old_path, *new_path, *old_name, *new_name, *old_dir, *new_dir, *expected_ns, *current_ns, *uri_key;
-	size_t name_offset, ns_start, ns_end;
+	size_t name_offset, ns_start, ns_end, stmt_start, stmt_end;
 	zend_long line, character;
 	bool any = false;
 
@@ -521,19 +612,24 @@ extern void lsp_lsparrot_will_rename_files(lsp_server *server, zval *return_valu
 
 			if (!zend_string_equals(old_dir, new_dir)) {
 				expected_ns = lsp_workspace_psr4_namespace_for_dir(server, new_dir);
-				if (expected_ns && ZSTR_LEN(expected_ns) > 0) {
+				if (expected_ns) {
 					current_ns = lsp_document_namespace(document->text);
 					if (!zend_string_equals(current_ns, expected_ns) &&
-						lsp_workspace_namespace_decl_range(document->text, &ns_start, &ns_end)
+						lsp_workspace_namespace_decl_range(document->text, &ns_start, &ns_end, &stmt_start, &stmt_end)
 					) {
-						lsp_workspace_append_text_edit(&changes, old_uri, document->text, ns_start, ns_end, expected_ns);
-						any = true;
+						if (ZSTR_LEN(expected_ns) > 0) {
+							lsp_workspace_append_text_edit(&changes, old_uri, document->text, ns_start, ns_end, expected_ns);
+							any = true;
+						} else if (ZSTR_LEN(current_ns) > 0 && stmt_end > stmt_start) {
+							/* Destination maps to the global namespace:
+							 * remove the whole declaration statement. */
+							lsp_workspace_append_text_edit(&changes, old_uri, document->text, stmt_start, stmt_end, zend_empty_string);
+							any = true;
+						}
 					}
 					if (current_ns != zend_empty_string) {
 						zend_string_release(current_ns);
 					}
-				}
-				if (expected_ns) {
 					zend_string_release(expected_ns);
 				}
 			}

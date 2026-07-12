@@ -399,6 +399,26 @@ static inline lsp_runner_session *lsp_runner_session_ensure(lsp_server *server, 
  * idle past the timeout and have nothing pending. */
 #define LSP_RUNNER_IDLE_TIMEOUT_SECONDS 300.0
 
+/* Forked index workers inherit every runner pipe fd; extra references keep
+ * the pipes open and delay EOF-based subprocess-exit detection in the
+ * parent. Children call this right after fork(). */
+extern void lsp_runner_close_pipes_in_child(lsp_server *server)
+{
+	lsp_runner_session *session;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(&server->runner_sessions, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		lsp_pipe_close(&session->pipes.input);
+		lsp_pipe_close(&session->pipes.output);
+		lsp_pipe_close(&session->pipes.error);
+	} ZEND_HASH_FOREACH_END();
+}
+
 extern void lsp_runner_reap_idle_sessions(lsp_server *server)
 {
 	lsp_runner_session *session;
