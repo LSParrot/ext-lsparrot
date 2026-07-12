@@ -77,6 +77,14 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	add_assoc_bool(&capabilities, "foldingRangeProvider", true);
 	add_assoc_bool(&capabilities, "callHierarchyProvider", true);
 	add_assoc_bool(&capabilities, "typeHierarchyProvider", true);
+	add_assoc_bool(&capabilities, "selectionRangeProvider", true);
+	{
+		zval document_link;
+
+		array_init(&document_link);
+		add_assoc_bool(&document_link, "resolveProvider", false);
+		add_assoc_zval(&capabilities, "documentLinkProvider", &document_link);
+	}
 	array_init(&code_lens);
 	add_assoc_bool(&code_lens, "resolveProvider", false);
 	add_assoc_zval(&capabilities, "codeLensProvider", &code_lens);
@@ -749,6 +757,297 @@ static inline void lsp_workspace_symbols(lsp_server *server, zval *params, zval 
 	}
 }
 
+/* ----------------------------------------------------------------------
+ * textDocument/selectionRange: expand-selection chains built from the word
+ * under the cursor and the enclosing bracket pairs (content first, then the
+ * pair including its delimiters), ending at the whole document.
+ * ---------------------------------------------------------------------- */
+
+#define LSP_SELECTION_STACK_MAX 128
+
+static inline void lsp_selection_push_level(zval *chain, zend_string *text, size_t start, size_t end, size_t *previous_start, size_t *previous_end)
+{
+	zval level, range;
+
+	if (start == *previous_start && end == *previous_end) {
+		return;
+	}
+
+	/* Chains must strictly widen. */
+	if (start > *previous_start || end < *previous_end) {
+		return;
+	}
+
+	array_init(&level);
+	lsp_range_from_offsets(text, start, end, &range);
+	add_assoc_zval(&level, "range", &range);
+	add_next_index_zval(chain, &level);
+	*previous_start = start;
+	*previous_end = end;
+}
+
+static inline void lsp_selection_range_for_offset(lsp_document *document, size_t offset, zval *result)
+{
+	zval *tokens_zv, *token, chain, *level, *parent_target, parent_copy;
+	zend_string *word;
+	HashTable *tokens;
+	size_t open_stack[LSP_SELECTION_STACK_MAX];
+	size_t token_offset, open_offset, previous_start, previous_end, word_start, word_end;
+	zend_long id;
+	uint32_t i, count, depth = 0, chain_count;
+
+	array_init(&chain);
+	previous_start = SIZE_MAX;
+	previous_end = 0;
+
+	word = lsp_word_at(document->text, offset);
+	if (ZSTR_LEN(word) > 0) {
+		word_start = offset;
+		while (word_start > 0 && (lsp_doc_is_identifier_char(ZSTR_VAL(document->text)[word_start - 1]) || ZSTR_VAL(document->text)[word_start - 1] == '$')) {
+			word_start--;
+		}
+		word_end = word_start + ZSTR_LEN(word);
+		previous_start = word_start;
+		previous_end = word_end;
+
+		{
+			zval level_zv, range;
+
+			array_init(&level_zv);
+			lsp_range_from_offsets(document->text, word_start, word_end, &range);
+			add_assoc_zval(&level_zv, "range", &range);
+			add_next_index_zval(&chain, &level_zv);
+		}
+	}
+	zend_string_release(word);
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (tokens_zv && Z_TYPE_P(tokens_zv) == IS_ARRAY) {
+		tokens = Z_ARRVAL_P(tokens_zv);
+		count = zend_hash_num_elements(tokens);
+		for (i = 0; i < count; i++) {
+			token = zend_hash_index_find(tokens, i);
+			if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+				continue;
+			}
+
+			id = lsp_token_long(token, "id", 0);
+			token_offset = (size_t) lsp_token_long(token, "offset", 0);
+
+			if (id == '(' || id == '[' || id == '{' || id == T_CURLY_OPEN || id == T_DOLLAR_OPEN_CURLY_BRACES || id == T_ATTRIBUTE) {
+				if (depth < LSP_SELECTION_STACK_MAX) {
+					open_stack[depth] = token_offset;
+				}
+				depth++;
+				continue;
+			}
+
+			if (id == ')' || id == ']' || id == '}') {
+				if (depth == 0) {
+					continue;
+				}
+				depth--;
+				if (depth >= LSP_SELECTION_STACK_MAX) {
+					continue;
+				}
+
+				open_offset = open_stack[depth];
+				/* Closing pairs surface innermost-first for offsets they
+				 * enclose, exactly the chain order needed. */
+				if (open_offset < offset && offset <= token_offset) {
+					lsp_selection_push_level(&chain, document->text, open_offset + 1, token_offset, &previous_start, &previous_end);
+					lsp_selection_push_level(&chain, document->text, open_offset, token_offset + 1, &previous_start, &previous_end);
+				}
+			}
+		}
+	}
+
+	lsp_selection_push_level(&chain, document->text, 0, ZSTR_LEN(document->text), &previous_start, &previous_end);
+
+	/* Fold the flat chain into the nested {range, parent} shape. */
+	chain_count = zend_hash_num_elements(Z_ARRVAL(chain));
+	if (chain_count == 0) {
+		zval range, level_zv;
+
+		array_init(result);
+		lsp_range_from_offsets(document->text, offset, offset, &range);
+		add_assoc_zval(result, "range", &range);
+		zval_ptr_dtor(&chain);
+		(void) level_zv;
+
+		return;
+	}
+
+	/* Build from the outermost inward: parent links point outward. */
+	ZVAL_UNDEF(&parent_copy);
+	parent_target = NULL;
+	for (i = chain_count; i > 0; i--) {
+		level = zend_hash_index_find(Z_ARRVAL(chain), i - 1);
+		if (!level || Z_TYPE_P(level) != IS_ARRAY) {
+			continue;
+		}
+
+		if (!Z_ISUNDEF(parent_copy)) {
+			add_assoc_zval(level, "parent", &parent_copy);
+		}
+
+		ZVAL_COPY(&parent_copy, level);
+	}
+
+	(void) parent_target;
+
+	if (!Z_ISUNDEF(parent_copy)) {
+		ZVAL_COPY(result, &parent_copy);
+		zval_ptr_dtor(&parent_copy);
+	} else {
+		array_init(result);
+	}
+
+	zval_ptr_dtor(&chain);
+}
+
+extern void lsp_lsparrot_selection_range(lsp_server *server, zval *return_value, lsp_document *document, zval *params)
+{
+	zval *positions, *position, entry;
+	zend_long line, character;
+	size_t offset;
+
+	(void) server;
+
+	array_init(return_value);
+
+	positions = lsp_array_find(params, "positions");
+	if (!positions || Z_TYPE_P(positions) != IS_ARRAY) {
+		return;
+	}
+
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(positions), position) {
+		lsp_position_from_zval(position, &line, &character);
+		offset = lsp_offset_at(document->text, line, character);
+		lsp_selection_range_for_offset(document, offset, &entry);
+		add_next_index_zval(return_value, &entry);
+	} ZEND_HASH_FOREACH_END();
+}
+
+/* ----------------------------------------------------------------------
+ * textDocument/documentLink: clickable require/include string arguments.
+ * `__DIR__ . '...'` and plain relative/absolute literals resolve against
+ * the document's directory; links only surface for files that exist.
+ * ---------------------------------------------------------------------- */
+
+static inline zend_string *lsp_document_link_dirname(zend_string *path)
+{
+	const char *value = ZSTR_VAL(path), *slash = strrchr(value, '/');
+
+	if (!slash || slash == value) {
+		return zend_string_init("/", 1, 0);
+	}
+
+	return zend_string_init(value, (size_t) (slash - value), 0);
+}
+
+extern void lsp_lsparrot_document_link(lsp_server *server, zval *return_value, lsp_document *document)
+{
+	zval *tokens_zv, *token, *string_token, link, range;
+	HashTable *tokens;
+	zend_string *literal, *base_dir, *resolved, *uri;
+	const char *inner;
+	size_t inner_length, string_offset;
+	zend_long id;
+	uint32_t i, j, count;
+	bool has_dir_prefix;
+
+	(void) server;
+
+	array_init(return_value);
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY || !document->path) {
+		return;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	base_dir = lsp_document_link_dirname(document->path);
+
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		id = lsp_token_long(token, "id", 0);
+		if (id != T_REQUIRE && id != T_REQUIRE_ONCE && id != T_INCLUDE && id != T_INCLUDE_ONCE) {
+			continue;
+		}
+
+		/* Accept: [(] [__DIR__ .] 'literal' */
+		string_token = NULL;
+		has_dir_prefix = false;
+		for (j = i + 1; j < count && j < i + 8; j++) {
+			zval *candidate = zend_hash_index_find(tokens, j);
+			zend_long candidate_id;
+
+			if (!candidate || Z_TYPE_P(candidate) != IS_ARRAY) {
+				continue;
+			}
+
+			candidate_id = lsp_token_long(candidate, "id", 0);
+			if (candidate_id == T_WHITESPACE || candidate_id == (zend_long) '(' || candidate_id == (zend_long) '.') {
+				continue;
+			}
+
+			if (candidate_id == T_DIR) {
+				has_dir_prefix = true;
+				continue;
+			}
+
+			if (candidate_id == T_CONSTANT_ENCAPSED_STRING) {
+				string_token = candidate;
+			}
+
+			break;
+		}
+
+		if (!string_token) {
+			continue;
+		}
+
+		literal = lsp_token_string(string_token, "text");
+		if (!literal || ZSTR_LEN(literal) < 3) {
+			continue;
+		}
+
+		inner = ZSTR_VAL(literal) + 1;
+		inner_length = ZSTR_LEN(literal) - 2;
+		if (inner_length == 0 || memchr(inner, '\\', inner_length) || memchr(inner, '$', inner_length)) {
+			continue;
+		}
+
+		if (has_dir_prefix || inner[0] != '/') {
+			resolved = strpprintf(0, "%s%s%.*s", ZSTR_VAL(base_dir), inner[0] == '/' ? "" : "/", (int) inner_length, inner);
+		} else {
+			resolved = zend_string_init(inner, inner_length, 0);
+		}
+
+		if (!lsp_is_regular_file(resolved)) {
+			zend_string_release(resolved);
+			continue;
+		}
+
+		string_offset = (size_t) lsp_token_long(string_token, "offset", 0);
+		uri = lsp_uri_from_path(resolved);
+		array_init(&link);
+		lsp_range_from_offsets(document->text, string_offset, string_offset + ZSTR_LEN(literal), &range);
+		add_assoc_zval(&link, "range", &range);
+		add_assoc_str(&link, "target", uri);
+		add_next_index_zval(return_value, &link);
+		zend_string_release(resolved);
+	}
+
+	zend_string_release(base_dir);
+}
+
 #define LSP_FOLDING_STACK_MAX 128
 
 static inline void lsp_folding_add_range(zval *items, zend_long start_line, zend_long end_line, const char *kind)
@@ -977,6 +1276,18 @@ static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zv
 
 	if (zend_string_equals_literal(method, "textDocument/semanticTokens/full/delta")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_semantic_tokens_full_delta, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/selectionRange")) {
+		lsp_document_request_params(server, params, lsp_lsparrot_selection_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/documentLink")) {
+		lsp_document_request_no_position(server, params, lsp_lsparrot_document_link, return_value);
 
 		return true;
 	}

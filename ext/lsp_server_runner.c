@@ -212,6 +212,7 @@ typedef struct _lsp_runner_session {
 	zend_string *analyzer;
 	zend_string *project_root;
 	uint64_t jobs_completed;
+	double last_activity;
 	zend_long next_job_id;
 	/* Deferred type-query descriptors keyed by job id: interactive requests
 	 * stop waiting after a short budget, and the answer is collected here
@@ -371,7 +372,10 @@ static inline lsp_runner_session *lsp_runner_session_ensure(lsp_server *server, 
 	if (existing) {
 		zend_string_release(key);
 
-		return (lsp_runner_session *) Z_PTR_P(existing);
+		session = (lsp_runner_session *) Z_PTR_P(existing);
+		session->last_activity = lsp_now_seconds();
+
+		return session;
 	}
 
 	session = lsp_runner_session_start(analyzer, project_root);
@@ -381,11 +385,41 @@ static inline lsp_runner_session *lsp_runner_session_ensure(lsp_server *server, 
 		return NULL;
 	}
 
+	session->last_activity = lsp_now_seconds();
 	ZVAL_PTR(&ptr, session);
 	zend_hash_update(&server->runner_sessions, key, &ptr);
 	zend_string_release(key);
 
 	return session;
+}
+
+/* Resident runners keep a booted PHP process per (analyzer, project) for
+ * interactive type queries. Long editing sessions touching many projects
+ * would otherwise accumulate processes forever; reap sessions that have been
+ * idle past the timeout and have nothing pending. */
+#define LSP_RUNNER_IDLE_TIMEOUT_SECONDS 300.0
+
+extern void lsp_runner_reap_idle_sessions(lsp_server *server)
+{
+	lsp_runner_session *session;
+	zend_string *key;
+	zval *value;
+	double now = lsp_now_seconds();
+
+	ZEND_HASH_FOREACH_STR_KEY_VAL(&server->runner_sessions, key, value) {
+		if (!key || Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		if (session->pending_initialized && zend_hash_num_elements(&session->pending) > 0) {
+			continue;
+		}
+
+		if (session->last_activity > 0.0 && now - session->last_activity > LSP_RUNNER_IDLE_TIMEOUT_SECONDS) {
+			zend_hash_del(&server->runner_sessions, key);
+		}
+	} ZEND_HASH_FOREACH_END();
 }
 
 static inline void lsp_runner_session_drop(lsp_server *server, lsp_runner_session *session)

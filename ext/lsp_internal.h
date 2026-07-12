@@ -876,6 +876,10 @@ void lsp_reap_analyzer_job_table(lsp_server *server, HashTable *jobs, const char
 void lsp_lsparrot_semantic_tokens_range(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_semantic_tokens_full_delta(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_semantic_tokens_cache_clear(void);
+void lsp_semantic_tokens_cache_evict(zend_string *uri);
+void lsp_runner_reap_idle_sessions(lsp_server *server);
+void lsp_lsparrot_selection_range(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
+void lsp_lsparrot_document_link(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_lsparrot_code_lens(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_lsparrot_signature_help(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_references(lsp_server *server, zval *return_value, lsp_document *document, zval *params);

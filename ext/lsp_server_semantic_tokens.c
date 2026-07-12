@@ -571,6 +571,14 @@ static inline HashTable *lsp_semantic_tokens_cache_ht(void)
 	return &lsp_semantic_tokens_cache;
 }
 
+/* Closed documents must not pin their token snapshot forever. */
+extern void lsp_semantic_tokens_cache_evict(zend_string *uri)
+{
+	if (lsp_semantic_tokens_cache_ready) {
+		zend_hash_del(&lsp_semantic_tokens_cache, uri);
+	}
+}
+
 extern void lsp_semantic_tokens_cache_clear(void)
 {
 	if (lsp_semantic_tokens_cache_ready) {

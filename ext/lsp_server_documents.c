@@ -23,6 +23,11 @@ extern void lsp_server_evict_document_caches(lsp_server *server, zend_string *ur
 {
 	zend_string *key, *needle;
 
+	if (include_type_cache) {
+		/* didSave/didClose: drop the semantic-token delta snapshot too. */
+		lsp_semantic_tokens_cache_evict(uri);
+	}
+
 	needle = strpprintf(0, ":%s:", ZSTR_VAL(uri));
 
 	ZEND_HASH_FOREACH_STR_KEY(&server->completion_cache, key) {
@@ -366,6 +371,7 @@ extern void lsp_reap_analyzer_jobs(lsp_server *server)
 	lsp_reap_analyzer_job_table(server, &server->psalm_jobs, "psalm");
 	lsp_psalm_ls_pump(server, 0.0);
 	lsp_runner_pump_pending(server);
+	lsp_runner_reap_idle_sessions(server);
 	lsp_reap_analyzer_completion_jobs();
 }
 
