@@ -47,6 +47,11 @@
 11. **`lsp_process_wait` は無タイムアウトでブロックする**。プロセス回収は必ず `lsp_process_wait_timeout` + `lsp_process_terminate_force` のエスカレーションを使う(サーバーは単一スレッド。1個の wedged プロセスで全機能が止まる)。
 12. **診断 severity のテスト**(053/099 など)はクライアント入力側の値。サーバー出力の severity を変えても壊れないが、grep で確認してから触ること。
 
+### CI の実行形態(タイムアウト設計時の必読事項)
+- Linux ネイティブ CI は同じスイートを **3 回**実行する: 通常ビルド → debug ビルド → **valgrind memcheck**。valgrind フェーズはサーバーが 10〜30 倍遅くなるため、固定秒数の時間予算(型クエリ 5 秒、固定 sleep 等)に依存するテストはそこだけ落ちる。テストの分析タイムアウトは 20 秒以上、待ち合わせはポーリング方式にすること。
+- 子プロセスの pid は **reap した瞬間に必ず無効化**する(`LSP_INVALID_PROCESS_ID` 代入)。reap 済み pid への kill は OS の pid 再利用により無関係プロセス(CI では別テスト)を殺す。実際に macOS CI で Termsig=15 のランダム失敗として顕在化した。`lsp_process_run_capture` は exited 後にパイプが開いていても deadline で kill しない。
+- `lsp_process_spawn_piped` は親側パイプ fd に FD_CLOEXEC を付ける。これがないと後続の exec 子が write end を握り、EOF 検出が遅延して capture が deadline まで回る。
+
 ## 3. 検証インフラ(再利用すべき資産)
 
 - **PHPT**: `ext/tests/` 001–130(130 = hierarchy/multi-root/willRename)。ハーネスパターンは 122 以降のテストからコピーする(proc_open `php -n -d extension=...`、Content-Length フレーミング)。

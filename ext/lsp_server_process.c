@@ -102,6 +102,23 @@ static inline bool lsp_process_set_nonblock(lsp_pipe_handle pipe)
 	return fcntl((int) pipe, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+/* Parent-side pipe ends must not leak into later fork+exec children: an
+ * unrelated child holding a stray write end delays EOF detection (a capture
+ * then spins until its deadline), and a stray read end keeps buffers alive. */
+static inline void lsp_process_set_cloexec(lsp_pipe_handle pipe)
+{
+	int flags;
+
+	if (!lsp_pipe_handle_valid(pipe)) {
+		return;
+	}
+
+	flags = fcntl((int) pipe, F_GETFD, 0);
+	if (flags >= 0) {
+		(void) fcntl((int) pipe, F_SETFD, flags | FD_CLOEXEC);
+	}
+}
+
 static inline void lsp_process_child_dup2_or_exit(int source, int target)
 {
 	if (source == target) {
@@ -727,6 +744,9 @@ extern bool lsp_process_spawn_piped(lsp_command *command, zend_string *cwd, lsp_
 	lsp_process_set_nonblock(input_write);
 	lsp_process_set_nonblock(output_read);
 	lsp_process_set_nonblock(error_read);
+	lsp_process_set_cloexec(input_write);
+	lsp_process_set_cloexec(output_read);
+	lsp_process_set_cloexec(error_read);
 	pipes->input = input_write;
 	pipes->output = output_read;
 	pipes->error = error_read;
@@ -843,8 +863,17 @@ extern zend_string *lsp_process_run_capture(lsp_command *command, zend_string *c
 			break;
 		}
 		if (lsp_now_seconds() >= deadline) {
-			lsp_process_terminate(pipes.process);
-			lsp_process_wait(pipes.process, &status);
+			/* The pipes can outlive the child when a descendant inherited
+			 * the write ends. Once the child has been reaped its pid may
+			 * already belong to an unrelated process, so it must never be
+			 * signalled again — just stop reading. */
+			if (!exited) {
+				lsp_process_terminate(pipes.process);
+				if (!lsp_process_wait_timeout(pipes.process, &status, 2.0)) {
+					lsp_process_terminate_force(pipes.process);
+					lsp_process_wait_timeout(pipes.process, &status, 2.0);
+				}
+			}
 			break;
 		}
 		lsp_sleep_milliseconds(10);

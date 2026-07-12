@@ -1863,6 +1863,9 @@ static inline bool lsp_index_worker_start(lsp_server *server)
 static inline void lsp_index_worker_finished(lsp_server *server)
 {
 	server->index_worker_running = false;
+	/* The worker has been reaped; drop the pid so no later stop/terminate
+	 * path can signal a reused process id. */
+	server->index_worker_pid = LSP_INVALID_PROCESS_ID;
 
 	if (lsp_index_cache_load_ex(server, false)) {
 		lsp_analyzer_status("index", "idle", "Project index ready.");

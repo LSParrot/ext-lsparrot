@@ -846,6 +846,16 @@ extern void lsp_runner_status(lsp_server *server, zval *target)
 		alive = lsp_process_id_valid(session->pipes.process) &&
 			!lsp_process_wait_nonblocking(session->pipes.process, &status)
 		;
+		if (!alive && lsp_process_id_valid(session->pipes.process)) {
+			/* The probe above reaped the runner, so its pid may be reused
+			 * by an unrelated process at any moment; forget it so teardown
+			 * cannot signal a stale id. */
+			lsp_pipe_close(&session->pipes.input);
+			lsp_pipe_close(&session->pipes.output);
+			lsp_pipe_close(&session->pipes.error);
+			lsp_process_close(session->pipes.process);
+			session->pipes.process = LSP_INVALID_PROCESS_ID;
+		}
 
 		array_init(&entry);
 		add_assoc_str(&entry, "analyzer", zend_string_copy(session->analyzer));

@@ -343,7 +343,13 @@ static inline long lsp_current_process_id(void)
 
 static inline bool lsp_process_id_valid(lsp_process_id process)
 {
+#if LSP_HAVE_POSIX_PROCESS
+	/* Reject negative ids too: fork()/spawn failures yield -1, and
+	 * kill(-1, sig) would signal every process the user owns. */
+	return process > 0;
+#else
 	return process != LSP_INVALID_PROCESS_ID;
+#endif
 }
 
 static inline bool lsp_pipe_handle_valid(lsp_pipe_handle pipe)

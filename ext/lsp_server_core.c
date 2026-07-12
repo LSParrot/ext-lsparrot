@@ -76,7 +76,10 @@ extern void lsp_analyzer_job_destroy(lsp_analyzer_job *job)
 	status = 0;
 	if (job->running && lsp_process_id_valid(job->pid)) {
 		lsp_process_terminate(job->pid);
-		lsp_process_wait(job->pid, &status);
+		if (!lsp_process_wait_timeout(job->pid, &status, 2.0)) {
+			lsp_process_terminate_force(job->pid);
+			lsp_process_wait_timeout(job->pid, &status, 2.0);
+		}
 	}
 
 	if (job->cache_file) {
