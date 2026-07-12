@@ -558,7 +558,7 @@ extern void lsp_append_psalm_cached_diagnostics(lsp_server *server, lsp_document
 {
 	zend_long line, severity;
 	zend_string *project_root, *output_file, *output, *json, *failure_message;
-	zval decoded, *file_zv, *issue_zv, *line_zv, *message_text_zv, *type_zv, *severity_zv, range;
+	zval decoded, *file_zv, *issue_zv, *line_zv, *message_text_zv, *type_zv, *severity_zv, *column_from_zv, *column_to_zv, range;
 
 	if (!server->psalm_enabled) {
 		return;
@@ -626,12 +626,22 @@ extern void lsp_append_psalm_cached_diagnostics(lsp_server *server, lsp_document
 		type_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "type", sizeof("type") - 1);
 
 		severity_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "severity", sizeof("severity") - 1);
-		if (severity_zv && Z_TYPE_P(severity_zv) == IS_STRING && zend_string_equals_literal(Z_STR_P(severity_zv), "info")) {
-			severity = 3;
+		if (severity_zv && Z_TYPE_P(severity_zv) == IS_STRING) {
+			if (zend_string_equals_literal(Z_STR_P(severity_zv), "info")) {
+				severity = 3;
+			} else if (zend_string_equals_literal(Z_STR_P(severity_zv), "error")) {
+				severity = 1;
+			}
 		}
 
+		column_from_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "column_from", sizeof("column_from") - 1);
+		column_to_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "column_to", sizeof("column_to") - 1);
+
 		line = line_zv && Z_TYPE_P(line_zv) == IS_LONG ? Z_LVAL_P(line_zv) : 1;
-		lsp_line_range(&range, document->text, line);
+		lsp_line_range_columns(&range, document->text, line,
+			column_from_zv && Z_TYPE_P(column_from_zv) == IS_LONG ? Z_LVAL_P(column_from_zv) : 0,
+			column_to_zv && Z_TYPE_P(column_to_zv) == IS_LONG ? Z_LVAL_P(column_to_zv) : 0
+		);
 		lsp_add_analyzer_diagnostic(diagnostics, "psalm", Z_STR_P(message_text_zv),
 			type_zv && Z_TYPE_P(type_zv) == IS_STRING ? Z_STR_P(type_zv) : NULL, &range, severity
 		);

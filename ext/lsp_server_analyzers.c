@@ -566,6 +566,64 @@ extern zend_string *lsp_document_project_root(lsp_server *server, lsp_document *
 	return zend_string_copy(server->root);
 }
 
+/* Like lsp_line_range but honoring 1-based column bounds when the analyzer
+ * provides them (Psalm's column_from/column_to); PhpStorm-style precise
+ * squiggles instead of whole-line noise. Invalid columns fall back to the
+ * full line. */
+extern void lsp_line_range_columns(zval *range, zend_string *text, zend_long one_based_line, zend_long column_from, zend_long column_to)
+{
+	const char *next;
+	zend_long line = one_based_line > 0 ? one_based_line - 1 : 0, current;
+	zval start, end;
+	size_t offset = 0, line_start, line_end, from_offset, to_offset, length = ZSTR_LEN(text);
+
+	for (current = 0; current < line; current++) {
+		next = memchr(ZSTR_VAL(text) + offset, '\n', length - offset);
+		if (!next) {
+			offset = length;
+			break;
+		}
+
+		offset = (size_t) (next - ZSTR_VAL(text)) + 1;
+	}
+
+	line_start = offset;
+	while (offset < length && ZSTR_VAL(text)[offset] != '\n' && ZSTR_VAL(text)[offset] != '\r') {
+		offset++;
+	}
+	line_end = offset;
+
+	if (column_from < 1 || column_to < column_from) {
+		lsp_line_range(range, text, one_based_line);
+
+		return;
+	}
+
+	from_offset = line_start + (size_t) (column_from - 1);
+	to_offset = line_start + (size_t) (column_to - 1);
+	if (from_offset > line_end) {
+		from_offset = line_end;
+	}
+	if (to_offset > line_end) {
+		to_offset = line_end;
+	}
+	if (to_offset <= from_offset) {
+		lsp_line_range(range, text, one_based_line);
+
+		return;
+	}
+
+	array_init(range);
+	array_init(&start);
+	add_assoc_long(&start, "line", line);
+	add_assoc_long(&start, "character", (zend_long) lsp_byte_offset_to_utf16_units(ZSTR_VAL(text), line_start, from_offset));
+	array_init(&end);
+	add_assoc_long(&end, "line", line);
+	add_assoc_long(&end, "character", (zend_long) lsp_byte_offset_to_utf16_units(ZSTR_VAL(text), line_start, to_offset));
+	add_assoc_zval(range, "start", &start);
+	add_assoc_zval(range, "end", &end);
+}
+
 extern void lsp_line_range(zval *range, zend_string *text, zend_long one_based_line)
 {
 	const char *next;
@@ -602,9 +660,26 @@ extern void lsp_line_range(zval *range, zend_string *text, zend_long one_based_l
 	add_assoc_zval(range, "end", &end);
 }
 
+static inline bool lsp_diagnostic_code_contains_ci(zend_string *code, const char *needle)
+{
+	size_t needle_length = strlen(needle), i;
+
+	if (ZSTR_LEN(code) < needle_length) {
+		return false;
+	}
+
+	for (i = 0; i + needle_length <= ZSTR_LEN(code); i++) {
+		if (strncasecmp(ZSTR_VAL(code) + i, needle, needle_length) == 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 extern void lsp_add_analyzer_diagnostic(zval *diagnostics, const char *source, zend_string *message, zend_string *code, zval *range, zend_long severity)
 {
-	zval diagnostic;
+	zval diagnostic, tags;
 
 	array_init(&diagnostic);
 	add_assoc_string(&diagnostic, "source", source);
@@ -612,6 +687,20 @@ extern void lsp_add_analyzer_diagnostic(zval *diagnostics, const char *source, z
 
 	if (code && ZSTR_LEN(code) > 0) {
 		add_assoc_str(&diagnostic, "code", zend_string_copy(code));
+
+		/* Psalm issue types (DeprecatedMethod, UnusedVariable, ...) and
+		 * PHPStan identifiers (method.deprecated, deadCode.unusedVariable)
+		 * map onto LSP DiagnosticTags so editors can strike through or fade
+		 * the offending code. */
+		if (lsp_diagnostic_code_contains_ci(code, "deprecated")) {
+			array_init(&tags);
+			add_next_index_long(&tags, 2);
+			add_assoc_zval(&diagnostic, "tags", &tags);
+		} else if (lsp_diagnostic_code_contains_ci(code, "unused") || lsp_diagnostic_code_contains_ci(code, "deadcode")) {
+			array_init(&tags);
+			add_next_index_long(&tags, 1);
+			add_assoc_zval(&diagnostic, "tags", &tags);
+		}
 	}
 
 	add_assoc_long(&diagnostic, "severity", severity);

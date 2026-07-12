@@ -230,8 +230,14 @@ static inline void lsp_runner_session_free(lsp_runner_session *session)
 		lsp_pipe_close(&session->pipes.input);
 		lsp_pipe_close(&session->pipes.output);
 		lsp_pipe_close(&session->pipes.error);
+		/* A wedged runner (or an analyzer child it forked) may ignore
+		 * SIGTERM; never block the single-threaded request loop on it —
+		 * escalate to SIGKILL after a short grace period. */
 		lsp_process_terminate(session->pipes.process);
-		lsp_process_wait(session->pipes.process, &status);
+		if (!lsp_process_wait_timeout(session->pipes.process, &status, 2.0)) {
+			lsp_process_terminate_force(session->pipes.process);
+			lsp_process_wait_timeout(session->pipes.process, &status, 1.0);
+		}
 		lsp_process_close(session->pipes.process);
 	}
 

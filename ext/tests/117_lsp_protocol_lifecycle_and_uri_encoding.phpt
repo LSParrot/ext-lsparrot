@@ -189,7 +189,7 @@ $messages = [
     // Definition into a path containing spaces must return a percent-encoded URI.
     ['jsonrpc' => '2.0', 'id' => 3, 'method' => 'textDocument/definition', 'params' => ['textDocument' => ['uri' => $uri], 'position' => lsp_position_after($fresh, 'public function run(Targ')]],
     // Unknown request methods must produce MethodNotFound, not a null result.
-    ['jsonrpc' => '2.0', 'id' => 4, 'method' => 'textDocument/typeDefinition', 'params' => ['textDocument' => ['uri' => $uri], 'position' => ['line' => 0, 'character' => 0]]],
+    ['jsonrpc' => '2.0', 'id' => 4, 'method' => 'textDocument/definitelyNotAMethod', 'params' => ['textDocument' => ['uri' => $uri], 'position' => ['line' => 0, 'character' => 0]]],
     ['jsonrpc' => '2.0', 'id' => 5, 'method' => 'shutdown', 'params' => []],
     // Requests after shutdown are invalid; only exit is honored.
     ['jsonrpc' => '2.0', 'id' => 6, 'method' => 'textDocument/hover', 'params' => ['textDocument' => ['uri' => $uri], 'position' => ['line' => 0, 'character' => 0]]],

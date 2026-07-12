@@ -1240,6 +1240,48 @@ extern void lsp_lsparrot_code_lens(lsp_server *server, zval *return_value, lsp_d
 	}
 }
 
+/* textDocument/typeDefinition: for a variable, jump to the class of its
+ * inferred type; for anything else fall back to the class the word resolves
+ * to (which for class names matches plain definition). */
+extern void lsp_lsparrot_type_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
+{
+	zend_long line, character;
+	zend_string *word, *class_name;
+	size_t offset;
+
+	lsp_position_from_zval(position, &line, &character);
+	offset = lsp_offset_at(document->text, line, character);
+	word = lsp_word_at(document->text, offset);
+
+	if (ZSTR_LEN(word) == 0) {
+		zend_string_release(word);
+		ZVAL_NULL(return_value);
+
+		return;
+	}
+
+	if (ZSTR_VAL(word)[0] == '$') {
+		class_name = lsp_infer_receiver_class(server, document, word, offset);
+	} else {
+		class_name = lsp_resolve_class_name_at(document->text, word, offset);
+	}
+
+	zend_string_release(word);
+
+	if (!class_name) {
+		ZVAL_NULL(return_value);
+
+		return;
+	}
+
+	lsp_index_join_worker(server);
+	if (!lsp_project_class_definition(server, class_name, return_value)) {
+		ZVAL_NULL(return_value);
+	}
+
+	zend_string_release(class_name);
+}
+
 extern void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
 {
 	zend_long line, character, target_line;

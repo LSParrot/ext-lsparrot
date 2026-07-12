@@ -13,6 +13,8 @@
 
 #include "lsp_internal.h"
 
+static inline zend_string *lsp_infer_property_fetch_assignment_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset);
+
 extern bool lsp_text_is_word_boundary(zend_string *text, size_t offset)
 {
 	const char *value = ZSTR_VAL(text);
@@ -2181,6 +2183,11 @@ extern zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *d
 		return class_name;
 	}
 
+	class_name = lsp_infer_property_fetch_assignment_class(server, document, receiver, offset);
+	if (class_name) {
+		return class_name;
+	}
+
 	type = lsp_parameter_declared_type_for_variable(document, receiver, offset);
 	if (type) {
 		class_name = lsp_resolve_class_name_at(document->text, type, offset);
@@ -2951,6 +2958,108 @@ static inline zend_string *lsp_resolve_project_property_declared_class(lsp_serve
 	return class_name;
 }
 
+/* `$x = $this->prop;` / `$x = $other->prop;` — assignment from a bare
+ * property fetch. The property's declared (or promoted/constructor) type
+ * gives $x its class, matching what PhpStorm resolves instantly. Method-call
+ * assignments take the earlier lsp_infer_method_call_assignment_class path;
+ * this one requires the fetch NOT to be a call. */
+static inline zend_string *lsp_infer_property_fetch_assignment_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text), *end = value + lsp_current_statement_scan_limit(document->text, offset),
+		*p = value, *match, *q, *recv_start, *recv_end, *prop_start, *prop_end;
+	zend_string *recv_variable, *receiver_class, *property_name, *class_name = NULL;
+
+	while (p < end) {
+		match = strstr(p, ZSTR_VAL(receiver));
+		if (!match || match >= end) {
+			break;
+		}
+
+		q = match + ZSTR_LEN(receiver);
+		if (lsp_doc_is_identifier_char(*q)) {
+			p = match + 1;
+			continue;
+		}
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+
+		if (q >= end || *q != '=' || (q + 1 < end && q[1] == '=')) {
+			p = match + 1;
+			continue;
+		}
+
+		q++;
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+
+		if (q >= end || *q != '$') {
+			p = match + 1;
+			continue;
+		}
+
+		recv_start = q++;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+		recv_end = q;
+
+		if (q + 2 >= end || q[0] != '-' || q[1] != '>') {
+			p = match + 1;
+			continue;
+		}
+
+		q += 2;
+		if (q >= end || !lsp_doc_is_identifier_start(*q)) {
+			p = match + 1;
+			continue;
+		}
+
+		prop_start = q++;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+		prop_end = q;
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+
+		/* A '(' means a method call; another '->' means a chain — both are
+		 * handled by other strategies. Only a terminated bare fetch counts. */
+		if (q >= end || *q != ';') {
+			p = match + 1;
+			continue;
+		}
+
+		recv_variable = zend_string_init(recv_start, recv_end - recv_start, 0);
+		if (zend_string_equals_literal(recv_variable, "$this")) {
+			receiver_class = lsp_inference_declared_class_name(document->text);
+		} else {
+			/* Scan limit shrinks to this assignment, so recursion always
+			 * terminates even for self-referential chains. */
+			receiver_class = lsp_infer_receiver_class(server, document, recv_variable, (size_t) (match - value));
+		}
+		zend_string_release(recv_variable);
+
+		if (receiver_class) {
+			property_name = zend_string_init(prop_start, prop_end - prop_start, 0);
+			if (class_name) {
+				zend_string_release(class_name);
+			}
+			class_name = lsp_resolve_project_property_declared_class(server, document, receiver_class, property_name);
+			zend_string_release(property_name);
+			zend_string_release(receiver_class);
+		}
+
+		p = match + 1;
+	}
+
+	return class_name;
+}
+
 static inline zend_string *lsp_resolve_ast_variable_class(lsp_server *server, lsp_document *document, zend_ast *ast, size_t context_offset)
 {
 	zend_string *name, *variable, *class_name;
@@ -3366,6 +3475,11 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 	}
 
 	type = lsp_infer_method_call_assignment_type(server, document, variable, offset);
+	if (type) {
+		return type;
+	}
+
+	type = lsp_infer_property_fetch_assignment_class(server, document, variable, offset);
 	if (type) {
 		return type;
 	}

@@ -29,6 +29,11 @@ extern void lsp_document_destroy(zval *value)
 		zval_ptr_dtor(&document->lsparrot);
 	}
 
+	if (document->outline_cache_text) {
+		zend_string_release(document->outline_cache_text);
+		zval_ptr_dtor(&document->outline_cache);
+	}
+
 	lsp_document_derived_invalidate(document);
 	efree(document);
 }
@@ -644,6 +649,56 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 	psalm = lsp_array_find(value, "psalm");
 	lsp_options_parse_psalm_cli(options, psalm);
 	lsp_options_parse_psalm(options, psalm);
+}
+
+/* workspace/didChangeConfiguration: apply the live-safe option subset without
+ * a server restart. Structural options (symbol index size, worker fan-out,
+ * analyzer selection) stay fixed for the process lifetime. Accepts either
+ * the options at the top level of `settings` or nested under `lsparrot`. */
+extern void lsp_options_apply_runtime(lsp_options *options, zval *params)
+{
+	zval *settings, *scoped;
+	zend_string *memory_limit;
+	zend_long level;
+	double timeout;
+
+	settings = params ? lsp_array_find(params, "settings") : NULL;
+	if (!settings || Z_TYPE_P(settings) != IS_ARRAY) {
+		return;
+	}
+
+	scoped = lsp_array_find(settings, "lsparrot");
+	if (scoped && Z_TYPE_P(scoped) == IS_ARRAY) {
+		settings = scoped;
+	}
+
+	lsp_options_parse_formatting(options, lsp_array_find(settings, "formatting"));
+
+	level = lsp_array_long(settings, "phpstanLevel", options->phpstan_level);
+	if (level >= 0) {
+		options->phpstan_level = level;
+	}
+
+	level = lsp_array_long(settings, "psalmLevel", options->psalm_level);
+	if (level >= 0) {
+		options->psalm_level = level;
+	}
+
+	memory_limit = lsp_array_string(settings, "memoryLimit");
+	if (memory_limit && ZSTR_LEN(memory_limit) > 0) {
+		zend_string_release(options->memory_limit);
+		options->memory_limit = zend_string_copy(memory_limit);
+	}
+
+	timeout = lsp_array_double(settings, "analyzerDiagnosticsTimeout", options->analyzer_diagnostics_timeout);
+	if (timeout >= 0.0) {
+		options->analyzer_diagnostics_timeout = timeout;
+	}
+
+	timeout = lsp_array_double(settings, "analyzerTypeQueryTimeout", options->analyzer_type_query_timeout);
+	if (timeout >= 0.0) {
+		options->analyzer_type_query_timeout = timeout;
+	}
 }
 
 extern void lsp_options_destroy(lsp_options *options)

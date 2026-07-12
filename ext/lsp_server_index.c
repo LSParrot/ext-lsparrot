@@ -1955,8 +1955,14 @@ extern void lsp_resolve_analyzers(lsp_server *server)
 
 	if (server->options.analyzer_auto) {
 		server->phpstan_enabled = phpstan_available;
-		server->psalm_enabled = psalm_available;
+		/* A composer install of Psalm ships both vendor/bin/psalm and
+		 * vendor/bin/psalm-language-server; running both duplicates every
+		 * diagnostic and doubles hover latency. Prefer the resident language
+		 * server (incremental, faster) and fall back to the CLI only when
+		 * the LS binary is absent. Explicit configuration can still enable
+		 * both deliberately. */
 		server->psalm_ls_enabled = psalm_ls_available;
+		server->psalm_enabled = psalm_available && !psalm_ls_available;
 	} else {
 		if (server->options.analyzer_phpstan) {
 			if (phpstan_available) {

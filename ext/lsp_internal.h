@@ -111,6 +111,11 @@ typedef struct _lsp_document {
 	size_t derived_import_insert_offset;
 	bool derived_import_after_use;
 	bool derived_valid;
+	/* documentSymbol outline memoized per text revision: editors poll the
+	 * outline continuously (breadcrumbs, sticky scroll), and the token walk
+	 * costs ~20ms on large files. */
+	zval outline_cache;
+	zend_string *outline_cache_text;
 } lsp_document;
 
 typedef struct _lsp_dir {
@@ -842,6 +847,9 @@ bool lsp_offset_is_inside_class_body(zend_string *text, size_t offset);
 void lsp_lsparrot_completion(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_hover(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_type_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_folding_range(lsp_server *server, zval *return_value, lsp_document *document);
+void lsp_options_apply_runtime(lsp_options *options, zval *params);
 void lsp_lsparrot_code_lens(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_lsparrot_signature_help(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_references(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
@@ -971,6 +979,7 @@ void lsp_composer_cache_clear(void);
 bool lsp_path_is_under_composer_vendor_dir(zend_string *path, zend_string *project_root);
 bool lsp_path_is_in_workspace_composer_vendor(zend_string *workspace_root, zend_string *path);
 void lsp_line_range(zval *range, zend_string *text, zend_long one_based_line);
+void lsp_line_range_columns(zval *range, zend_string *text, zend_long one_based_line, zend_long column_from, zend_long column_to);
 void lsp_publish_document_diagnostics(lsp_server *server, lsp_document *document);
 zend_string *lsp_document_project_root(lsp_server *server, lsp_document *document);
 zend_string *lsp_phpstan_type_for_expression(lsp_server *server, lsp_document *document, zend_string *expression, size_t offset);

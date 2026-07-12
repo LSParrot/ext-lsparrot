@@ -13,6 +13,8 @@
 
 #include "lsp_internal.h"
 
+#include <Zend/zend_language_parser.h>
+
 static inline void lsp_initialize(lsp_server *server, zval *params, zval *return_value)
 {
 	zend_string *root_uri = lsp_array_string(params, "rootUri"), *root_path = lsp_array_string(params, "rootPath");
@@ -59,11 +61,15 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	add_assoc_zval(&completion, "triggerCharacters", &triggers);
 	add_assoc_zval(&capabilities, "completionProvider", &completion);
 
+	add_assoc_string(&capabilities, "positionEncoding", "utf-16");
 	add_assoc_bool(&capabilities, "hoverProvider", true);
 	add_assoc_bool(&capabilities, "definitionProvider", true);
+	add_assoc_bool(&capabilities, "declarationProvider", true);
+	add_assoc_bool(&capabilities, "typeDefinitionProvider", true);
 	add_assoc_bool(&capabilities, "referencesProvider", true);
 	add_assoc_bool(&capabilities, "documentHighlightProvider", true);
 	add_assoc_bool(&capabilities, "implementationProvider", true);
+	add_assoc_bool(&capabilities, "foldingRangeProvider", true);
 	array_init(&code_lens);
 	add_assoc_bool(&code_lens, "resolveProvider", false);
 	add_assoc_zval(&capabilities, "codeLensProvider", &code_lens);
@@ -416,7 +422,30 @@ static inline void lsp_document_symbol_frame_close(lsp_document_symbol_frame *fr
  * methods and enum cases as children, with real ranges (declaration through
  * closing brace) and name-based selection ranges. Token-driven so it also
  * works on documents that do not currently parse. */
+static inline void lsp_document_symbols_uncached(zval *return_value, lsp_document *document);
+
+/* Text pointer identity keys the cache the same way the token cache does:
+ * didChange swaps document->text, naturally invalidating the memo. */
 static inline void lsp_document_symbols(zval *return_value, lsp_document *document)
+{
+	if (document->outline_cache_text == document->text && Z_TYPE(document->outline_cache) == IS_ARRAY) {
+		ZVAL_COPY(return_value, &document->outline_cache);
+
+		return;
+	}
+
+	lsp_document_symbols_uncached(return_value, document);
+
+	if (document->outline_cache_text) {
+		zend_string_release(document->outline_cache_text);
+		zval_ptr_dtor(&document->outline_cache);
+	}
+
+	document->outline_cache_text = zend_string_copy(document->text);
+	ZVAL_COPY(&document->outline_cache, return_value);
+}
+
+static inline void lsp_document_symbols_uncached(zval *return_value, lsp_document *document)
 {
 	lsp_document_symbol_frame frames[LSP_SYMBOL_FRAME_MAX];
 	zend_long depth = 0, kind, pending_kind = 0;
@@ -686,6 +715,121 @@ static inline void lsp_workspace_symbols(lsp_server *server, zval *params, zval 
 	}
 }
 
+#define LSP_FOLDING_STACK_MAX 128
+
+static inline void lsp_folding_add_range(zval *items, zend_long start_line, zend_long end_line, const char *kind)
+{
+	zval range;
+
+	if (end_line <= start_line) {
+		return;
+	}
+
+	array_init(&range);
+	add_assoc_long(&range, "startLine", start_line);
+	add_assoc_long(&range, "endLine", end_line);
+	if (kind) {
+		add_assoc_string(&range, "kind", kind);
+	}
+	add_next_index_zval(items, &range);
+}
+
+static inline zend_long lsp_folding_token_newlines(zend_string *text)
+{
+	const char *p = ZSTR_VAL(text), *end = p + ZSTR_LEN(text);
+	zend_long count = 0;
+
+	while (p < end) {
+		p = memchr(p, '\n', (size_t) (end - p));
+		if (!p) {
+			break;
+		}
+		count++;
+		p++;
+	}
+
+	return count;
+}
+
+/* Brace/bracket/paren blocks, multi-line doc comments, heredocs, and grouped
+ * use statements fold. The closing-delimiter line stays visible (endLine =
+ * closer line - 1), matching how VSCode folds braces; comments collapse onto
+ * their first line. */
+extern void lsp_lsparrot_folding_range(lsp_server *server, zval *return_value, lsp_document *document)
+{
+	zval *tokens_zv, *token;
+	zend_string *token_text;
+	HashTable *tokens;
+	zend_long open_lines[LSP_FOLDING_STACK_MAX];
+	zend_long token_line, newlines, heredoc_start_line;
+	uint32_t i, count, depth;
+	zend_long id;
+
+	(void) server;
+
+	array_init(return_value);
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY) {
+		return;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	depth = 0;
+	heredoc_start_line = -1;
+
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		id = lsp_token_long(token, "id", 0);
+		token_line = lsp_token_long(token, "line", 1) - 1;
+
+		if (id == T_COMMENT || id == T_DOC_COMMENT) {
+			token_text = lsp_token_string(token, "text");
+			newlines = token_text ? lsp_folding_token_newlines(token_text) : 0;
+			if (newlines > 0) {
+				lsp_folding_add_range(return_value, token_line, token_line + newlines, "comment");
+			}
+			continue;
+		}
+
+		if (id == T_START_HEREDOC) {
+			heredoc_start_line = token_line;
+			continue;
+		}
+
+		if (id == T_END_HEREDOC) {
+			if (heredoc_start_line >= 0) {
+				lsp_folding_add_range(return_value, heredoc_start_line, token_line - 1, NULL);
+				heredoc_start_line = -1;
+			}
+			continue;
+		}
+
+		if (id == '{' || id == '(' || id == '[' || id == T_ATTRIBUTE || id == T_CURLY_OPEN || id == T_DOLLAR_OPEN_CURLY_BRACES) {
+			if (depth < LSP_FOLDING_STACK_MAX) {
+				open_lines[depth] = token_line;
+			}
+			depth++;
+			continue;
+		}
+
+		if (id == '}' || id == ')' || id == ']') {
+			if (depth > 0) {
+				depth--;
+				if (depth < LSP_FOLDING_STACK_MAX) {
+					lsp_folding_add_range(return_value, open_lines[depth], token_line - 1, NULL);
+				}
+			}
+			continue;
+		}
+	}
+}
+
 static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zval *params, zval *return_value)
 {
 	if (zend_string_equals_literal(method, "initialize")) {
@@ -769,8 +913,31 @@ static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zv
 		return true;
 	}
 
-	if (zend_string_equals_literal(method, "textDocument/definition")) {
+	if (zend_string_equals_literal(method, "textDocument/definition") ||
+		zend_string_equals_literal(method, "textDocument/declaration")
+	) {
+		/* PHP has no declaration/definition split; declaration aliases the
+		 * definition lookup. */
 		lsp_document_request(server, params, lsp_lsparrot_definition, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/typeDefinition")) {
+		lsp_document_request(server, params, lsp_lsparrot_type_definition, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/foldingRange")) {
+		lsp_document_request_no_position(server, params, lsp_lsparrot_folding_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "workspace/didChangeConfiguration")) {
+		lsp_options_apply_runtime(&server->options, params);
+		ZVAL_NULL(return_value);
 
 		return true;
 	}

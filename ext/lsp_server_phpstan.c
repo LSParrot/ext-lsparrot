@@ -554,8 +554,11 @@ extern void lsp_append_phpstan_cached_diagnostics(lsp_server *server, lsp_docume
 
 			line = line_zv && Z_TYPE_P(line_zv) == IS_LONG ? Z_LVAL_P(line_zv) : 1;
 			lsp_line_range(&range, document->text, line);
+			/* PHPStan reports genuine rule violations without a severity
+			 * axis; PhpStorm and the official VSCode integrations surface
+			 * them as errors, so do the same. */
 			lsp_add_analyzer_diagnostic(diagnostics, "phpstan", Z_STR_P(message_text_zv),
-				identifier_zv && Z_TYPE_P(identifier_zv) == IS_STRING ? Z_STR_P(identifier_zv) : NULL, &range, 2
+				identifier_zv && Z_TYPE_P(identifier_zv) == IS_STRING ? Z_STR_P(identifier_zv) : NULL, &range, 1
 			);
 		} ZEND_HASH_FOREACH_END();
 	}
