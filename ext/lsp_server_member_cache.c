@@ -221,6 +221,103 @@ extern bool lsp_token_is_promoted_property(HashTable *tokens, uint32_t index, ze
 	return lsp_token_is_promoted_property_declaration(tokens, index, text, body_depth, param_start);
 }
 
+static inline zend_string *lsp_member_cache_entry_member_detail(zval *entry, zend_string *member)
+{
+	zend_string *label, *detail;
+	zval *collection, *item;
+	const char *keys[3] = { "properties", "methods", "constants" };
+	size_t key_index;
+
+	for (key_index = 0; key_index < 3; key_index++) {
+		collection = zend_hash_str_find(Z_ARRVAL_P(entry), keys[key_index], strlen(keys[key_index]));
+		if (!collection || Z_TYPE_P(collection) != IS_ARRAY) {
+			continue;
+		}
+
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(collection), item) {
+			label = lsp_array_string(item, "label");
+			if (!label || !zend_string_equals(label, member)) {
+				continue;
+			}
+
+			detail = lsp_array_string(item, "detail");
+			if (detail) {
+				return zend_string_copy(detail);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	return NULL;
+}
+
+static zend_string *lsp_inherited_member_detail_ex(lsp_server *server, zend_string *class_name, zend_string *member, HashTable *visited, uint32_t depth)
+{
+	zend_string *current, *next, *detail = NULL;
+	zval *entry, *parent, *traits, *trait_zv;
+
+	if (depth > 16) {
+		return NULL;
+	}
+
+	current = zend_string_copy(class_name);
+	while (current) {
+		if (zend_hash_exists(visited, current)) {
+			break;
+		}
+
+		zend_hash_add_empty_element(visited, current);
+		entry = lsp_class_member_cache_entry(server, current);
+		if (!entry || Z_TYPE_P(entry) != IS_ARRAY) {
+			break;
+		}
+
+		detail = lsp_member_cache_entry_member_detail(entry, member);
+		if (detail) {
+			break;
+		}
+
+		traits = zend_hash_str_find(Z_ARRVAL_P(entry), "traits", sizeof("traits") - 1);
+		if (traits && Z_TYPE_P(traits) == IS_ARRAY) {
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(traits), trait_zv) {
+				if (Z_TYPE_P(trait_zv) == IS_STRING) {
+					detail = lsp_inherited_member_detail_ex(server, Z_STR_P(trait_zv), member, visited, depth + 1);
+					if (detail) {
+						break;
+					}
+				}
+			} ZEND_HASH_FOREACH_END();
+		}
+		if (detail) {
+			break;
+		}
+
+		parent = zend_hash_str_find(Z_ARRVAL_P(entry), "parent", sizeof("parent") - 1);
+		next = parent && Z_TYPE_P(parent) == IS_STRING && Z_STRLEN_P(parent) > 0 ? zend_string_copy(Z_STR_P(parent)) : NULL;
+		zend_string_release(current);
+		current = next;
+	}
+
+	if (current) {
+		zend_string_release(current);
+	}
+
+	return detail;
+}
+
+/* Declaration detail (signature, property type, const/case) for a member of
+ * `class_name`, searching the ancestor chain and traits. */
+extern zend_string *lsp_inherited_member_detail(lsp_server *server, zend_string *class_name, zend_string *member)
+{
+	HashTable visited;
+	zend_string *detail;
+
+	zend_hash_init(&visited, 8, NULL, NULL, 0);
+	detail = lsp_inherited_member_detail_ex(server, class_name, member, &visited, 0);
+	zend_hash_destroy(&visited);
+
+	return detail;
+}
+
 static inline void lsp_cache_class_method(zval *methods, zend_string *label, zend_string *detail, bool is_static, lsp_method_visibility visibility)
 {
 	zval method;

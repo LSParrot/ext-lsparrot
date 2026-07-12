@@ -2750,7 +2750,7 @@ extern zend_string *lsp_type_array_element_type(zend_string *type)
 	while (end > value && isspace((unsigned char) end[-1])) {
 		end--;
 	}
-	if (end - value > 2 && end[-1] == ']' && end[-2] == ']') {
+	if (end - value > 2 && end[-1] == ']' && end[-2] == '[') {
 		return lsp_string_trim_slice(value, end - 2);
 	}
 

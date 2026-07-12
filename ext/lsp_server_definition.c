@@ -64,7 +64,7 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 	zval tokens_zv, *token, *name_token;
 	HashTable *tokens;
 	uint32_t i, count, name_index;
-	size_t class_start = 0, body_start = 0, body_end = 0, name_offset;
+	size_t class_start = 0, body_start = 0, body_end = 0, name_offset, promoted_param_start;
 
 	*parent_class = NULL;
 
@@ -87,7 +87,35 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 			continue;
 		}
 
-		if (!lsp_token_name_equals(token, "T_FUNCTION") || !lsp_token_at_depth(contents, token, body_depth)) {
+		if (!lsp_token_at_depth(contents, token, body_depth)) {
+			continue;
+		}
+
+		/* Property declarations (including constructor-promoted params). */
+		if (lsp_token_name_equals(token, "T_VARIABLE")) {
+			label = lsp_token_string(token, "text");
+			if (!label ||
+				ZSTR_LEN(label) != ZSTR_LEN(member_name) + 1 ||
+				ZSTR_VAL(label)[0] != '$' ||
+				memcmp(ZSTR_VAL(label) + 1, ZSTR_VAL(member_name), ZSTR_LEN(member_name)) != 0
+			) {
+				continue;
+			}
+
+			if (!lsp_token_is_property_declaration(tokens, i, contents, body_depth) &&
+				!lsp_token_is_promoted_property(tokens, i, contents, body_depth, &promoted_param_start)
+			) {
+				continue;
+			}
+
+			name_offset = (size_t) lsp_token_long(token, "offset", 0);
+			lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(label), return_value);
+			zval_ptr_dtor(&tokens_zv);
+
+			return true;
+		}
+
+		if (!lsp_token_name_equals(token, "T_FUNCTION")) {
 			continue;
 		}
 
@@ -110,7 +138,7 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 	return false;
 }
 
-static inline bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth)
+extern bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth)
 {
 	zend_string *path, *contents, *parent_class;
 	zval traits, *trait_zv;
@@ -522,7 +550,7 @@ static inline bool lsp_definition_word_bounds(zend_string *text, zend_string *wo
 	return true;
 }
 
-static inline bool lsp_static_member_receiver_class(lsp_document *document, size_t offset, zend_string *word, zend_string **class_name, bool *public_only)
+extern bool lsp_static_member_receiver_class(lsp_document *document, size_t offset, zend_string *word, zend_string **class_name, bool *public_only)
 {
 	const char *value;
 	zend_string *receiver, *resolved;

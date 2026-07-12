@@ -180,7 +180,7 @@ static inline bool lsp_find_matching_close_paren(zend_string *text, size_t open_
 	return false;
 }
 
-static inline bool lsp_find_function_scope_at(HashTable *tokens, zend_string *text, size_t offset, size_t *param_start, size_t *param_end, size_t *body_start, size_t *body_end, zend_long *body_depth)
+extern bool lsp_find_function_scope_at(HashTable *tokens, zend_string *text, size_t offset, size_t *param_start, size_t *param_end, size_t *body_start, size_t *body_end, zend_long *body_depth)
 {
 	const char *value = ZSTR_VAL(text);
 	zval *token;
@@ -759,43 +759,46 @@ extern zend_string *lsp_function_signature_detail(zend_string *text, zval *name_
 
 extern bool lsp_find_enclosing_class_header(zend_string *text, size_t offset, size_t *class_start, size_t *body_start, size_t *body_end, zend_long *body_depth)
 {
-	const char *value = ZSTR_VAL(text);
-	size_t i, length, p, close_offset;
+	const char *keywords[4] = {"class", "interface", "trait", "enum"}, *value = ZSTR_VAL(text);
+	size_t i, length, p, close_offset, keyword_index, keyword_length;
 	bool found = false;
 
 	length = offset > ZSTR_LEN(text) ? ZSTR_LEN(text) : offset;
 
-	for (i = 0; i + sizeof("class") - 1 < length; i++) {
-		if (memcmp(value + i, "class", sizeof("class") - 1) != 0) {
-			continue;
-		}
+	for (i = 0; i < length; i++) {
+		for (keyword_index = 0; keyword_index < sizeof(keywords) / sizeof(keywords[0]); keyword_index++) {
+			keyword_length = strlen(keywords[keyword_index]);
+			if (i + keyword_length >= length || memcmp(value + i, keywords[keyword_index], keyword_length) != 0) {
+				continue;
+			}
 
-		if (i > 0 && (lsp_doc_is_identifier_char(value[i - 1]) || value[i - 1] == '$')) {
-			continue;
-		}
+			if (i > 0 && (lsp_doc_is_identifier_char(value[i - 1]) || value[i - 1] == '$')) {
+				continue;
+			}
 
-		if (!lsp_text_is_word_boundary(text, i + sizeof("class") - 1)) {
-			continue;
-		}
+			if (!lsp_text_is_word_boundary(text, i + keyword_length)) {
+				continue;
+			}
 
-		p = i + sizeof("class") - 1;
-		while (p < ZSTR_LEN(text) && value[p] != '{') {
-			p++;
-		}
+			p = i + keyword_length;
+			while (p < ZSTR_LEN(text) && value[p] != '{') {
+				p++;
+			}
 
-		if (p >= ZSTR_LEN(text) || p >= offset) {
-			continue;
-		}
+			if (p >= ZSTR_LEN(text) || p >= offset) {
+				continue;
+			}
 
-		if (!lsp_find_matching_brace(text, p, &close_offset) || offset > close_offset) {
-			continue;
-		}
+			if (!lsp_find_matching_brace(text, p, &close_offset) || offset > close_offset) {
+				continue;
+			}
 
-		*class_start = i;
-		*body_start = p + 1;
-		*body_end = close_offset;
-		*body_depth = lsp_brace_depth_at(text, p + 1);
-		found = true;
+			*class_start = i;
+			*body_start = p + 1;
+			*body_end = close_offset;
+			*body_depth = lsp_brace_depth_at(text, p + 1);
+			found = true;
+		}
 	}
 
 	return found;

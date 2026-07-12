@@ -832,6 +832,10 @@ bool lsp_document_has_import_cached(lsp_document *document, char kind, const cha
 bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
 void lsp_add_inherited_project_class_method_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
 zend_string *lsp_parameter_declared_type_before_variable(zend_string *text, size_t variable_offset, size_t param_start);
+zend_string *lsp_inherited_member_detail(lsp_server *server, zend_string *class_name, zend_string *member);
+bool lsp_static_member_receiver_class(lsp_document *document, size_t offset, zend_string *word, zend_string **class_name, bool *public_only);
+bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth);
+bool lsp_find_function_scope_at(HashTable *tokens, zend_string *text, size_t offset, size_t *param_start, size_t *param_end, size_t *body_start, size_t *body_end, zend_long *body_depth);
 bool lsp_token_is_promoted_property(HashTable *tokens, uint32_t index, zend_string *text, zend_long body_depth, size_t *param_start);
 zend_string *lsp_document_import_bound_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
 size_t lsp_document_import_insert_offset_cached(lsp_document *document, bool *after_existing_use);

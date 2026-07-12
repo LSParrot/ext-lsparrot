@@ -754,35 +754,6 @@ static inline zend_string *lsp_hover_property_declaration_markdown(lsp_document 
 	return NULL;
 }
 
-static inline zend_string *lsp_hover_member_detail_from_entry(zval *entry, zend_string *member)
-{
-	zend_string *label, *detail;
-	zval *collection, *item;
-	const char *keys[2] = { "properties", "methods" };
-	size_t key_index;
-
-	for (key_index = 0; key_index < 2; key_index++) {
-		collection = zend_hash_str_find(Z_ARRVAL_P(entry), keys[key_index], strlen(keys[key_index]));
-		if (!collection || Z_TYPE_P(collection) != IS_ARRAY) {
-			continue;
-		}
-
-		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(collection), item) {
-			label = lsp_array_string(item, "label");
-			if (!label || !zend_string_equals(label, member)) {
-				continue;
-			}
-
-			detail = lsp_array_string(item, "detail");
-			if (detail) {
-				return zend_string_copy(detail);
-			}
-		} ZEND_HASH_FOREACH_END();
-	}
-
-	return NULL;
-}
-
 /* Look up a member declared by the class enclosing the given offset,
  * including private members (which the member cache excludes). */
 static inline zend_string *lsp_hover_own_member_detail(lsp_document *document, zend_string *member, size_t offset)
@@ -853,7 +824,6 @@ static inline zend_string *lsp_hover_member_access_markdown(lsp_server *server, 
 	const char *value = ZSTR_VAL(document->text);
 	zend_long body_depth = 0;
 	zend_string *class_name, *member_prefix, *detail, *markdown;
-	zval *entry;
 	size_t word_start, arrow_end, receiver_end, class_start = 0, body_start = 0, body_end = 0;
 
 	if (ZSTR_LEN(word) == 0 || ZSTR_VAL(word)[0] == '$' || offset > ZSTR_LEN(document->text)) {
@@ -875,7 +845,9 @@ static inline zend_string *lsp_hover_member_access_markdown(lsp_server *server, 
 	}
 
 	class_name = NULL;
-	if (lsp_member_access_class_context(server, document, offset, word, &class_name, &member_prefix)) {
+	/* The completion-oriented context helpers expect the offset at the END
+	 * of the typed prefix; hover positions land mid-word, so realign. */
+	if (lsp_member_access_class_context(server, document, word_start + ZSTR_LEN(word), word, &class_name, &member_prefix)) {
 		zend_string_release(member_prefix);
 	} else {
 		/* "$this->" receivers resolve to the enclosing class. */
@@ -890,8 +862,8 @@ static inline zend_string *lsp_hover_member_access_markdown(lsp_server *server, 
 		return NULL;
 	}
 
-	entry = lsp_class_member_cache_entry(server, class_name);
-	detail = entry && Z_TYPE_P(entry) == IS_ARRAY ? lsp_hover_member_detail_from_entry(entry, word) : NULL;
+	/* Search the ancestor chain and traits, not only the receiver class. */
+	detail = lsp_inherited_member_detail(server, class_name, word);
 	zend_string_release(class_name);
 
 	if (!detail) {
@@ -1194,6 +1166,91 @@ static inline zend_string *lsp_hover_project_symbol_markdown(lsp_server *server,
 	return markdown;
 }
 
+/* Hover on the declaration site of an enum case (`case Red = 'r';`). */
+static inline zend_string *lsp_hover_enum_case_declaration_markdown(lsp_server *server, lsp_document *document, zend_string *word, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text);
+	zend_long body_depth = 0;
+	zend_string *enclosing, *detail, *markdown;
+	size_t word_start, kw_end, kw_start, class_start = 0, body_start = 0, body_end = 0;
+
+	if (ZSTR_LEN(word) == 0 || offset > ZSTR_LEN(document->text)) {
+		return NULL;
+	}
+
+	word_start = offset;
+	while (word_start > 0 && lsp_doc_is_identifier_char(value[word_start - 1])) {
+		word_start--;
+	}
+
+	kw_end = word_start;
+	while (kw_end > 0 && isspace((unsigned char) value[kw_end - 1])) {
+		kw_end--;
+	}
+	kw_start = kw_end;
+	while (kw_start > 0 && lsp_doc_is_identifier_char(value[kw_start - 1])) {
+		kw_start--;
+	}
+	if (kw_end - kw_start != sizeof("case") - 1 || strncasecmp(value + kw_start, "case", sizeof("case") - 1) != 0) {
+		return NULL;
+	}
+
+	if (!lsp_find_enclosing_class_header(document->text, offset, &class_start, &body_start, &body_end, &body_depth)) {
+		return NULL;
+	}
+
+	enclosing = lsp_class_declared_name(document->text, class_start, body_start);
+	if (!enclosing) {
+		return NULL;
+	}
+
+	detail = lsp_inherited_member_detail(server, enclosing, word);
+	zend_string_release(enclosing);
+	if (!detail) {
+		return NULL;
+	}
+
+	markdown = strpprintf(0, "`%s`\n\nLSParrot Engine", ZSTR_VAL(detail));
+	zend_string_release(detail);
+
+	return markdown;
+}
+
+/* Hover for "Receiver::word" (class constants, enum cases, static members,
+ * parent::/self::/static:: calls): resolve the receiver class and surface the
+ * member declaration from the inheritance-aware member cache. */
+static inline zend_string *lsp_hover_static_member_markdown(lsp_server *server, lsp_document *document, zend_string *word, size_t offset)
+{
+	zend_string *class_name, *lookup, *detail, *markdown;
+	bool public_only;
+
+	if (ZSTR_LEN(word) == 0) {
+		return NULL;
+	}
+
+	if (!lsp_static_member_receiver_class(document, offset, word, &class_name, &public_only)) {
+		return NULL;
+	}
+
+	/* Static property hovers arrive as "$name"; the cache stores "name". */
+	lookup = ZSTR_VAL(word)[0] == '$' && ZSTR_LEN(word) > 1
+		? zend_string_init(ZSTR_VAL(word) + 1, ZSTR_LEN(word) - 1, 0)
+		: zend_string_copy(word)
+	;
+	detail = lsp_inherited_member_detail(server, class_name, lookup);
+	zend_string_release(lookup);
+	zend_string_release(class_name);
+
+	if (!detail) {
+		return NULL;
+	}
+
+	markdown = strpprintf(0, "`%s`\n\nLSParrot Engine", ZSTR_VAL(detail));
+	zend_string_release(detail);
+
+	return markdown;
+}
+
 extern void lsp_lsparrot_hover(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
 {
 	zend_long line, character;
@@ -1269,24 +1326,20 @@ extern void lsp_lsparrot_hover(lsp_server *server, zval *return_value, lsp_docum
 		return;
 	}
 
-	markdown = lsp_hover_builtin_symbol_markdown(word);
-	if (markdown) {
-		array_init(return_value);
-		array_init(&contents);
-		add_assoc_string(&contents, "kind", "markdown");
-		add_assoc_str(&contents, "value", markdown);
-		add_assoc_zval(return_value, "contents", &contents);
-		if (analyzer_expression) {
-			zend_string_release(analyzer_expression);
-		}
-		zend_string_release(word);
-
-		return;
+	/* Member/static hovers first: a property or constant named like a PHP
+	 * builtin (Widget::MAX, $w->count) must not surface the builtin. */
+	markdown = lsp_hover_static_member_markdown(server, document, word, offset);
+	if (!markdown) {
+		markdown = lsp_hover_member_access_markdown(server, document, word, offset);
 	}
-
-	markdown = lsp_hover_member_access_markdown(server, document, word, offset);
+	if (!markdown) {
+		markdown = lsp_hover_enum_case_declaration_markdown(server, document, word, offset);
+	}
 	if (!markdown) {
 		markdown = lsp_hover_property_declaration_markdown(document, word, offset);
+	}
+	if (!markdown) {
+		markdown = lsp_hover_builtin_symbol_markdown(word);
 	}
 	if (!markdown) {
 		markdown = lsp_hover_project_symbol_markdown(server, document, word);

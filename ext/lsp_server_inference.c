@@ -1931,6 +1931,116 @@ static inline zend_string *lsp_infer_method_array_access_assignment_class(lsp_se
 	return NULL;
 }
 
+/* `foreach ($container as $item)` / `as $key => $item`: infer $item's class
+ * from the container's array-ish type (`Foo[]`, `array<Foo>`, ...). */
+static inline zend_string *lsp_infer_foreach_element_class(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text);
+	zend_string *container, *container_type, *element_type, *resolved;
+	size_t limit, p, open, close, as_pos, bound_start, bound_end, container_end, depth, i;
+
+	limit = offset > ZSTR_LEN(document->text) ? ZSTR_LEN(document->text) : offset;
+	resolved = NULL;
+
+	for (p = 0; p + sizeof("foreach") - 1 < limit; p++) {
+		if (strncasecmp(value + p, "foreach", sizeof("foreach") - 1) != 0 ||
+			(p > 0 && lsp_doc_is_identifier_char(value[p - 1])) ||
+			lsp_doc_is_identifier_char(value[p + sizeof("foreach") - 1])
+		) {
+			continue;
+		}
+
+		open = p + sizeof("foreach") - 1;
+		while (open < limit && isspace((unsigned char) value[open])) {
+			open++;
+		}
+		if (open >= limit || value[open] != '(') {
+			continue;
+		}
+
+		depth = 1;
+		as_pos = 0;
+		close = 0;
+		for (i = open + 1; i < ZSTR_LEN(document->text); i++) {
+			if (value[i] == '(' || value[i] == '[') {
+				depth++;
+			} else if (value[i] == ')' || value[i] == ']') {
+				depth--;
+				if (depth == 0) {
+					close = i;
+					break;
+				}
+			} else if (depth == 1 &&
+				(value[i] == 'a' || value[i] == 'A') &&
+				i + 1 < ZSTR_LEN(document->text) &&
+				(value[i + 1] == 's' || value[i + 1] == 'S') &&
+				!lsp_doc_is_identifier_char(value[i - 1]) &&
+				(i + 2 >= ZSTR_LEN(document->text) || !lsp_doc_is_identifier_char(value[i + 2]))
+			) {
+				as_pos = i;
+			}
+		}
+
+		/* The hovered/completed use site must be past the foreach header. */
+		if (!close || !as_pos || limit <= close) {
+			continue;
+		}
+
+		/* Bound variable: the LAST $ident before ')' (covers `$k => $v`). */
+		bound_end = close;
+		while (bound_end > as_pos && isspace((unsigned char) value[bound_end - 1])) {
+			bound_end--;
+		}
+		bound_start = bound_end;
+		while (bound_start > as_pos && (lsp_doc_is_identifier_char(value[bound_start - 1]) || value[bound_start - 1] == '$')) {
+			bound_start--;
+		}
+		if (bound_end <= bound_start ||
+			value[bound_start] != '$' ||
+			bound_end - bound_start != ZSTR_LEN(variable) ||
+			memcmp(value + bound_start, ZSTR_VAL(variable), ZSTR_LEN(variable)) != 0
+		) {
+			continue;
+		}
+
+		container_end = as_pos;
+		while (container_end > open + 1 && isspace((unsigned char) value[container_end - 1])) {
+			container_end--;
+		}
+		i = open + 1;
+		while (i < container_end && isspace((unsigned char) value[i])) {
+			i++;
+		}
+		if (i >= container_end || value[i] != '$') {
+			continue;
+		}
+
+		container = zend_string_init(value + i, container_end - i, 0);
+		container_type = lsp_infer_variable_phpdoc_type(document, container, p);
+		if (!container_type) {
+			container_type = lsp_parameter_declared_type_for_variable(document, container, p);
+		}
+		zend_string_release(container);
+		if (!container_type) {
+			continue;
+		}
+
+		element_type = lsp_type_array_element_type(container_type);
+		zend_string_release(container_type);
+		if (!element_type) {
+			continue;
+		}
+
+		if (resolved) {
+			zend_string_release(resolved);
+		}
+		resolved = lsp_resolve_class_name(document->text, element_type);
+		zend_string_release(element_type);
+	}
+
+	return resolved;
+}
+
 static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
 {
 	zend_string *type, *class_name, *resolved;
@@ -1994,7 +2104,7 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 		}
 	}
 
-	return NULL;
+	return lsp_infer_foreach_element_class(server, document, receiver, offset);
 }
 
 static inline bool lsp_static_method_call_before_offset(lsp_document *document, size_t offset, zend_string **method_name, zend_string **class_name)
@@ -3173,7 +3283,7 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 		return type;
 	}
 
-	return NULL;
+	return lsp_infer_foreach_element_class(server, document, variable, offset);
 }
 
 extern zend_string *lsp_infer_variable_phpdoc_type(lsp_document *document, zend_string *variable, size_t offset)

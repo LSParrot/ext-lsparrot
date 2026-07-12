@@ -13,6 +13,8 @@
 
 #include "lsp_internal.h"
 
+static inline bool lsp_refactor_add_scoped_matches(zval *items, zend_string *location_path, lsp_document *document, zend_string *word, size_t offset);
+
 static inline bool lsp_refactor_string_equals_ci(const char *left, size_t left_length, const char *right, size_t right_length)
 {
 	return left_length == right_length && strncasecmp(left, right, left_length) == 0;
@@ -838,7 +840,7 @@ static inline bool lsp_refactor_class_location(zend_string *path, zend_string *c
 	return found;
 }
 
-static inline void lsp_refactor_add_implementation_locations(lsp_server *server, zval *locations, zend_string *target)
+static inline void lsp_refactor_add_implementation_locations_ex(lsp_server *server, zval *locations, zend_string *target, zend_string *method)
 {
 	lsp_symbol_index_header *header;
 	lsp_document *document;
@@ -892,7 +894,10 @@ static inline void lsp_refactor_add_implementation_locations(lsp_server *server,
 		owns_contents = document || contents != zend_empty_string;
 		if (owns_contents && lsp_refactor_class_matches_implementation(contents, candidate, target)) {
 			ZVAL_UNDEF(&location);
-			if (lsp_refactor_class_location(path_string, contents, candidate, &location)) {
+			if (method
+				? lsp_project_method_definition_for_class(server, candidate, method, &location, 0)
+				: lsp_refactor_class_location(path_string, contents, candidate, &location)
+			) {
 				add_next_index_zval(locations, &location);
 			} else if (!Z_ISUNDEF(location)) {
 				zval_ptr_dtor(&location);
@@ -1418,7 +1423,7 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 {
 	const char *value;
 	zval *label;
-	size_t i;
+	size_t i, named_scan;
 	uint32_t depth, param_index;
 	bool escaped, need_hint;
 	char quote;
@@ -1447,6 +1452,19 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 		}
 
 		if (need_hint && !isspace((unsigned char) value[i])) {
+			/* PHP 8 named arguments (`name: value`) already show the name;
+			 * a parameter hint would render it twice. */
+			named_scan = i;
+			while (named_scan < close_offset && lsp_doc_is_identifier_char(value[named_scan])) {
+				named_scan++;
+			}
+			if (named_scan > i && named_scan < close_offset && value[named_scan] == ':' &&
+				(named_scan + 1 >= close_offset || value[named_scan + 1] != ':')
+			) {
+				need_hint = false;
+				continue;
+			}
+
 			label = zend_hash_index_find(Z_ARRVAL_P(params), param_index);
 			if (label && Z_TYPE_P(label) == IS_STRING) {
 				/* Anchor at the argument itself, not at whitespace that may
@@ -1531,12 +1549,247 @@ extern void lsp_lsparrot_references(lsp_server *server, zval *return_value, lsp_
 		return;
 	}
 
-	lsp_refactor_add_token_locations(return_value, document->path, document->text, word);
+	/* Scope-aware in-document references: locals must not merge with a
+	 * same-named property and vice versa. */
+	if (!lsp_refactor_add_scoped_matches(return_value, document->path, document, word, offset)) {
+		lsp_refactor_add_token_locations(return_value, document->path, document->text, word);
+	}
 	if (!lsp_refactor_word_is_variable(word)) {
 		lsp_refactor_add_project_reference_locations(server, return_value, document, word);
 	}
 
 	zend_string_release(word);
+}
+
+static inline void lsp_refactor_add_highlight_range(zval *items, zend_string *contents, size_t start, size_t end)
+{
+	zval item, range;
+
+	array_init(&item);
+	lsp_range_from_offsets(contents, start, end, &range);
+	add_assoc_zval(&item, "range", &range);
+	add_assoc_long(&item, "kind", 1);
+	add_next_index_zval(items, &item);
+}
+
+/* Emit either a DocumentHighlight (location_path == NULL) or a Location. */
+static inline void lsp_refactor_add_scoped_result(zval *items, zend_string *location_path, zend_string *contents, size_t start, size_t end)
+{
+	zval item;
+
+	if (location_path) {
+		lsp_refactor_location_from_offsets(location_path, contents, start, end, &item);
+		add_next_index_zval(items, &item);
+	} else {
+		lsp_refactor_add_highlight_range(items, contents, start, end);
+	}
+}
+
+static inline zval *lsp_refactor_prev_significant_token(HashTable *tokens, uint32_t index)
+{
+	zval *token;
+
+	while (index > 0) {
+		index--;
+		token = zend_hash_index_find(tokens, index);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_WHITESPACE") ||
+			lsp_token_name_equals(token, "T_COMMENT") ||
+			lsp_token_name_equals(token, "T_DOC_COMMENT")
+		) {
+			continue;
+		}
+
+		return token;
+	}
+
+	return NULL;
+}
+
+static inline bool lsp_refactor_token_is_object_operator(zval *token)
+{
+	return lsp_token_name_equals(token, "T_OBJECT_OPERATOR") ||
+		lsp_token_name_equals(token, "T_NULLSAFE_OBJECT_OPERATOR")
+	;
+}
+
+/* Highlight a property: its declaration(s) plus `->name` accesses. */
+static inline void lsp_refactor_add_property_highlights(zval *items, zend_string *location_path, lsp_document *document, HashTable *tokens, zend_string *member)
+{
+	zend_long class_depth;
+	zend_string *variable_name, *text;
+	zval *token, *previous;
+	uint32_t i, count;
+	size_t token_offset, class_start, body_start, body_end, promoted_param_start;
+
+	variable_name = strpprintf(0, "$%s", ZSTR_VAL(member));
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+
+		if (lsp_token_name_equals(token, "T_VARIABLE")) {
+			text = lsp_token_string(token, "text");
+			if (!text || !zend_string_equals(text, variable_name)) {
+				continue;
+			}
+
+			if (!lsp_find_enclosing_class_header(document->text, token_offset, &class_start, &body_start, &body_end, &class_depth)) {
+				continue;
+			}
+
+			if (lsp_token_is_property_declaration(tokens, i, document->text, class_depth) ||
+				lsp_token_is_promoted_property(tokens, i, document->text, class_depth, &promoted_param_start)
+			) {
+				lsp_refactor_add_scoped_result(items, location_path, document->text, token_offset, token_offset + ZSTR_LEN(text));
+			}
+
+			continue;
+		}
+
+		if (!lsp_token_name_equals(token, "T_STRING")) {
+			continue;
+		}
+
+		text = lsp_token_string(token, "text");
+		if (!text || !zend_string_equals(text, member)) {
+			continue;
+		}
+
+		previous = lsp_refactor_prev_significant_token(tokens, i);
+		if (previous && lsp_refactor_token_is_object_operator(previous)) {
+			lsp_refactor_add_scoped_result(items, location_path, document->text, token_offset, token_offset + ZSTR_LEN(text));
+		}
+	}
+
+	zend_string_release(variable_name);
+}
+
+/* Scope-aware highlights: a local `$name` must not merge with a same-named
+ * property, and a property must include its `->name` access sites. Returns
+ * false to fall back to the plain text matcher. */
+static inline bool lsp_refactor_add_scoped_matches(zval *items, zend_string *location_path, lsp_document *document, zend_string *word, size_t offset)
+{
+	zend_long class_depth, body_depth;
+	zend_string *text;
+	zval *tokens_zv, *token, *previous;
+	HashTable *tokens;
+	uint32_t i, count, cursor_index;
+	size_t token_offset, token_length, class_start, body_start, body_end, promoted_param_start,
+		param_start, param_end, scope_body_start, scope_body_end;
+	bool is_variable, cursor_found = false, property_mode = false, has_scope;
+
+	tokens_zv = Z_TYPE(document->lsparrot) == IS_ARRAY
+		? zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1)
+		: NULL
+	;
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY) {
+		return false;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	is_variable = ZSTR_LEN(word) > 0 && ZSTR_VAL(word)[0] == '$';
+
+	/* Locate the token under the cursor and classify it. */
+	cursor_index = 0;
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		text = lsp_token_string(token, "text");
+		if (!text || !zend_string_equals(text, word)) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		token_length = ZSTR_LEN(text);
+		if (offset < token_offset || offset > token_offset + token_length) {
+			continue;
+		}
+
+		if (is_variable && lsp_token_name_equals(token, "T_VARIABLE")) {
+			cursor_found = true;
+			cursor_index = i;
+			if (lsp_find_enclosing_class_header(document->text, token_offset, &class_start, &body_start, &body_end, &class_depth) &&
+				(lsp_token_is_property_declaration(tokens, i, document->text, class_depth) ||
+					lsp_token_is_promoted_property(tokens, i, document->text, class_depth, &promoted_param_start))
+			) {
+				property_mode = true;
+			}
+			break;
+		}
+
+		if (!is_variable && lsp_token_name_equals(token, "T_STRING")) {
+			previous = lsp_refactor_prev_significant_token(tokens, i);
+			if (previous && lsp_refactor_token_is_object_operator(previous)) {
+				cursor_found = true;
+				cursor_index = i;
+				property_mode = true;
+				break;
+			}
+		}
+	}
+
+	if (!cursor_found) {
+		return false;
+	}
+
+	(void) cursor_index;
+
+	if (property_mode) {
+		zend_string *member = is_variable
+			? zend_string_init(ZSTR_VAL(word) + 1, ZSTR_LEN(word) - 1, 0)
+			: zend_string_copy(word)
+		;
+		lsp_refactor_add_property_highlights(items, location_path, document, tokens, member);
+		zend_string_release(member);
+
+		return true;
+	}
+
+	/* Local variable: restrict to the enclosing function scope and skip
+	 * property declarations and `->name` member accesses. */
+	has_scope = lsp_find_function_scope_at(tokens, document->text, offset, &param_start, &param_end, &scope_body_start, &scope_body_end, &body_depth);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_VARIABLE")) {
+			continue;
+		}
+
+		text = lsp_token_string(token, "text");
+		if (!text || !zend_string_equals(text, word)) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		if (has_scope &&
+			(token_offset < param_start || token_offset > param_end) &&
+			(token_offset < scope_body_start || token_offset > scope_body_end)
+		) {
+			continue;
+		}
+
+		if (lsp_find_enclosing_class_header(document->text, token_offset, &class_start, &body_start, &body_end, &class_depth) &&
+			(lsp_token_is_property_declaration(tokens, i, document->text, class_depth) ||
+				lsp_token_is_promoted_property(tokens, i, document->text, class_depth, &promoted_param_start))
+		) {
+			continue;
+		}
+
+		lsp_refactor_add_scoped_result(items, location_path, document->text, token_offset, token_offset + ZSTR_LEN(text));
+	}
+
+	return true;
 }
 
 extern void lsp_lsparrot_document_highlight(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
@@ -1550,10 +1803,43 @@ extern void lsp_lsparrot_document_highlight(lsp_server *server, zval *return_val
 	lsp_position_from_zval(position, &line, &character);
 	offset = lsp_offset_at(document->text, line, character);
 	word = lsp_word_at(document->text, offset);
-	if (ZSTR_LEN(word) > 0) {
+	if (ZSTR_LEN(word) > 0 && !lsp_refactor_add_scoped_matches(return_value, NULL, document, word, offset)) {
 		lsp_refactor_add_document_highlights(return_value, document->text, word);
 	}
 	zend_string_release(word);
+}
+
+static inline void lsp_refactor_add_implementation_locations(lsp_server *server, zval *locations, zend_string *target)
+{
+	lsp_refactor_add_implementation_locations_ex(server, locations, target, NULL);
+}
+
+/* True when the word ending the given bounds is a declared function/method
+ * name (immediately preceded by the `function` keyword). */
+static inline bool lsp_refactor_word_is_function_declaration(zend_string *text, size_t word_start)
+{
+	const char *value = ZSTR_VAL(text);
+	size_t i = word_start, kw_end, kw_start;
+
+	while (i > 0 && isspace((unsigned char) value[i - 1])) {
+		i--;
+	}
+	if (i > 0 && value[i - 1] == '&') {
+		i--;
+		while (i > 0 && isspace((unsigned char) value[i - 1])) {
+			i--;
+		}
+	}
+
+	kw_end = i;
+	while (i > 0 && lsp_doc_is_identifier_char(value[i - 1])) {
+		i--;
+	}
+	kw_start = i;
+
+	return kw_end - kw_start == sizeof("function") - 1 &&
+		strncasecmp(value + kw_start, "function", sizeof("function") - 1) == 0
+	;
 }
 
 extern void lsp_lsparrot_implementation(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
@@ -1569,6 +1855,32 @@ extern void lsp_lsparrot_implementation(lsp_server *server, zval *return_value, 
 	if (ZSTR_LEN(word) == 0) {
 		zend_string_release(word);
 		return;
+	}
+
+	/* On a method DECLARATION inside an interface/class, list each
+	 * implementer's override of that method instead of the type itself. */
+	{
+		zend_long enclosing_depth = 0;
+		zend_string *enclosing;
+		size_t word_start = offset > ZSTR_LEN(document->text) ? ZSTR_LEN(document->text) : offset,
+			class_start = 0, body_start = 0, body_end = 0;
+
+		while (word_start > 0 && lsp_doc_is_identifier_char(ZSTR_VAL(document->text)[word_start - 1])) {
+			word_start--;
+		}
+
+		if (lsp_refactor_word_is_function_declaration(document->text, word_start) &&
+			lsp_find_enclosing_class_header(document->text, offset, &class_start, &body_start, &body_end, &enclosing_depth)
+		) {
+			enclosing = lsp_class_declared_name(document->text, class_start, body_start);
+			if (enclosing) {
+				lsp_refactor_add_implementation_locations_ex(server, return_value, enclosing, word);
+				zend_string_release(enclosing);
+				zend_string_release(word);
+
+				return;
+			}
+		}
 	}
 
 	target = lsp_resolve_class_name(document->text, word);
@@ -1613,6 +1925,54 @@ extern void lsp_lsparrot_code_action(lsp_server *server, zval *return_value, lsp
 	zend_string_release(word);
 }
 
+/* Only identifier-bearing tokens are rename targets: keywords, string
+ * literal contents, and comments must return null from prepareRename. */
+static inline bool lsp_refactor_offset_is_renamable(lsp_document *document, size_t word_start)
+{
+	zval *tokens_zv, *token;
+	HashTable *tokens;
+	uint32_t i, count;
+	size_t token_offset, token_length;
+	zend_string *text;
+
+	tokens_zv = Z_TYPE(document->lsparrot) == IS_ARRAY
+		? zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1)
+		: NULL
+	;
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY) {
+		return true;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		text = lsp_token_string(token, "text");
+		if (!text) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+		token_length = ZSTR_LEN(text);
+		if (word_start < token_offset || word_start >= token_offset + token_length) {
+			continue;
+		}
+
+		return lsp_token_name_equals(token, "T_VARIABLE") ||
+			lsp_token_name_equals(token, "T_STRING") ||
+			lsp_token_name_equals(token, "T_NAME_QUALIFIED") ||
+			lsp_token_name_equals(token, "T_NAME_FULLY_QUALIFIED") ||
+			lsp_token_name_equals(token, "T_NAME_RELATIVE")
+		;
+	}
+
+	return true;
+}
+
 extern void lsp_lsparrot_prepare_rename(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
 {
 	zend_long line, character;
@@ -1624,7 +1984,11 @@ extern void lsp_lsparrot_prepare_rename(lsp_server *server, zval *return_value, 
 	lsp_position_from_zval(position, &line, &character);
 	offset = lsp_offset_at(document->text, line, character);
 	word = lsp_word_at(document->text, offset);
-	if (ZSTR_LEN(word) == 0 || lsp_refactor_word_is_qualified(word) || !lsp_refactor_word_bounds(document->text, offset, &word_start, &word_end)) {
+	if (ZSTR_LEN(word) == 0 ||
+		lsp_refactor_word_is_qualified(word) ||
+		!lsp_refactor_word_bounds(document->text, offset, &word_start, &word_end) ||
+		!lsp_refactor_offset_is_renamable(document, word_start)
+	) {
 		zend_string_release(word);
 		ZVAL_NULL(return_value);
 		return;
@@ -1633,6 +1997,48 @@ extern void lsp_lsparrot_prepare_rename(lsp_server *server, zval *return_value, 
 	lsp_range_from_offsets(document->text, word_start, word_end, &range);
 	ZVAL_COPY_VALUE(return_value, &range);
 	zend_string_release(word);
+}
+
+/* Rename a variable using the same scoping rules as documentHighlight:
+ * collect the scoped ranges, then emit text edits for them. Returns false
+ * (leaving changes untouched) when scoping cannot classify the cursor. */
+static inline bool lsp_refactor_add_scoped_variable_rename_changes(zval *changes, lsp_document *document, zend_string *word, zend_string *new_text, size_t offset)
+{
+	zval matches, *match, *range, edits, edit, range_copy;
+	bool any = false;
+
+	array_init(&matches);
+	if (!lsp_refactor_add_scoped_matches(&matches, NULL, document, word, offset)) {
+		zval_ptr_dtor(&matches);
+
+		return false;
+	}
+
+	array_init(&edits);
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(matches), match) {
+		range = lsp_array_find(match, "range");
+		if (!range) {
+			continue;
+		}
+
+		array_init(&edit);
+		ZVAL_COPY(&range_copy, range);
+		add_assoc_zval(&edit, "range", &range_copy);
+		add_assoc_str(&edit, "newText", zend_string_copy(new_text));
+		add_next_index_zval(&edits, &edit);
+		any = true;
+	} ZEND_HASH_FOREACH_END();
+	zval_ptr_dtor(&matches);
+
+	if (!any) {
+		zval_ptr_dtor(&edits);
+
+		return false;
+	}
+
+	add_assoc_zval_ex(changes, ZSTR_VAL(document->uri), ZSTR_LEN(document->uri), &edits);
+
+	return true;
 }
 
 extern void lsp_lsparrot_rename(lsp_server *server, zval *return_value, lsp_document *document, zval *params)
@@ -1665,7 +2071,12 @@ extern void lsp_lsparrot_rename(lsp_server *server, zval *return_value, lsp_docu
 
 	variable = lsp_refactor_word_is_variable(word);
 	new_text = lsp_refactor_rename_text(word, new_name);
-	lsp_refactor_add_file_rename_changes(&changes, document->uri, document->text, word, new_text);
+	if (variable && lsp_refactor_add_scoped_variable_rename_changes(&changes, document, word, new_text, offset)) {
+		/* Local variable scoped rename: property declarations and other
+		 * functions' same-named locals stay untouched. */
+	} else {
+		lsp_refactor_add_file_rename_changes(&changes, document->uri, document->text, word, new_text);
+	}
 	if (!variable) {
 		lsp_refactor_add_project_rename_changes(server, &changes, document, word, new_text);
 	}
