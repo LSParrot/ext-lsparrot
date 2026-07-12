@@ -286,15 +286,33 @@ static inline void lsp_index_signature_scan_dir(zend_string *dir, uint32_t depth
 	lsp_dir_close(handle);
 }
 
+typedef struct _lsp_index_signature_ctx {
+	uint64_t *signature;
+	uint64_t *file_count;
+} lsp_index_signature_ctx;
+
+static void lsp_index_signature_root(lsp_server *server, zend_string *root, void *context)
+{
+	lsp_index_signature_ctx *ctx = (lsp_index_signature_ctx *) context;
+
+	(void) server;
+
+	*ctx->signature = lsp_index_signature_mix_bytes(*ctx->signature, ZSTR_VAL(root), ZSTR_LEN(root));
+	lsp_index_signature_scan_dir(root, 0, ctx->signature, ctx->file_count);
+}
+
 static inline void lsp_index_signature(lsp_server *server, uint64_t *signature, uint64_t *file_count)
 {
+	lsp_index_signature_ctx ctx;
+
 	*signature = LSP_INDEX_SIGNATURE_OFFSET;
 	*file_count = 0;
-	*signature = lsp_index_signature_mix_bytes(*signature, ZSTR_VAL(server->root), ZSTR_LEN(server->root));
 	*signature = lsp_index_signature_mix_bytes(*signature, PHP_LSPARROT_VERSION, strlen(PHP_LSPARROT_VERSION));
 	*signature = lsp_index_signature_mix_u64(*signature, LSP_SYMBOL_INDEX_PAYLOAD_VERSION);
 
-	lsp_index_signature_scan_dir(server->root, 0, signature, file_count);
+	ctx.signature = signature;
+	ctx.file_count = file_count;
+	lsp_workspace_roots_each(server, lsp_index_signature_root, &ctx);
 }
 
 static inline bool lsp_index_cache_write_all(FILE *fp, const void *data, size_t length)
@@ -690,7 +708,7 @@ static inline void lsp_scan_psr4_dir(lsp_server *server, zend_string *dir, uint3
 	zend_string *child;
 	zend_stat_t st;
 
-	if (depth > 32 || !lsp_path_is_under_root(dir, server->root) || lsp_path_contains_vendor(dir)) {
+	if (depth > 32 || !lsp_path_is_under_any_root(server, dir) || lsp_path_contains_vendor(dir)) {
 		return;
 	}
 
@@ -729,7 +747,7 @@ static inline void lsp_scan_psr0_dir(lsp_server *server, zend_string *dir, uint3
 	zend_string *child;
 	zend_stat_t st;
 
-	if (depth > 32 || !lsp_path_is_under_root(dir, server->root) || lsp_path_contains_vendor(dir)) {
+	if (depth > 32 || !lsp_path_is_under_any_root(server, dir) || lsp_path_contains_vendor(dir)) {
 		return;
 	}
 
@@ -1390,7 +1408,7 @@ static inline void lsp_index_declared_symbols_in_path(lsp_server *server, zend_s
 {
 	zend_stat_t st;
 
-	if (!lsp_path_is_under_root(path, server->root) || VCWD_STAT(ZSTR_VAL(path), &st) != 0) {
+	if (!lsp_path_is_under_any_root(server, path) || VCWD_STAT(ZSTR_VAL(path), &st) != 0) {
 		return;
 	}
 
@@ -1474,10 +1492,17 @@ static inline void lsp_index_workspace_composer_projects(lsp_server *server, zen
 	lsp_dir_close(handle);
 }
 
+static void lsp_build_project_index_root(lsp_server *server, zend_string *root, void *context)
+{
+	(void) context;
+
+	lsp_index_composer_project(server, root);
+	lsp_index_workspace_composer_projects(server, root, 0);
+}
+
 static inline void lsp_build_project_index_work(lsp_server *server)
 {
-	lsp_index_composer_project(server, server->root);
-	lsp_index_workspace_composer_projects(server, server->root, 0);
+	lsp_workspace_roots_each(server, lsp_build_project_index_root, NULL);
 }
 
 #if LSP_HAVE_POSIX_PROCESS

@@ -95,10 +95,29 @@ static inline bool lsp_analyzer_job_matches_document(lsp_analyzer_job *job, lsp_
 	;
 }
 
+static inline bool lsp_analyzer_job_table_matches_document(HashTable *jobs, lsp_document *document)
+{
+	lsp_analyzer_job *job;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(jobs, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		job = (lsp_analyzer_job *) Z_PTR_P(value);
+		if (lsp_analyzer_job_matches_document(job, document)) {
+			return true;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return false;
+}
+
 extern bool lsp_analyzer_jobs_running_for_document(lsp_server *server, lsp_document *document)
 {
-	return lsp_analyzer_job_matches_document(&server->phpstan_job, document) ||
-		lsp_analyzer_job_matches_document(&server->psalm_job, document) ||
+	return lsp_analyzer_job_table_matches_document(&server->phpstan_jobs, document) ||
+		lsp_analyzer_job_table_matches_document(&server->psalm_jobs, document) ||
 		lsp_analyzer_job_matches_document(&server->phpstan_completion_job, document) ||
 		lsp_analyzer_job_matches_document(&server->psalm_completion_job, document) ||
 		lsp_runner_has_pending_for_uri(server, document->uri)
@@ -109,13 +128,7 @@ extern uint32_t lsp_active_process_count(lsp_server *server)
 {
 	uint32_t count = 0;
 
-	if (server->phpstan_job.running && lsp_process_id_valid(server->phpstan_job.pid)) {
-		count++;
-	}
-
-	if (server->psalm_job.running && lsp_process_id_valid(server->psalm_job.pid)) {
-		count++;
-	}
+	count += lsp_analyzer_running_project_jobs(server);
 
 	if (server->phpstan_completion_job.running && lsp_process_id_valid(server->phpstan_completion_job.pid)) {
 		count++;

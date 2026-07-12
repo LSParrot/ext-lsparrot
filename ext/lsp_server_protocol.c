@@ -19,6 +19,7 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 {
 	zend_string *root_uri = lsp_array_string(params, "rootUri"), *root_path = lsp_array_string(params, "rootPath");
 	zval capabilities, sync, save, completion, triggers, code_lens, signature, signature_triggers, code_action, code_action_kinds, rename, server_info, semantic_tokens, legend;
+	zval workspace, workspace_folders, file_operations, will_rename, filters, filter, pattern;
 
 	if (root_uri) {
 		zend_string_release(server->root);
@@ -27,6 +28,10 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 		zend_string_release(server->root);
 		server->root = zend_string_copy(root_path);
 	}
+
+	/* Multi-root: every workspace folder is indexed; the first folder (or
+	 * rootUri) anchors the index cache location. */
+	lsp_workspace_parse_folders(server, params);
 
 	lsp_resolve_analyzers(server);
 	lsp_build_project_index(server);
@@ -70,6 +75,8 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	add_assoc_bool(&capabilities, "documentHighlightProvider", true);
 	add_assoc_bool(&capabilities, "implementationProvider", true);
 	add_assoc_bool(&capabilities, "foldingRangeProvider", true);
+	add_assoc_bool(&capabilities, "callHierarchyProvider", true);
+	add_assoc_bool(&capabilities, "typeHierarchyProvider", true);
 	array_init(&code_lens);
 	add_assoc_bool(&code_lens, "resolveProvider", false);
 	add_assoc_zval(&capabilities, "codeLensProvider", &code_lens);
@@ -98,6 +105,26 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	add_assoc_zval(&capabilities, "signatureHelpProvider", &signature);
 	add_assoc_bool(&capabilities, "documentSymbolProvider", true);
 	add_assoc_bool(&capabilities, "workspaceSymbolProvider", true);
+
+	array_init(&workspace);
+	array_init(&workspace_folders);
+	add_assoc_bool(&workspace_folders, "supported", true);
+	add_assoc_bool(&workspace_folders, "changeNotifications", true);
+	add_assoc_zval(&workspace, "workspaceFolders", &workspace_folders);
+	array_init(&file_operations);
+	array_init(&will_rename);
+	array_init(&filters);
+	array_init(&filter);
+	array_init(&pattern);
+	add_assoc_string(&pattern, "glob", "**/*.php");
+	add_assoc_string(&pattern, "matches", "file");
+	add_assoc_zval(&filter, "pattern", &pattern);
+	add_next_index_zval(&filters, &filter);
+	add_assoc_zval(&will_rename, "filters", &filters);
+	add_assoc_zval(&file_operations, "willRename", &will_rename);
+	add_assoc_zval(&workspace, "fileOperations", &file_operations);
+	add_assoc_zval(&capabilities, "workspace", &workspace);
+
 	add_assoc_zval(return_value, "capabilities", &capabilities);
 
 	array_init(&server_info);
@@ -935,9 +962,58 @@ static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zv
 		return true;
 	}
 
+	if (zend_string_equals_literal(method, "textDocument/prepareCallHierarchy")) {
+		lsp_document_request(server, params, lsp_lsparrot_prepare_call_hierarchy, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "callHierarchy/incomingCalls")) {
+		lsp_lsparrot_call_hierarchy_incoming(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "callHierarchy/outgoingCalls")) {
+		lsp_lsparrot_call_hierarchy_outgoing(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/prepareTypeHierarchy")) {
+		lsp_document_request(server, params, lsp_lsparrot_prepare_type_hierarchy, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "typeHierarchy/supertypes")) {
+		lsp_lsparrot_type_hierarchy_supertypes(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "typeHierarchy/subtypes")) {
+		lsp_lsparrot_type_hierarchy_subtypes(server, return_value, params);
+
+		return true;
+	}
+
 	if (zend_string_equals_literal(method, "workspace/didChangeConfiguration")) {
 		lsp_options_apply_runtime(&server->options, params);
 		ZVAL_NULL(return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "workspace/didChangeWorkspaceFolders")) {
+		lsp_workspace_did_change_folders(server, params);
+		ZVAL_NULL(return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "workspace/willRenameFiles")) {
+		lsp_lsparrot_will_rename_files(server, return_value, params);
 
 		return true;
 	}

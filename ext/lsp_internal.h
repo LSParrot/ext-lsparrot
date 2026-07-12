@@ -244,11 +244,15 @@ typedef struct _lsp_server {
 	HashTable psalm_ls_projects;
 	HashTable perf_stats;
 	HashTable runner_sessions;
+	HashTable workspace_roots;
 	zend_string *root;
 	lsp_options options;
 	lsp_symbol_index symbol_index;
-	lsp_analyzer_job phpstan_job;
-	lsp_analyzer_job psalm_job;
+	/* Project-wide diagnostics jobs keyed by project root: independent
+	 * Composer projects in a workspace analyze concurrently, bounded by
+	 * lsp_analyzer_parallel_workers. */
+	HashTable phpstan_jobs;
+	HashTable psalm_jobs;
 	lsp_analyzer_job phpstan_completion_job;
 	lsp_analyzer_job psalm_completion_job;
 	lsp_process_id index_worker_pid;
@@ -850,6 +854,25 @@ void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_documen
 void lsp_lsparrot_type_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_folding_range(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_options_apply_runtime(lsp_options *options, zval *params);
+void lsp_lsparrot_prepare_call_hierarchy(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_call_hierarchy_incoming(lsp_server *server, zval *return_value, zval *params);
+void lsp_lsparrot_call_hierarchy_outgoing(lsp_server *server, zval *return_value, zval *params);
+void lsp_lsparrot_prepare_type_hierarchy(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_type_hierarchy_supertypes(lsp_server *server, zval *return_value, zval *params);
+void lsp_lsparrot_type_hierarchy_subtypes(lsp_server *server, zval *return_value, zval *params);
+void lsp_workspace_roots_add(lsp_server *server, zend_string *root);
+void lsp_workspace_roots_remove(lsp_server *server, zend_string *root);
+bool lsp_path_is_under_any_root(lsp_server *server, zend_string *path);
+void lsp_workspace_roots_each(lsp_server *server, void (*callback)(lsp_server *server, zend_string *root, void *context), void *context);
+void lsp_workspace_parse_folders(lsp_server *server, zval *params);
+void lsp_workspace_did_change_folders(lsp_server *server, zval *params);
+void lsp_lsparrot_will_rename_files(lsp_server *server, zval *return_value, zval *params);
+HashTable *lsp_analyzer_job_table(lsp_server *server, const char *analyzer);
+lsp_analyzer_job *lsp_analyzer_job_slot(lsp_server *server, const char *analyzer, zend_string *project_root);
+uint32_t lsp_analyzer_running_project_jobs(lsp_server *server);
+bool lsp_analyzer_job_table_running(HashTable *jobs);
+void lsp_analyzer_job_entry_destroy(zval *value);
+void lsp_reap_analyzer_job_table(lsp_server *server, HashTable *jobs, const char *analyzer);
 void lsp_lsparrot_code_lens(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_lsparrot_signature_help(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_references(lsp_server *server, zval *return_value, lsp_document *document, zval *params);

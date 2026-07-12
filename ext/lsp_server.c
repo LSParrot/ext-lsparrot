@@ -36,6 +36,9 @@ extern void lsp_server_run(zval *options)
 	zend_hash_init(&server.psalm_ls_projects, 8, NULL, lsp_psalm_ls_project_destroy, 0);
 	zend_hash_init(&server.perf_stats, 8, NULL, lsp_perf_counter_dtor, 0);
 	zend_hash_init(&server.runner_sessions, 8, NULL, lsp_runner_session_destroy, 0);
+	zend_hash_init(&server.workspace_roots, 4, NULL, NULL, 0);
+	zend_hash_init(&server.phpstan_jobs, 4, NULL, lsp_analyzer_job_entry_destroy, 0);
+	zend_hash_init(&server.psalm_jobs, 4, NULL, lsp_analyzer_job_entry_destroy, 0);
 	server.root = zend_string_init(".", sizeof(".") - 1, 0);
 	server.phpstan_enabled = false;
 	server.psalm_enabled = false;
@@ -56,8 +59,8 @@ extern void lsp_server_run(zval *options)
 	lsp_runner_shutdown_all(&server);
 	zend_hash_destroy(&server.runner_sessions);
 	lsp_psalm_ls_shutdown_all(&server);
-	lsp_analyzer_job_destroy(&server.phpstan_job);
-	lsp_analyzer_job_destroy(&server.psalm_job);
+	zend_hash_destroy(&server.phpstan_jobs);
+	zend_hash_destroy(&server.psalm_jobs);
 	lsp_analyzer_job_destroy(&server.phpstan_completion_job);
 	lsp_analyzer_job_destroy(&server.psalm_completion_job);
 	zend_hash_destroy(&server.psalm_ls_projects);
@@ -69,6 +72,7 @@ extern void lsp_server_run(zval *options)
 	zend_hash_destroy(&server.member_cache);
 	zend_hash_destroy(&server.documents);
 	zend_hash_destroy(&server.perf_stats);
+	zend_hash_destroy(&server.workspace_roots);
 	zend_string_release(server.root);
 	lsp_symbol_index_destroy(&server.symbol_index);
 	lsp_options_destroy(&server.options);

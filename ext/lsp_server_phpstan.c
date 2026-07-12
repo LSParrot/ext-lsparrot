@@ -88,31 +88,35 @@ static inline bool lsp_start_phpstan_project_analyzer(lsp_server *server, zend_s
 
 extern void lsp_start_pending_phpstan_project_analyzer(lsp_server *server)
 {
-	zend_string *project_root = NULL, *candidate = NULL;
+	zend_string *project_root = NULL, *candidate;
 	zval *state_zv;
-	bool started = false;
+	zend_long capacity;
 
-	if (server->phpstan_job.running) {
-		return;
+	/* Independent projects analyze concurrently up to the worker budget. */
+	capacity = lsp_analyzer_parallel_workers(server);
+	if (capacity < 1) {
+		capacity = 1;
 	}
 
-	ZEND_HASH_FOREACH_STR_KEY_VAL(&server->phpstan_projects, project_root, state_zv) {
-		if (project_root && Z_TYPE_P(state_zv) == IS_LONG && Z_LVAL_P(state_zv) == LSP_ANALYZER_PROJECT_PENDING) {
-			candidate = zend_string_copy(project_root);
-			break;
+	while ((zend_long) lsp_analyzer_running_project_jobs(server) < capacity) {
+		candidate = NULL;
+		ZEND_HASH_FOREACH_STR_KEY_VAL(&server->phpstan_projects, project_root, state_zv) {
+			if (project_root && Z_TYPE_P(state_zv) == IS_LONG && Z_LVAL_P(state_zv) == LSP_ANALYZER_PROJECT_PENDING) {
+				candidate = zend_string_copy(project_root);
+				break;
+			}
+		} ZEND_HASH_FOREACH_END();
+
+		if (!candidate) {
+			return;
 		}
-	} ZEND_HASH_FOREACH_END();
 
-	if (!candidate) {
-		return;
+		if (!lsp_start_phpstan_project_analyzer(server, candidate)) {
+			zend_hash_del(&server->phpstan_projects, candidate);
+		}
+
+		zend_string_release(candidate);
 	}
-
-	started = lsp_start_phpstan_project_analyzer(server, candidate);
-	if (!started) {
-		zend_hash_del(&server->phpstan_projects, candidate);
-	}
-
-	zend_string_release(candidate);
 }
 
 extern void lsp_schedule_phpstan_project_analyzer(lsp_server *server, zend_string *project_root)

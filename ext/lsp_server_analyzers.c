@@ -875,9 +875,72 @@ static inline HashTable *lsp_analyzer_project_table(lsp_server *server, const ch
 	return &server->psalm_projects;
 }
 
-static inline lsp_analyzer_job *lsp_analyzer_project_job(lsp_server *server, const char *analyzer)
+extern HashTable *lsp_analyzer_job_table(lsp_server *server, const char *analyzer)
 {
-	return strcmp(analyzer, "phpstan") == 0 ? &server->phpstan_job : &server->psalm_job;
+	return strcmp(analyzer, "phpstan") == 0 ? &server->phpstan_jobs : &server->psalm_jobs;
+}
+
+extern void lsp_analyzer_job_entry_destroy(zval *value)
+{
+	lsp_analyzer_job *job;
+
+	if (Z_TYPE_P(value) != IS_PTR) {
+		return;
+	}
+
+	job = (lsp_analyzer_job *) Z_PTR_P(value);
+	lsp_analyzer_job_destroy(job);
+	efree(job);
+}
+
+extern lsp_analyzer_job *lsp_analyzer_job_slot(lsp_server *server, const char *analyzer, zend_string *project_root)
+{
+	HashTable *jobs = lsp_analyzer_job_table(server, analyzer);
+	lsp_analyzer_job *job;
+	zval *existing, value;
+
+	existing = zend_hash_find(jobs, project_root);
+	if (existing && Z_TYPE_P(existing) == IS_PTR) {
+		return (lsp_analyzer_job *) Z_PTR_P(existing);
+	}
+
+	job = ecalloc(1, sizeof(*job));
+	ZVAL_PTR(&value, job);
+	zend_hash_update(jobs, project_root, &value);
+
+	return job;
+}
+
+static inline uint32_t lsp_analyzer_job_table_running_count(HashTable *jobs)
+{
+	lsp_analyzer_job *job;
+	zval *value;
+	uint32_t count = 0;
+
+	ZEND_HASH_FOREACH_VAL(jobs, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		job = (lsp_analyzer_job *) Z_PTR_P(value);
+		if (job->running && lsp_process_id_valid(job->pid)) {
+			count++;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return count;
+}
+
+extern bool lsp_analyzer_job_table_running(HashTable *jobs)
+{
+	return lsp_analyzer_job_table_running_count(jobs) > 0;
+}
+
+extern uint32_t lsp_analyzer_running_project_jobs(lsp_server *server)
+{
+	return lsp_analyzer_job_table_running_count(&server->phpstan_jobs) +
+		lsp_analyzer_job_table_running_count(&server->psalm_jobs)
+	;
 }
 
 extern zend_string *lsp_analyzer_project_output_file(zend_string *project_root, const char *analyzer)
@@ -956,7 +1019,7 @@ extern bool lsp_start_analyzer_project_job(lsp_server *server, const char *analy
 	zend_string *temporary_file;
 	lsp_process_id pid;
 
-	job = lsp_analyzer_project_job(server, analyzer);
+	job = lsp_analyzer_job_slot(server, analyzer, project_root);
 	if (job->running) {
 		return false;
 	}
@@ -1110,9 +1173,16 @@ extern void lsp_analyzer_project_finished(lsp_server *server, const char *analyz
 	}
 }
 
+static void lsp_schedule_workspace_analyzers_root(lsp_server *server, zend_string *root, void *context)
+{
+	(void) context;
+
+	lsp_schedule_workspace_analyzer_projects(server, root, 0);
+}
+
 extern void lsp_schedule_workspace_analyzers(lsp_server *server)
 {
-	lsp_schedule_workspace_analyzer_projects(server, server->root, 0);
+	lsp_workspace_roots_each(server, lsp_schedule_workspace_analyzers_root, NULL);
 }
 
 extern void lsp_schedule_project_analyzers(lsp_server *server, lsp_document *document)

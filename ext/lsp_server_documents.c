@@ -254,6 +254,23 @@ static inline const char *lsp_analyzer_finished_message(const char *analyzer)
 	return "Psalm diagnostics finished.";
 }
 
+static inline void lsp_reap_analyzer_job(lsp_server *server, lsp_analyzer_job *job, const char *analyzer);
+
+extern void lsp_reap_analyzer_job_table(lsp_server *server, HashTable *jobs, const char *analyzer)
+{
+	lsp_analyzer_job *job;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(jobs, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		job = (lsp_analyzer_job *) Z_PTR_P(value);
+		lsp_reap_analyzer_job(server, job, analyzer);
+	} ZEND_HASH_FOREACH_END();
+}
+
 static inline void lsp_reap_analyzer_job(lsp_server *server, lsp_analyzer_job *job, const char *analyzer)
 {
 	zend_string *project_root = NULL, *output_file = NULL;
@@ -345,8 +362,8 @@ extern void lsp_analyzer_deferred_type_completed(lsp_server *server, zval *descr
 extern void lsp_reap_analyzer_jobs(lsp_server *server)
 {
 	lsp_index_poll_worker(server);
-	lsp_reap_analyzer_job(server, &server->phpstan_job, "phpstan");
-	lsp_reap_analyzer_job(server, &server->psalm_job, "psalm");
+	lsp_reap_analyzer_job_table(server, &server->phpstan_jobs, "phpstan");
+	lsp_reap_analyzer_job_table(server, &server->psalm_jobs, "psalm");
 	lsp_psalm_ls_pump(server, 0.0);
 	lsp_runner_pump_pending(server);
 	lsp_reap_analyzer_completion_jobs();
@@ -543,13 +560,13 @@ extern void lsp_server_status(lsp_server *server, zval *return_value)
 	array_init(&processes);
 	add_assoc_long(&processes, "active", lsp_active_process_count(server));
 	add_assoc_long(&processes, "configured", server->options.worker_count);
-	add_assoc_bool(&processes, "phpstanRunning", server->phpstan_job.running);
-	add_assoc_bool(&processes, "psalmRunning", server->psalm_job.running);
+	add_assoc_bool(&processes, "phpstanRunning", lsp_analyzer_job_table_running(&server->phpstan_jobs));
+	add_assoc_bool(&processes, "psalmRunning", lsp_analyzer_job_table_running(&server->psalm_jobs));
 	add_assoc_zval(return_value, "processes", &processes);
 
 	array_init(&analyzers);
-	lsp_add_analyzer_status_entry(&analyzers, "phpstan", server->phpstan_enabled, server->phpstan_job.running, &server->phpstan_projects);
-	lsp_add_analyzer_status_entry(&analyzers, "psalm", server->psalm_enabled, server->psalm_job.running, &server->psalm_projects);
+	lsp_add_analyzer_status_entry(&analyzers, "phpstan", server->phpstan_enabled, lsp_analyzer_job_table_running(&server->phpstan_jobs), &server->phpstan_projects);
+	lsp_add_analyzer_status_entry(&analyzers, "psalm", server->psalm_enabled, lsp_analyzer_job_table_running(&server->psalm_jobs), &server->psalm_projects);
 	lsp_add_analyzer_status_entry(&analyzers, "psalm-ls", server->psalm_ls_enabled, false, &server->psalm_ls_project_states);
 	add_assoc_zval(return_value, "analyzers", &analyzers);
 
@@ -860,8 +877,8 @@ static inline int lsp_transport_fill(double timeout_seconds)
 static inline bool lsp_server_has_background_work(lsp_server *server)
 {
 	return server->index_worker_running ||
-		server->phpstan_job.running ||
-		server->psalm_job.running ||
+		lsp_analyzer_job_table_running(&server->phpstan_jobs) ||
+		lsp_analyzer_job_table_running(&server->psalm_jobs) ||
 		server->phpstan_completion_job.running ||
 		server->psalm_completion_job.running ||
 		zend_hash_num_elements(&server->psalm_ls_projects) > 0 ||
