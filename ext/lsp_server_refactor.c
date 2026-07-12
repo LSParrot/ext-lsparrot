@@ -13,6 +13,10 @@
 
 #include "lsp_internal.h"
 
+#include <Zend/zend_language_parser.h>
+
+#define LSP_INLAY_TYPE_HINT_LIMIT 64
+
 static inline bool lsp_refactor_add_scoped_matches(zval *items, zend_string *location_path, lsp_document *document, zend_string *word, size_t offset);
 static inline zval *lsp_refactor_prev_significant_token(HashTable *tokens, uint32_t index);
 static inline bool lsp_refactor_token_is_object_operator(zval *token);
@@ -1796,11 +1800,13 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 			continue;
 		}
 
-		if (value[i] == '\'' || value[i] == '"') {
-			quote = value[i];
-			continue;
-		}
-
+		/* The need_hint check must run before we decide to enter quote
+		 * tracking below: an argument that is itself a string literal
+		 * (e.g. `foo('x')`) has the opening quote as its very first,
+		 * non-whitespace character. Checking need_hint after the quote
+		 * branch would let that branch `continue` past this character
+		 * every time, so the hint for a string-literal argument would
+		 * never fire. */
 		if (need_hint && !isspace((unsigned char) value[i])) {
 			/* PHP 8 named arguments (`name: value`) already show the name;
 			 * a parameter hint would render it twice. */
@@ -1822,6 +1828,11 @@ static inline void lsp_inlay_add_call_hints(zval *items, zend_string *text, size
 				lsp_inlay_add_hint(items, text, i, Z_STR_P(label));
 			}
 			need_hint = false;
+		}
+
+		if (value[i] == '\'' || value[i] == '"') {
+			quote = value[i];
+			continue;
 		}
 
 		if (value[i] == '(' || value[i] == '[' || value[i] == '{') {
@@ -2438,16 +2449,422 @@ extern void lsp_lsparrot_rename(lsp_server *server, zval *return_value, lsp_docu
 	add_assoc_zval(return_value, "changes", &changes);
 }
 
+/* Resolves the class named directly after a `new` keyword token (e.g. the
+ * `Leaf` in `new Leaf(...)`). Only plain/qualified name tokens are handled;
+ * dynamic class expressions (`new $class(...)`, `new static(...)`) yield no
+ * text and therefore no hint, same as any other uninferrable expression. */
+static inline zend_string *lsp_inlay_new_class_text(HashTable *tokens, uint32_t new_index)
+{
+	zval *class_token;
+	zend_string *text;
+	uint32_t class_index;
+
+	class_token = lsp_inlay_next_non_whitespace(tokens, new_index + 1, &class_index);
+	if (!class_token) {
+		return NULL;
+	}
+
+	if (!lsp_token_name_equals(class_token, "T_STRING") &&
+		!lsp_token_name_equals(class_token, "T_NAME_QUALIFIED") &&
+		!lsp_token_name_equals(class_token, "T_NAME_FULLY_QUALIFIED") &&
+		!lsp_token_name_equals(class_token, "T_NAME_RELATIVE")
+	) {
+		return NULL;
+	}
+
+	text = lsp_token_string(class_token, "text");
+	if (!text || ZSTR_LEN(text) == 0) {
+		return NULL;
+	}
+
+	return zend_string_copy(text);
+}
+
+/* Resolves a raw class name token's text (as written in source) to a
+ * (possibly namespaced) FQCN, preferring an already-loaded engine class
+ * before falling back to import/namespace resolution against the document
+ * text — mirroring how the rest of the inference layer treats `new X`. */
+static inline zend_string *lsp_inlay_resolve_class_text(lsp_document *document, zend_string *class_text)
+{
+	if (zend_lookup_class(class_text)) {
+		return zend_string_copy(class_text);
+	}
+
+	return lsp_resolve_class_name(document->text, class_text);
+}
+
+/* True if `offset` (measured from `body_start`) sits inside an unmatched
+ * `(...)` — i.e. a parameter list rather than a class-body statement. Used
+ * to keep the native property scan below from mistaking an ordinary
+ * (non-promoted) constructor parameter such as `__construct(Leaf $leaf)`
+ * for a `Leaf $leaf` property declaration; both have a type token directly
+ * before the `$name` and, since a parameter list precedes the method's own
+ * `{`, both sit at the same brace depth as the class body. */
+static inline bool lsp_inlay_within_parens(zend_string *text, size_t body_start, size_t offset)
+{
+	const char *value = ZSTR_VAL(text);
+	long depth = 0;
+	size_t i;
+
+	for (i = body_start; i < offset && i < ZSTR_LEN(text); i++) {
+		if (value[i] == '(') {
+			depth++;
+		} else if (value[i] == ')' && depth > 0) {
+			depth--;
+		}
+	}
+
+	return depth != 0;
+}
+
+/* Reimplements (locally, since the original is private to lsp_server_phpdoc.c)
+ * the "is there a visibility/var modifier earlier in this same statement"
+ * check used to confirm `$name` is being declared as a property rather than
+ * merely referenced. */
+static inline bool lsp_inlay_property_declaration_before(zend_string *text, size_t variable_offset)
+{
+	static const char *visibility[5] = {"public", "protected", "private", "var", "readonly"};
+	const char *value;
+	size_t declaration_start, scan, token_start, token_end;
+	uint32_t i;
+
+	if (variable_offset > ZSTR_LEN(text)) {
+		return false;
+	}
+
+	value = ZSTR_VAL(text);
+	declaration_start = variable_offset;
+	while (declaration_start > 0 &&
+		value[declaration_start - 1] != ';' &&
+		value[declaration_start - 1] != '{' &&
+		value[declaration_start - 1] != '}'
+	) {
+		declaration_start--;
+	}
+
+	scan = declaration_start;
+	while (scan < variable_offset) {
+		if (!lsp_doc_is_identifier_start(value[scan])) {
+			scan++;
+			continue;
+		}
+
+		token_start = scan;
+		scan++;
+		while (scan < variable_offset && lsp_doc_is_identifier_char(value[scan])) {
+			scan++;
+		}
+		token_end = scan;
+
+		for (i = 0; i < sizeof(visibility) / sizeof(visibility[0]); i++) {
+			if (token_end - token_start == strlen(visibility[i]) &&
+				strncasecmp(value + token_start, visibility[i], token_end - token_start) == 0
+			) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/* Finds the declared type of a plain, native typed property (no phpdoc,
+ * e.g. `private Leaf $leaf;`) by locating the enclosing class body and
+ * scanning it for a `$property` occurrence that reads as a property
+ * declaration: same brace depth as the class body, not inside a parameter
+ * list, with a visibility/var modifier earlier in the statement, and a
+ * bare type-name token directly before the `$`. */
+static inline zend_string *lsp_inlay_native_property_type(lsp_document *document, zend_string *property, size_t offset)
+{
+	const char *value;
+	zend_string *candidate;
+	size_t class_start, body_start, body_end, search, variable_end, type_start, type_end;
+	zend_long body_depth;
+
+	if (!lsp_find_enclosing_class_header(document->text, offset, &class_start, &body_start, &body_end, &body_depth)) {
+		return NULL;
+	}
+
+	value = ZSTR_VAL(document->text);
+	for (search = body_start; search + ZSTR_LEN(property) < body_end; search++) {
+		if (value[search] != '$') {
+			continue;
+		}
+
+		variable_end = search + 1 + ZSTR_LEN(property);
+		if (variable_end > body_end || strncmp(value + search + 1, ZSTR_VAL(property), ZSTR_LEN(property)) != 0) {
+			continue;
+		}
+
+		if (variable_end < ZSTR_LEN(document->text) && lsp_doc_is_identifier_char(value[variable_end])) {
+			continue;
+		}
+
+		if (lsp_brace_depth_at(document->text, search) != body_depth || lsp_inlay_within_parens(document->text, body_start, search)) {
+			continue;
+		}
+
+		if (!lsp_inlay_property_declaration_before(document->text, search)) {
+			continue;
+		}
+
+		type_end = search;
+		while (type_end > body_start && isspace((unsigned char) value[type_end - 1])) {
+			type_end--;
+		}
+
+		type_start = type_end;
+		while (type_start > body_start && (lsp_doc_is_identifier_char(value[type_start - 1]) || value[type_start - 1] == '\\')) {
+			type_start--;
+		}
+
+		if (type_start == type_end) {
+			continue;
+		}
+
+		candidate = zend_string_init(value + type_start, type_end - type_start, 0);
+		if (ZSTR_LEN(candidate) == 0) {
+			zend_string_release(candidate);
+			continue;
+		}
+
+		return candidate;
+	}
+
+	return NULL;
+}
+
+/* Resolves the class of a bare `$this->property` read (no call, no
+ * subscript, no further chaining — the whole right-hand side of the
+ * assignment) via the declared/typed-property lookup used elsewhere for
+ * property inference. */
+static inline zend_string *lsp_inlay_this_property_class(lsp_document *document, HashTable *tokens, uint32_t this_index)
+{
+	zval *arrow_token, *prop_token, *terminator_token;
+	uint32_t arrow_index, prop_index, terminator_index;
+	zend_string *property, *type, *resolved;
+	size_t prop_end;
+
+	arrow_token = lsp_inlay_next_non_whitespace(tokens, this_index + 1, &arrow_index);
+	if (!arrow_token || !lsp_token_name_equals(arrow_token, "T_OBJECT_OPERATOR")) {
+		return NULL;
+	}
+
+	prop_token = lsp_inlay_next_non_whitespace(tokens, arrow_index + 1, &prop_index);
+	if (!prop_token || !lsp_token_name_equals(prop_token, "T_STRING")) {
+		return NULL;
+	}
+
+	terminator_token = lsp_inlay_next_non_whitespace(tokens, prop_index + 1, &terminator_index);
+	if (!terminator_token || !lsp_token_is_char(terminator_token, ';')) {
+		return NULL;
+	}
+
+	property = lsp_token_string(prop_token, "text");
+	if (!property || ZSTR_LEN(property) == 0) {
+		return NULL;
+	}
+
+	prop_end = (size_t) lsp_token_long(prop_token, "offset", 0) + ZSTR_LEN(property);
+
+	/* lsp_phpdoc_property_type_for_word only recognizes `@var`-documented
+	 * properties; it returns NULL for plain native typed declarations
+	 * (`private Leaf $leaf;`), which is the common case. Try it first
+	 * (it also covers phpdoc-only properties this pass otherwise
+	 * couldn't resolve), then fall back to a native-declaration scan. */
+	type = lsp_phpdoc_property_type_for_word(document->text, property, prop_end);
+	if (!type) {
+		type = lsp_inlay_native_property_type(document, property, prop_end);
+	}
+
+	if (!type) {
+		return NULL;
+	}
+
+	resolved = lsp_inlay_resolve_class_text(document, type);
+	zend_string_release(type);
+
+	return resolved;
+}
+
+/* Infers the class held by `$var` right after `$var = <rhs>;`. Only the two
+ * shapes PhpStorm-style hints care most about are handled: a fresh `new`
+ * instantiation and a bare `$this->property` read. Anything else (method
+ * call results, array access, literals, ...) intentionally yields NULL so no
+ * hint is produced — better no hint than a wrong one. */
+static inline zend_string *lsp_inlay_infer_assignment_class(lsp_document *document, HashTable *tokens, uint32_t equals_index)
+{
+	zval *rhs_token;
+	zend_string *variable_text;
+	uint32_t rhs_index;
+
+	rhs_token = lsp_inlay_next_non_whitespace(tokens, equals_index + 1, &rhs_index);
+	if (!rhs_token) {
+		return NULL;
+	}
+
+	if (lsp_token_long(rhs_token, "id", -1) == T_NEW) {
+		zend_string *class_text, *resolved;
+
+		class_text = lsp_inlay_new_class_text(tokens, rhs_index);
+		if (!class_text) {
+			return NULL;
+		}
+
+		resolved = lsp_inlay_resolve_class_text(document, class_text);
+		zend_string_release(class_text);
+
+		return resolved;
+	}
+
+	if (lsp_token_name_equals(rhs_token, "T_VARIABLE")) {
+		variable_text = lsp_token_string(rhs_token, "text");
+		if (variable_text && zend_string_equals_literal(variable_text, "$this")) {
+			return lsp_inlay_this_property_class(document, tokens, rhs_index);
+		}
+	}
+
+	return NULL;
+}
+
+static inline void lsp_inlay_add_type_hint(zval *items, zend_string *text, size_t offset, zend_string *class_name)
+{
+	const char *short_name;
+	size_t short_length;
+	zend_string *label;
+	zval hint, range, position, *start;
+
+	short_name = lsp_basename_from_fqcn(ZSTR_VAL(class_name), ZSTR_LEN(class_name), &short_length);
+	label = strpprintf(0, ": %.*s", (int) short_length, short_name);
+
+	array_init(&hint);
+	lsp_range_from_offsets(text, offset, offset, &range);
+	start = zend_hash_str_find(Z_ARRVAL(range), "start", sizeof("start") - 1);
+	if (start) {
+		ZVAL_COPY(&position, start);
+		add_assoc_zval(&hint, "position", &position);
+	}
+
+	add_assoc_str(&hint, "label", label);
+	add_assoc_long(&hint, "kind", 1);
+	add_assoc_bool(&hint, "paddingLeft", true);
+	add_next_index_zval(items, &hint);
+
+	zval_ptr_dtor(&range);
+}
+
+static inline bool lsp_inlay_range_lines(zval *params, zend_long *start_line, zend_long *end_line)
+{
+	zval *range, *start, *end;
+
+	range = lsp_array_find(params, "range");
+	if (!range || Z_TYPE_P(range) != IS_ARRAY) {
+		return false;
+	}
+
+	start = lsp_array_find(range, "start");
+	end = lsp_array_find(range, "end");
+	if (!start || Z_TYPE_P(start) != IS_ARRAY || !end || Z_TYPE_P(end) != IS_ARRAY) {
+		return false;
+	}
+
+	*start_line = lsp_array_long(start, "line", 0);
+	*end_line = lsp_array_long(end, "line", 0);
+
+	return true;
+}
+
+/* Marks (line, variable) as seen, returning false if it was already present
+ * so callers can skip emitting a duplicate hint for the same variable on the
+ * same line (e.g. `$a = $b = new Leaf();`). */
+static inline bool lsp_inlay_mark_seen(HashTable *seen, zend_long line, zend_string *variable)
+{
+	zend_string *key;
+	zval marker;
+	bool inserted;
+
+	key = strpprintf(0, "%ld:%s", (long) line, ZSTR_VAL(variable));
+	ZVAL_TRUE(&marker);
+	inserted = zend_hash_add(seen, key, &marker) != NULL;
+	zend_string_release(key);
+
+	return inserted;
+}
+
+static inline void lsp_inlay_add_variable_type_hints(lsp_document *document, zval *params, zval *items)
+{
+	zval *tokens_zv, *token, *equals_token;
+	HashTable *tokens, seen;
+	zend_string *variable, *class_name;
+	uint32_t i, count, equals_index;
+	zend_long start_line, end_line, token_line;
+	size_t hint_offset;
+	bool have_range;
+	uint32_t emitted;
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY) {
+		return;
+	}
+
+	have_range = lsp_inlay_range_lines(params, &start_line, &end_line);
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	emitted = 0;
+	zend_hash_init(&seen, 16, NULL, ZVAL_PTR_DTOR, 0);
+
+	for (i = 0; i < count && emitted < LSP_INLAY_TYPE_HINT_LIMIT; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_name_equals(token, "T_VARIABLE")) {
+			continue;
+		}
+
+		variable = lsp_token_string(token, "text");
+		if (!variable || ZSTR_LEN(variable) <= 1 || zend_string_equals_literal(variable, "$this")) {
+			continue;
+		}
+
+		token_line = lsp_token_long(token, "line", 1) - 1;
+		if (have_range && (token_line < start_line || token_line > end_line)) {
+			continue;
+		}
+
+		equals_token = lsp_inlay_next_non_whitespace(tokens, i + 1, &equals_index);
+		if (!equals_token || !lsp_token_is_char(equals_token, '=')) {
+			continue;
+		}
+
+		class_name = lsp_inlay_infer_assignment_class(document, tokens, equals_index);
+		if (!class_name) {
+			continue;
+		}
+
+		if (!lsp_inlay_mark_seen(&seen, token_line, variable)) {
+			zend_string_release(class_name);
+
+			continue;
+		}
+
+		hint_offset = (size_t) lsp_token_long(token, "offset", 0) + ZSTR_LEN(variable);
+		lsp_inlay_add_type_hint(items, document->text, hint_offset, class_name);
+		zend_string_release(class_name);
+		emitted++;
+	}
+
+	zend_hash_destroy(&seen);
+}
+
 extern void lsp_lsparrot_inlay_hint(lsp_server *server, zval *return_value, lsp_document *document, zval *params)
 {
 	HashTable param_map;
 
 	(void) server;
-	(void) params;
 
 	array_init(return_value);
 	zend_hash_init(&param_map, 32, NULL, ZVAL_PTR_DTOR, 0);
 	lsp_inlay_collect_param_map(document, &param_map);
 	lsp_inlay_add_document_hints(document, &param_map, return_value);
 	zend_hash_destroy(&param_map);
+
+	lsp_inlay_add_variable_type_hints(document, params, return_value);
 }
