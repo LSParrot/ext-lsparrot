@@ -95,7 +95,8 @@ extern bool lsp_analyzer_jobs_running_for_document(lsp_server *server, lsp_docum
 	return lsp_analyzer_job_matches_document(&server->phpstan_job, document) ||
 		lsp_analyzer_job_matches_document(&server->psalm_job, document) ||
 		lsp_analyzer_job_matches_document(&server->phpstan_completion_job, document) ||
-		lsp_analyzer_job_matches_document(&server->psalm_completion_job, document)
+		lsp_analyzer_job_matches_document(&server->psalm_completion_job, document) ||
+		lsp_runner_has_pending_for_uri(server, document->uri)
 	;
 }
 
@@ -537,6 +538,7 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 	options->psalm_level = 6;
 	options->memory_limit = zend_string_init("-1", sizeof("-1") - 1, 0);
 	options->analyzer_diagnostics_timeout = 60.0;
+	options->analyzer_type_query_timeout = 5.0;
 	options->analyzer_auto = true;
 	options->psalm_transport = LSP_PSALM_TRANSPORT_AUTO;
 	options->psalm_on_change = true;
@@ -584,6 +586,15 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 		options->analyzer_diagnostics_timeout = lsp_array_double(workers, "analyzerDiagnosticsTimeout", 60.0);
 		if (options->analyzer_diagnostics_timeout < 0.0) {
 			options->analyzer_diagnostics_timeout = 60.0;
+		}
+
+		/* Interactive (completion/hover) type queries block the request
+		 * loop, so they get a much shorter budget than diagnostics; when
+		 * the resident runner is in use, a timed-out query keeps running
+		 * asynchronously and lands in the type cache. */
+		options->analyzer_type_query_timeout = lsp_array_double(workers, "analyzerTypeQueryTimeout", 5.0);
+		if (options->analyzer_type_query_timeout < 0.0) {
+			options->analyzer_type_query_timeout = 5.0;
 		}
 	}
 

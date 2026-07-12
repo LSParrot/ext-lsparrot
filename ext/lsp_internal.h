@@ -136,6 +136,7 @@ typedef struct _lsp_options {
 	zend_long phpstan_level;
 	zend_long psalm_level;
 	double analyzer_diagnostics_timeout;
+	double analyzer_type_query_timeout;
 	bool analyzer_auto;
 	bool analyzer_phpstan;
 	bool analyzer_psalm;
@@ -300,7 +301,13 @@ static inline void lsp_command_destroy(lsp_command *command)
 
 static inline zend_string *lsp_type_cache_key(const char *analyzer, lsp_document *document, zend_string *expression, size_t offset)
 {
-	return strpprintf(0, "%s:type:%s:" ZEND_LONG_FMT ":%zu:%s", analyzer, ZSTR_VAL(document->uri), document->version, offset, ZSTR_VAL(expression));
+	/* Deliberately no version/offset: an expression's analyzer type rarely
+	 * changes while typing on the same document, and version-scoped keys
+	 * meant a fresh analyzer run per keystroke. Entries are evicted on
+	 * didSave/didClose instead. */
+	(void) offset;
+
+	return strpprintf(0, "%s:type:%s:%s", analyzer, ZSTR_VAL(document->uri), ZSTR_VAL(expression));
 }
 
 static inline bool lsp_type_is_unhelpful(zend_string *type)
@@ -812,7 +819,14 @@ lsp_document *lsp_document_from_uri(lsp_server *server, zend_string *uri);
 void lsp_document_analyze(lsp_document *document);
 void lsp_document_derived_invalidate(lsp_document *document);
 void lsp_document_derived_ensure(lsp_document *document);
-void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri);
+void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri, bool include_type_cache);
+void lsp_analyzer_deferred_type_completed(lsp_server *server, zval *descriptor, zend_string *output);
+zend_string *lsp_runner_run_capture_deferred(lsp_server *server, const char *analyzer, zend_string *project_root, lsp_command *command, zend_string *cwd, double wait_timeout, double job_timeout, zval *descriptor, bool *deferred);
+void lsp_runner_pump_pending(lsp_server *server);
+bool lsp_runner_has_pending_for_uri(lsp_server *server, zend_string *uri);
+uint32_t lsp_runner_pending_count(lsp_server *server);
+zend_string *lsp_phpstan_parse_type_output(zend_string *output, zend_string *analysis_file, zend_long dump_line);
+zend_string *lsp_psalm_parse_type_output(zend_string *output, zend_string *expression, zend_long trace_line);
 zend_string *lsp_document_namespace_cached(lsp_document *document);
 bool lsp_document_has_import_cached(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
 bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);

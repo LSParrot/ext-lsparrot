@@ -186,6 +186,9 @@ static inline void lsp_did_save(lsp_server *server, zval *params)
 	}
 
 	lsp_document_analyze(document);
+	/* Saving is the natural refresh point for the version-less analyzer type
+	 * cache entries of this document. */
+	lsp_server_evict_document_caches(server, uri, true);
 	/* Drop only the member-cache entries built from the saved file; ancestor
 	 * entries re-validate themselves through version/mtime freshness checks. */
 	lsp_member_cache_invalidate_path(server, document->path);
@@ -232,7 +235,7 @@ static inline void lsp_did_close(lsp_server *server, zval *params)
 	}
 
 	lsp_psalm_ls_document_close(server, uri);
-	lsp_server_evict_document_caches(server, uri);
+	lsp_server_evict_document_caches(server, uri, true);
 	zend_hash_del(&server->documents, uri);
 	lsp_publish_empty_diagnostics(uri);
 }

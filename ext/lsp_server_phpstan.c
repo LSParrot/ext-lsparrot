@@ -323,12 +323,39 @@ static inline zend_string *lsp_phpstan_dump_type_from_decoded(zval *decoded, zen
 	return NULL;
 }
 
+extern zend_string *lsp_phpstan_parse_type_output(zend_string *output, zend_string *analysis_file, zend_long dump_line)
+{
+	zend_string *json, *type;
+	zval decoded;
+
+	if (!output || !analysis_file) {
+		return NULL;
+	}
+
+	json = lsp_json_slice_from(output, '{');
+	ZVAL_UNDEF(&decoded);
+	php_json_decode_ex(&decoded, ZSTR_VAL(json), ZSTR_LEN(json), PHP_JSON_OBJECT_AS_ARRAY, 512);
+	zend_string_release(json);
+
+	type = NULL;
+	if (Z_TYPE(decoded) == IS_ARRAY) {
+		type = lsp_phpstan_dump_type_from_decoded(&decoded, analysis_file, dump_line);
+	}
+
+	if (!Z_ISUNDEF(decoded)) {
+		zval_ptr_dtor(&decoded);
+	}
+
+	return type;
+}
+
 extern zend_string *lsp_phpstan_type_for_expression(lsp_server *server, lsp_document *document, zend_string *expression, size_t offset)
 {
 	lsp_command command;
 	zend_long dump_line;
-	zend_string *project_root, *analysis_file, *config, *generated_config, *output, *json, *type, *cache_key;
-	zval decoded, *cached, cache_value;
+	zend_string *project_root, *analysis_file, *config, *generated_config, *output, *type, *cache_key;
+	zval *cached, cache_value, descriptor;
+	bool deferred = false;
 
 	if (!server->phpstan_enabled || !lsp_phpstan_type_expression_safe(expression)) {
 		return NULL;
@@ -344,9 +371,15 @@ extern zend_string *lsp_phpstan_type_for_expression(lsp_server *server, lsp_docu
 			return type;
 		}
 
-		zend_string_release(cache_key);
+		/* IS_DOUBLE marks a query still running in the background; retry
+		 * only once its deadline has passed. */
+		if (Z_TYPE_P(cached) != IS_DOUBLE || lsp_now_seconds() < Z_DVAL_P(cached)) {
+			zend_string_release(cache_key);
 
-		return NULL;
+			return NULL;
+		}
+
+		zend_hash_del(&server->type_cache, cache_key);
 	}
 
 	project_root = lsp_document_project_root(server, document);
@@ -393,31 +426,41 @@ extern zend_string *lsp_phpstan_type_for_expression(lsp_server *server, lsp_docu
 		zend_string_release(config);
 	}
 
-	output = lsp_runner_run_capture(server, "phpstan", project_root, &command, project_root, server->options.analyzer_diagnostics_timeout);
+	array_init(&descriptor);
+	add_assoc_string(&descriptor, "analyzer", "phpstan");
+	add_assoc_str(&descriptor, "cacheKey", zend_string_copy(cache_key));
+	add_assoc_str(&descriptor, "analysisFile", zend_string_copy(analysis_file));
+	add_assoc_long(&descriptor, "markerLine", dump_line);
+	add_assoc_str(&descriptor, "uri", zend_string_copy(document->uri));
+
+	output = lsp_runner_run_capture_deferred(server, "phpstan", project_root, &command, project_root,
+		server->options.analyzer_type_query_timeout, server->options.analyzer_diagnostics_timeout, &descriptor, &deferred);
 	lsp_command_destroy(&command);
-	json = lsp_json_slice_from(output, '{');
-	ZVAL_UNDEF(&decoded);
-	php_json_decode_ex(&decoded, ZSTR_VAL(json), ZSTR_LEN(json), PHP_JSON_OBJECT_AS_ARRAY, 512);
-	zend_string_release(json);
+	zend_string_release(project_root);
 
-	type = NULL;
-	if (Z_TYPE(decoded) == IS_ARRAY) {
-		type = lsp_phpstan_dump_type_from_decoded(&decoded, analysis_file, dump_line);
+	if (deferred) {
+		/* The runner keeps working; mark the key as in flight (retry after
+		 * the deadline) and let the pump fill the real value in. The shadow
+		 * file must survive until the background analysis finishes. */
+		ZVAL_DOUBLE(&cache_value, lsp_now_seconds() + server->options.analyzer_diagnostics_timeout + 10.0);
+		zend_hash_update(&server->type_cache, cache_key, &cache_value);
+		zend_string_release(cache_key);
+		zend_string_release(analysis_file);
+
+		return NULL;
 	}
 
-	if (!Z_ISUNDEF(decoded)) {
-		zval_ptr_dtor(&decoded);
-	}
+	zval_ptr_dtor(&descriptor);
 
-	if (output != zend_empty_string) {
+	type = lsp_phpstan_parse_type_output(output, analysis_file, dump_line);
+	if (output && output != zend_empty_string) {
 		zend_string_release(output);
 	}
 
-	/* One shadow copy is written per (version, offset) probe; without the
-	 * unlink they accumulate in the project for the whole session. */
+	/* One shadow copy is written per probe; without the unlink they
+	 * accumulate in the project for the whole session. */
 	VCWD_UNLINK(ZSTR_VAL(analysis_file));
 	zend_string_release(analysis_file);
-	zend_string_release(project_root);
 
 	if (lsp_type_is_unhelpful(type)) {
 		if (type) {

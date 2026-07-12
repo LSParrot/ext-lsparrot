@@ -15,10 +15,11 @@
 
 extern void lsp_document_analyze(lsp_document *document);
 
-/* Completion/type cache keys embed ":uri:version:"; entries for older
- * versions can never hit again, so drop them when the document changes or
- * closes instead of accumulating one stale entry per keystroke. */
-extern void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri)
+/* Completion cache keys embed ":uri:version:", so entries for older versions
+ * can never hit again and are dropped on every change. Type cache keys are
+ * deliberately version-less (an expression's analyzer type survives typing),
+ * so they are only evicted on save/close. */
+extern void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri, bool include_type_cache)
 {
 	zend_string *key, *needle;
 
@@ -30,11 +31,13 @@ extern void lsp_server_evict_document_caches(lsp_server *server, zend_string *ur
 		}
 	} ZEND_HASH_FOREACH_END();
 
-	ZEND_HASH_FOREACH_STR_KEY(&server->type_cache, key) {
-		if (key && strstr(ZSTR_VAL(key), ZSTR_VAL(needle))) {
-			zend_hash_del(&server->type_cache, key);
-		}
-	} ZEND_HASH_FOREACH_END();
+	if (include_type_cache) {
+		ZEND_HASH_FOREACH_STR_KEY(&server->type_cache, key) {
+			if (key && strstr(ZSTR_VAL(key), ZSTR_VAL(needle))) {
+				zend_hash_del(&server->type_cache, key);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
 
 	zend_string_release(needle);
 }
@@ -50,7 +53,7 @@ extern lsp_document *lsp_document_open_or_change(lsp_server *server, zend_string
 		document->text = zend_string_copy(text);
 		document->version = version;
 		lsp_document_analyze(document);
-		lsp_server_evict_document_caches(server, uri);
+		lsp_server_evict_document_caches(server, uri, false);
 
 		return document;
 	}
@@ -290,12 +293,62 @@ static inline void lsp_reap_analyzer_job(lsp_server *server, lsp_analyzer_job *j
 	}
 }
 
+/* A deferred type query finished in the resident runner: parse the output
+ * with the analyzer that started it and publish the result into the type
+ * cache so the next completion/hover request picks it up. */
+extern void lsp_analyzer_deferred_type_completed(lsp_server *server, zval *descriptor, zend_string *output)
+{
+	zend_string *analyzer, *cache_key, *analysis_file, *expression, *type;
+	zend_long marker_line;
+	zval cache_value;
+
+	analyzer = lsp_array_string(descriptor, "analyzer");
+	cache_key = lsp_array_string(descriptor, "cacheKey");
+	analysis_file = lsp_array_string(descriptor, "analysisFile");
+	expression = lsp_array_string(descriptor, "expression");
+	marker_line = lsp_array_long(descriptor, "markerLine", 0);
+
+	type = NULL;
+	if (output && analyzer) {
+		if (zend_string_equals_literal(analyzer, "phpstan")) {
+			type = lsp_phpstan_parse_type_output(output, analysis_file, marker_line);
+		} else if (zend_string_equals_literal(analyzer, "psalm")) {
+			type = lsp_psalm_parse_type_output(output, expression, marker_line);
+		}
+	}
+
+	if (lsp_type_is_unhelpful(type)) {
+		if (type) {
+			zend_string_release(type);
+		}
+		type = NULL;
+	}
+
+	if (cache_key) {
+		if (type) {
+			ZVAL_STR_COPY(&cache_value, type);
+		} else {
+			ZVAL_FALSE(&cache_value);
+		}
+		zend_hash_update(&server->type_cache, cache_key, &cache_value);
+	}
+
+	if (type) {
+		zend_string_release(type);
+	}
+
+	if (analysis_file) {
+		VCWD_UNLINK(ZSTR_VAL(analysis_file));
+	}
+}
+
 extern void lsp_reap_analyzer_jobs(lsp_server *server)
 {
 	lsp_index_poll_worker(server);
 	lsp_reap_analyzer_job(server, &server->phpstan_job, "phpstan");
 	lsp_reap_analyzer_job(server, &server->psalm_job, "psalm");
 	lsp_psalm_ls_pump(server, 0.0);
+	lsp_runner_pump_pending(server);
 	lsp_reap_analyzer_completion_jobs();
 }
 
@@ -811,7 +864,8 @@ static inline bool lsp_server_has_background_work(lsp_server *server)
 		server->psalm_job.running ||
 		server->phpstan_completion_job.running ||
 		server->psalm_completion_job.running ||
-		zend_hash_num_elements(&server->psalm_ls_projects) > 0
+		zend_hash_num_elements(&server->psalm_ls_projects) > 0 ||
+		lsp_runner_pending_count(server) > 0
 	;
 }
 
