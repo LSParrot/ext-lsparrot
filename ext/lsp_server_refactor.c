@@ -638,7 +638,7 @@ static inline void lsp_refactor_add_import_action(zval *actions, lsp_document *d
 	bool after_existing_use;
 
 	current_namespace = lsp_document_namespace(document->text);
-	if (lsp_symbol_in_current_namespace(current_namespace, fqcn, fqcn_length) || lsp_document_has_import(document->text, kind, fqcn)) {
+	if (lsp_symbol_in_current_namespace(current_namespace, kind, fqcn, fqcn_length) || lsp_document_has_import(document->text, kind, fqcn)) {
 		if (current_namespace != zend_empty_string) {
 			zend_string_release(current_namespace);
 		}

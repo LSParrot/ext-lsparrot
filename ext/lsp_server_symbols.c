@@ -34,14 +34,23 @@ static inline void lsp_symbol_index_header_init(lsp_symbol_index *region)
 static inline zend_string *lsp_symbol_index_key(char kind, zend_string *fqcn)
 {
 	zend_string *key;
-	size_t i;
+	const char *value = ZSTR_VAL(fqcn);
+	size_t i, length = ZSTR_LEN(fqcn);
 
-	key = zend_string_alloc(ZSTR_LEN(fqcn) + 1, 0);
-	ZSTR_VAL(key)[0] = kind;
-	for (i = 0; i < ZSTR_LEN(fqcn); i++) {
-		ZSTR_VAL(key)[i + 1] = (char) tolower((unsigned char) ZSTR_VAL(fqcn)[i]);
+	/* Index records are stored without a leading namespace separator, so a
+	 * fully-qualified probe such as "\App\Widget" must normalize to the same
+	 * key as "App\Widget". */
+	if (length > 0 && value[0] == '\\') {
+		value++;
+		length--;
 	}
-	ZSTR_VAL(key)[ZSTR_LEN(fqcn) + 1] = '\0';
+
+	key = zend_string_alloc(length + 1, 0);
+	ZSTR_VAL(key)[0] = kind;
+	for (i = 0; i < length; i++) {
+		ZSTR_VAL(key)[i + 1] = (char) tolower((unsigned char) value[i]);
+	}
+	ZSTR_VAL(key)[length + 1] = '\0';
 
 	return key;
 }
@@ -676,6 +685,29 @@ extern void lsp_add_completion_item(zval *items, zend_string *label, zend_long k
 	lsp_add_completion_item_ex(items, label, kind, detail, "lsparrot");
 }
 
+/* Same as lsp_add_completion_item, but records the item's FQCN so dedup can
+ * tell same-short-name classes from different namespaces apart. */
+extern void lsp_add_completion_item_qualified(zval *items, zend_string *label, zend_long kind, zend_string *detail, zend_string *namespace_name)
+{
+	zval item, data;
+
+	array_init(&item);
+	add_assoc_str(&item, "label", zend_string_copy(label));
+	add_assoc_long(&item, "kind", kind);
+	add_assoc_str(&item, "detail", zend_string_copy(detail));
+	add_assoc_str(&item, "filterText", zend_string_copy(label));
+
+	array_init(&data);
+	add_assoc_string(&data, "source", "lsparrot");
+	if (namespace_name && ZSTR_LEN(namespace_name) > 0) {
+		add_assoc_str(&data, "qualifiedName", strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(label)));
+	} else {
+		add_assoc_str(&data, "qualifiedName", zend_string_copy(label));
+	}
+	add_assoc_zval(&item, "data", &data);
+	add_next_index_zval(items, &item);
+}
+
 extern void lsp_add_keyword_completion(zval *items, const char *keyword, zend_string *prefix)
 {
 	zval item;
@@ -742,6 +774,19 @@ static inline bool lsp_completion_same_label(zval *left, zval *right)
 
 	if (left_qualified_name && right_qualified_name) {
 		return zend_string_equals(left_qualified_name, right_qualified_name);
+	}
+
+	/* Class-like items where only one side carries an FQCN may name
+	 * different classes that merely share a short name; merging would
+	 * collapse them onto an arbitrary namespace. */
+	if (left_qualified_name || right_qualified_name) {
+		switch (left_kind != 0 ? left_kind : right_kind) {
+			case 7:  /* Class */
+			case 8:  /* Interface */
+			case 9:  /* Module (trait) */
+			case 13: /* Enum */
+				return false;
+		}
 	}
 
 	return true;
@@ -1263,13 +1308,21 @@ static inline bool lsp_symbol_has_namespace(const char *fqcn, size_t fqcn_length
 	return false;
 }
 
-extern bool lsp_symbol_in_current_namespace(zend_string *current_namespace, const char *fqcn, size_t fqcn_length)
+extern bool lsp_symbol_in_current_namespace(zend_string *current_namespace, char kind, const char *fqcn, size_t fqcn_length)
 {
 	const char *namespace_end;
 	size_t namespace_length;
 
 	if (!lsp_symbol_has_namespace(fqcn, fqcn_length, &namespace_end)) {
-		return true;
+		/* Unqualified functions and constants fall back to the global
+		 * namespace at runtime, so a global symbol is always reachable.
+		 * Class names never fall back: inside a namespace a global class
+		 * needs an import (or a leading backslash) to be reachable. */
+		if (kind == LSP_SYMBOL_FUNCTION || kind == LSP_SYMBOL_CONSTANT) {
+			return true;
+		}
+
+		return ZSTR_LEN(current_namespace) == 0;
 	}
 
 	namespace_length = namespace_end - fqcn;
@@ -1446,11 +1499,56 @@ static inline zend_string *lsp_import_set_key(uint32_t target_kind, const char *
 	return key;
 }
 
+/* Key recording which short name (explicit alias or terminal segment) an
+ * import binds in the document, so completion can detect that adding a `use`
+ * for a same-named symbol from another namespace would conflict. */
+static inline zend_string *lsp_import_alias_set_key(uint32_t target_kind, const char *name, size_t length)
+{
+	zend_string *key;
+	size_t i;
+
+	key = zend_string_alloc(length + 3, 0);
+	ZSTR_VAL(key)[0] = 'A';
+	ZSTR_VAL(key)[1] = (char) ('0' + (target_kind % 10));
+	ZSTR_VAL(key)[2] = ':';
+
+	if (target_kind == ZEND_SYMBOL_CONST) {
+		memcpy(ZSTR_VAL(key) + 3, name, length);
+	} else {
+		for (i = 0; i < length; i++) {
+			ZSTR_VAL(key)[i + 3] = (char) tolower((unsigned char) name[i]);
+		}
+	}
+
+	ZSTR_VAL(key)[length + 3] = '\0';
+
+	return key;
+}
+
+static inline void lsp_import_terminal_segment(const char *name, size_t length, const char **segment, size_t *segment_length)
+{
+	size_t i;
+
+	for (i = length; i > 0; i--) {
+		if (name[i - 1] == '\\') {
+			*segment = name + i;
+			*segment_length = length - i;
+
+			return;
+		}
+	}
+
+	*segment = name;
+	*segment_length = length;
+}
+
 static inline void lsp_collect_use_statement_imports(zend_ast *use_ast, zend_string *prefix, HashTable *imports)
 {
 	zend_ast_list *list;
 	zend_ast *elem;
-	zend_string *name, *full_name, *key;
+	zend_string *name, *full_name, *key, *alias;
+	const char *alias_value;
+	size_t alias_length;
 	uint32_t i, elem_kind;
 
 	if (!use_ast || use_ast->kind != ZEND_AST_USE || !zend_ast_is_list(use_ast)) {
@@ -1476,6 +1574,18 @@ static inline void lsp_collect_use_statement_imports(zend_ast *use_ast, zend_str
 
 		full_name = lsp_import_full_name(prefix, name);
 		key = lsp_import_set_key(elem_kind, ZSTR_VAL(full_name), ZSTR_LEN(full_name));
+		zend_hash_add_empty_element(imports, key);
+		zend_string_release(key);
+
+		alias = elem->child[1] ? lsp_ast_string_value(elem->child[1]) : NULL;
+		if (alias) {
+			alias_value = ZSTR_VAL(alias);
+			alias_length = ZSTR_LEN(alias);
+		} else {
+			lsp_import_terminal_segment(ZSTR_VAL(full_name), ZSTR_LEN(full_name), &alias_value, &alias_length);
+		}
+
+		key = lsp_import_alias_set_key(elem_kind, alias_value, alias_length);
 		zend_hash_add_empty_element(imports, key);
 		zend_string_release(key);
 		zend_string_release(full_name);
@@ -1524,6 +1634,192 @@ static inline void lsp_collect_imports_in_ast(zend_ast *ast, HashTable *imports)
 	}
 }
 
+static inline bool lsp_collect_import_token_is_ignored(zval *token)
+{
+	return lsp_token_name_equals(token, "T_WHITESPACE") ||
+		lsp_token_name_equals(token, "T_COMMENT") ||
+		lsp_token_name_equals(token, "T_DOC_COMMENT")
+	;
+}
+
+static inline bool lsp_collect_import_token_is_name_part(zval *token)
+{
+	return lsp_token_name_equals(token, "T_STRING") ||
+		lsp_token_name_equals(token, "T_NAME_QUALIFIED") ||
+		lsp_token_name_equals(token, "T_NAME_FULLY_QUALIFIED") ||
+		lsp_token_name_equals(token, "T_NAME_RELATIVE") ||
+		lsp_token_name_equals(token, "T_NS_SEPARATOR")
+	;
+}
+
+static inline void lsp_collect_import_candidate(HashTable *imports, uint32_t target_kind, smart_str *prefix, smart_str *name, zend_string *alias)
+{
+	zend_string *key, *full_name;
+	const char *alias_value;
+	size_t alias_length;
+
+	if (!name->s || ZSTR_LEN(name->s) == 0) {
+		return;
+	}
+
+	smart_str_0(name);
+	if (prefix->s && ZSTR_LEN(prefix->s) > 0) {
+		smart_str_0(prefix);
+		full_name = strpprintf(0, "%s\\%s", ZSTR_VAL(prefix->s), ZSTR_VAL(name->s));
+	} else {
+		full_name = zend_string_copy(name->s);
+	}
+
+	if (ZSTR_LEN(full_name) > 0 && ZSTR_VAL(full_name)[0] == '\\') {
+		zend_string *trimmed = zend_string_init(ZSTR_VAL(full_name) + 1, ZSTR_LEN(full_name) - 1, 0);
+		zend_string_release(full_name);
+		full_name = trimmed;
+	}
+
+	key = lsp_import_set_key(target_kind, ZSTR_VAL(full_name), ZSTR_LEN(full_name));
+	zend_hash_add_empty_element(imports, key);
+	zend_string_release(key);
+
+	if (alias) {
+		alias_value = ZSTR_VAL(alias);
+		alias_length = ZSTR_LEN(alias);
+	} else {
+		lsp_import_terminal_segment(ZSTR_VAL(full_name), ZSTR_LEN(full_name), &alias_value, &alias_length);
+	}
+
+	key = lsp_import_alias_set_key(target_kind, alias_value, alias_length);
+	zend_hash_add_empty_element(imports, key);
+	zend_string_release(key);
+	zend_string_release(full_name);
+}
+
+/* Token-level fallback used while the document does not parse (mid-edit
+ * documents are routinely syntactically invalid). Mirrors the use-statement
+ * shapes handled by the AST collector: plain, aliased, grouped, and
+ * function/const imports. */
+static inline void lsp_document_collect_imports_from_tokens(zend_string *text, HashTable *imports)
+{
+	zval tokens_zv, *token;
+	HashTable *tokens;
+	smart_str prefix = {0}, name = {0}, no_prefix = {0};
+	zend_string *alias, *token_text;
+	uint32_t i, count, target_kind;
+	bool in_use = false, in_group = false, reading_alias = false;
+
+	ZVAL_UNDEF(&tokens_zv);
+	lsp_lsparrot_tokens_to_zval(&tokens_zv, text);
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
+		if (!Z_ISUNDEF(tokens_zv)) {
+			zval_ptr_dtor(&tokens_zv);
+		}
+
+		return;
+	}
+
+	tokens = Z_ARRVAL(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	alias = NULL;
+	target_kind = ZEND_SYMBOL_CLASS;
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || lsp_collect_import_token_is_ignored(token)) {
+			continue;
+		}
+
+		if (!in_use) {
+			if (lsp_token_is_class_like(token)) {
+				break;
+			}
+
+			if (lsp_token_name_equals(token, "T_USE")) {
+				in_use = true;
+				in_group = false;
+				reading_alias = false;
+				alias = NULL;
+				target_kind = ZEND_SYMBOL_CLASS;
+				smart_str_free(&prefix);
+				memset(&prefix, 0, sizeof(prefix));
+				smart_str_free(&name);
+				memset(&name, 0, sizeof(name));
+			}
+
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_FUNCTION")) {
+			target_kind = ZEND_SYMBOL_FUNCTION;
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_CONST")) {
+			target_kind = ZEND_SYMBOL_CONST;
+			continue;
+		}
+
+		if (lsp_token_is_char(token, ';')) {
+			lsp_collect_import_candidate(imports, target_kind, &prefix, &name, alias);
+			smart_str_free(&name);
+			memset(&name, 0, sizeof(name));
+			in_use = false;
+			continue;
+		}
+
+		if (lsp_token_is_char(token, '{')) {
+			if (name.s) {
+				smart_str_0(&name);
+				smart_str_append(&prefix, name.s);
+				smart_str_free(&name);
+				memset(&name, 0, sizeof(name));
+			}
+
+			in_group = true;
+			alias = NULL;
+			reading_alias = false;
+			continue;
+		}
+
+		if (lsp_token_is_char(token, ',') || lsp_token_is_char(token, '}')) {
+			lsp_collect_import_candidate(imports, target_kind, in_group ? &prefix : &no_prefix, &name, alias);
+			smart_str_free(&name);
+			memset(&name, 0, sizeof(name));
+			alias = NULL;
+			reading_alias = false;
+
+			if (lsp_token_is_char(token, '}')) {
+				in_group = false;
+			}
+
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_AS")) {
+			reading_alias = true;
+			alias = NULL;
+			continue;
+		}
+
+		if (reading_alias) {
+			if (lsp_collect_import_token_is_name_part(token)) {
+				alias = lsp_token_string(token, "text");
+				reading_alias = false;
+			}
+
+			continue;
+		}
+
+		if (lsp_collect_import_token_is_name_part(token)) {
+			token_text = lsp_token_string(token, "text");
+			if (token_text) {
+				smart_str_append(&name, token_text);
+			}
+		}
+	}
+
+	smart_str_free(&prefix);
+	smart_str_free(&name);
+	zval_ptr_dtor(&tokens_zv);
+}
+
 extern void lsp_document_collect_imports(zend_string *text, HashTable *imports)
 {
 	zend_arena *ast_arena;
@@ -1536,6 +1832,7 @@ extern void lsp_document_collect_imports(zend_string *text, HashTable *imports)
 	ast = lsp_compile_string_to_ast_silent(text, ZSTR_EMPTY_ALLOC(), &ast_arena);
 	if (!ast) {
 		lsp_compiled_ast_destroy(ast, ast_arena);
+		lsp_document_collect_imports_from_tokens(text, imports);
 
 		return;
 	}
@@ -1557,6 +1854,28 @@ extern bool lsp_document_has_import_cached(lsp_document *document, char kind, co
 
 	target_kind = lsp_symbol_import_ast_kind(kind);
 	key = lsp_import_set_key(target_kind, fqcn, fqcn_length);
+	exists = zend_hash_exists(document->derived_imports, key);
+	zend_string_release(key);
+
+	return exists;
+}
+
+extern bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length)
+{
+	zend_string *key;
+	const char *segment;
+	size_t segment_length;
+	uint32_t target_kind;
+	bool exists;
+
+	lsp_document_derived_ensure(document);
+	if (!document->derived_imports || zend_hash_num_elements(document->derived_imports) == 0) {
+		return false;
+	}
+
+	lsp_import_terminal_segment(fqcn, fqcn_length, &segment, &segment_length);
+	target_kind = lsp_symbol_import_ast_kind(kind);
+	key = lsp_import_alias_set_key(target_kind, segment, segment_length);
 	exists = zend_hash_exists(document->derived_imports, key);
 	zend_string_release(key);
 
@@ -1794,11 +2113,25 @@ static inline void lsp_add_project_symbol_completion_item(zval *items, lsp_symbo
 	zval entry;
 	zend_long score;
 	char sort_prefix;
-	bool call_snippet, needs_import;
+	bool call_snippet, needs_import, qualify_inline;
 
 	call_snippet = kind == LSP_SYMBOL_FUNCTION && !ctx->import_context;
 	sort_prefix = lsp_path_value_contains_vendor(path, path_length) ? '1' : '0';
 	detail = strpprintf(0, "%s%s", lsp_symbol_detail_prefix(kind), fqcn);
+
+	needs_import = !ctx->import_context &&
+		!ctx->prefix_is_qualified &&
+		!lsp_symbol_in_current_namespace(ctx->current_namespace, kind, fqcn, fqcn_length) &&
+		!lsp_document_has_import_cached(ctx->document, kind, fqcn, fqcn_length)
+	;
+
+	/* If the document already binds this short name to a different symbol
+	 * (another import or alias), adding a `use` would be a name clash;
+	 * insert the fully qualified name instead. */
+	qualify_inline = needs_import && lsp_document_import_binds_short_name(ctx->document, kind, fqcn, fqcn_length);
+	if (qualify_inline) {
+		needs_import = false;
+	}
 
 	if (ctx->import_context || ctx->prefix_is_qualified) {
 		if (ZSTR_LEN(ctx->prefix) > 0 && ZSTR_VAL(ctx->prefix)[0] == '\\') {
@@ -1806,6 +2139,8 @@ static inline void lsp_add_project_symbol_completion_item(zval *items, lsp_symbo
 		} else {
 			new_text = zend_string_init(fqcn, fqcn_length, 0);
 		}
+	} else if (qualify_inline) {
+		new_text = strpprintf(0, "\\%.*s", (int) fqcn_length, fqcn);
 	} else {
 		new_text = zend_string_init(label_value, label_length, 0);
 	}
@@ -1847,12 +2182,6 @@ static inline void lsp_add_project_symbol_completion_item(zval *items, lsp_symbo
 	}
 
 	smart_str_appendc(&json, '}');
-
-	needs_import = !ctx->import_context &&
-		!ctx->prefix_is_qualified &&
-		!lsp_symbol_in_current_namespace(ctx->current_namespace, fqcn, fqcn_length) &&
-		!lsp_document_has_import_cached(ctx->document, kind, fqcn, fqcn_length)
-	;
 
 	if (needs_import) {
 		smart_str_appendl(&json, ",\"additionalTextEdits\":[{\"range\":", sizeof(",\"additionalTextEdits\":[{\"range\":") - 1);

@@ -3269,6 +3269,25 @@ static inline zend_string *lsp_resolve_imported_class_name(zend_string *text, ze
 	return lsp_resolve_imported_class_name_from_tokenized_text(text, type, type_segment_length, type_segment_end);
 }
 
+static inline bool lsp_type_is_fully_qualified(zend_string *type)
+{
+	const char *p = ZSTR_VAL(type), *end = p + ZSTR_LEN(type);
+
+	while (p < end && isspace((unsigned char) *p)) {
+		p++;
+	}
+
+	while (p < end && (*p == '?' || *p == '(')) {
+		p++;
+	}
+
+	while (p < end && isspace((unsigned char) *p)) {
+		p++;
+	}
+
+	return p < end && *p == '\\';
+}
+
 extern zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type)
 {
 	zend_string *base = lsp_type_class_name(type), *resolved, *namespace_name;
@@ -3281,10 +3300,16 @@ extern zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type)
 		return NULL;
 	}
 
-	if (zend_lookup_class(base)) {
+	/* Fully qualified names bypass import/namespace resolution entirely.
+	 * lsp_type_class_name strips the leading backslash, so the check has to
+	 * look at the raw type text. */
+	if (lsp_type_is_fully_qualified(type)) {
 		return base;
 	}
 
+	/* Imports and the current namespace take precedence over globally loaded
+	 * classes: a builtin sharing the short name of an imported class (e.g.
+	 * `use App\Domain\Exception`) must not shadow the import. */
 	resolved = lsp_resolve_imported_class_name(text, base);
 	if (resolved) {
 		zend_string_release(base);
@@ -3294,6 +3319,8 @@ extern zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type)
 
 	namespace_name = lsp_document_namespace(text);
 	if (namespace_name != zend_empty_string) {
+		/* Unqualified names inside a namespace resolve to the current
+		 * namespace, matching PHP's own name resolution rules. */
 		resolved = strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(base));
 		zend_string_release(namespace_name);
 		zend_string_release(base);

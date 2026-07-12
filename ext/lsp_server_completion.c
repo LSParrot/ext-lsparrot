@@ -366,10 +366,11 @@ static inline void lsp_add_return_type_builtin_completions(zval *items, zend_str
 static inline void lsp_add_current_document_class_like_completions(zval *items, lsp_document *document, HashTable *tokens, zend_string *prefix)
 {
 	zend_long kind;
-	zend_string *label, *detail;
+	zend_string *label, *detail, *namespace_name;
 	zval *token;
 	uint32_t i, count;
 
+	namespace_name = lsp_document_namespace_cached(document);
 	count = zend_hash_num_elements(tokens);
 	for (i = 0; i < count; i++) {
 		token = zend_hash_index_find(tokens, i);
@@ -387,7 +388,7 @@ static inline void lsp_add_current_document_class_like_completions(zval *items, 
 			lsp_token_name_equals(token, "T_INTERFACE") ? "interface" : (lsp_token_name_equals(token, "T_TRAIT") ? "trait" : (lsp_token_name_equals(token, "T_ENUM") ? "enum" : "class")),
 			ZSTR_VAL(label)
 		);
-		lsp_add_completion_item_ex(items, label, kind, detail, "lsparrot");
+		lsp_add_completion_item_qualified(items, label, kind, detail, namespace_name);
 		zend_string_release(detail);
 	}
 }
@@ -1418,7 +1419,7 @@ extern void lsp_lsparrot_completion(lsp_server *server, zval *return_value, lsp_
 			}
 		} else if (lsp_token_is_class_like(token)) {
 			label = lsp_next_string_token(tokens, i + 1);
-			kind = lsp_token_name_equals(token, "T_INTERFACE") ? 11 : (lsp_token_name_equals(token, "T_ENUM") ? 10 : 7);
+			kind = lsp_token_name_equals(token, "T_INTERFACE") ? 8 : (lsp_token_name_equals(token, "T_TRAIT") ? 9 : (lsp_token_name_equals(token, "T_ENUM") ? 13 : 7));
 			if (label) {
 				detail = strpprintf(0, "%s %s", lsp_token_name_equals(token, "T_INTERFACE") ? "interface" : (lsp_token_name_equals(token, "T_TRAIT") ? "trait" : (lsp_token_name_equals(token, "T_ENUM") ? "enum" : "class")), ZSTR_VAL(label));
 			}
@@ -1436,7 +1437,11 @@ extern void lsp_lsparrot_completion(lsp_server *server, zval *return_value, lsp_
 			continue;
 		}
 
-		lsp_add_completion_item(&items, label, kind, detail);
+		if (lsp_token_is_class_like(token)) {
+			lsp_add_completion_item_qualified(&items, label, kind, detail, lsp_document_namespace_cached(document));
+		} else {
+			lsp_add_completion_item(&items, label, kind, detail);
+		}
 		zend_string_release(detail);
 	}
 

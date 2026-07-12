@@ -1076,7 +1076,6 @@ static inline zend_string *lsp_infer_method_call_assignment_declared_type(lsp_do
 static inline zend_string *lsp_infer_method_call_assignment_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
 {
 	zend_string *return_type, *class_name;
-	const char *slash;
 
 	return_type = lsp_infer_method_call_assignment_type(server, document, receiver, offset);
 
@@ -1084,8 +1083,10 @@ static inline zend_string *lsp_infer_method_call_assignment_class(lsp_server *se
 		return NULL;
 	}
 
-	slash = memchr(ZSTR_VAL(return_type), '\\', ZSTR_LEN(return_type));
-	class_name = slash ? zend_string_copy(return_type) : lsp_resolve_class_name(document->text, return_type);
+	/* Qualified return types still need import/namespace resolution: a
+	 * leading backslash must be stripped for index lookups and a relative
+	 * name such as Sub\Widget resolves against the declaring file. */
+	class_name = lsp_resolve_class_name(document->text, return_type);
 	zend_string_release(return_type);
 
 	return class_name;
@@ -1845,16 +1846,21 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 
 	class_name = lsp_infer_new_assignment_class(document->text, receiver, offset);
 	if (class_name) {
+		/* Resolve imports and the current namespace before consulting
+		 * loaded classes, so `use App\DateTime; new DateTime()` does not
+		 * get shadowed by the builtin sharing the short name. */
+		resolved = lsp_resolve_class_name(document->text, class_name);
+		if (resolved) {
+			zend_string_release(class_name);
+
+			return resolved;
+		}
+
 		if (zend_lookup_class(class_name)) {
 			return class_name;
 		}
 
-		resolved = lsp_resolve_class_name(document->text, class_name);
 		zend_string_release(class_name);
-
-		if (resolved) {
-			return resolved;
-		}
 	}
 
 	class_name = lsp_infer_method_array_access_assignment_class(server, document, receiver, offset);
