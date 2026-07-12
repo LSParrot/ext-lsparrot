@@ -51,6 +51,8 @@
 - Linux ネイティブ CI は同じスイートを **3 回**実行する: 通常ビルド → debug ビルド → **valgrind memcheck**。valgrind フェーズはサーバーが 10〜30 倍遅くなるため、固定秒数の時間予算(型クエリ 5 秒、固定 sleep 等)に依存するテストはそこだけ落ちる。テストの分析タイムアウトは 20 秒以上、待ち合わせはポーリング方式にすること。
 - 子プロセスの pid は **reap した瞬間に必ず無効化**する(`LSP_INVALID_PROCESS_ID` 代入)。reap 済み pid への kill は OS の pid 再利用により無関係プロセス(CI では別テスト)を殺す。実際に macOS CI で Termsig=15 のランダム失敗として顕在化した。`lsp_process_run_capture` は exited 後にパイプが開いていても deadline で kill しない。
 - `lsp_process_spawn_piped` は親側パイプ fd に FD_CLOEXEC を付ける。これがないと後続の exec 子が write end を握り、EOF 検出が遅延して capture が deadline まで回る。
+- **macos-26 ランナーは PHP バージョンを問わず、テスト中の LSP サーバープロセスへ散発的に SIGTERM を送る**(1 スイートあたり 1〜3 テスト、原因はランナー環境側。ci_macos.yaml の 1 回リトライだけでは確率的に落ちる)。対策としてサーバーは SIGTERM ガードを実装済み(`lsp_terminate_guard_*`): ループ中の SIGTERM は exit 通知と同様のグレースフル終了(teardown 完走・キャッシュ永続化)になり、teardown 中の SIGTERM では死ななくなった。これはエディタが SIGTERM でサーバーを止める実運用でも正しい挙動。SIGKILL は従来どおり即死。
+- ASAN(clang-asan-php)フェーズは ARM zts ジョブで実行される。emalloc したまま返し忘れた zend_string は通常ビルドでは request 終了時に回収されて見えないが、ASAN では leak として検出されテストが落ちる。
 
 ## 3. 検証インフラ(再利用すべき資産)
 

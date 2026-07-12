@@ -23,6 +23,7 @@ extern void lsp_server_run(zval *options)
 	lsp_server server;
 
 	memset(&server, 0, sizeof(server));
+	lsp_terminate_guard_install();
 	lsp_set_lsp_stdio_binary();
 	lsp_options_from_zval(&server.options, options);
 	lsp_symbol_index_init(&server.symbol_index, &server.options);
@@ -79,4 +80,5 @@ extern void lsp_server_run(zval *options)
 	lsp_options_destroy(&server.options);
 
 	EG(exit_status) = server.saw_shutdown ? 0 : 1;
+	lsp_terminate_guard_restore();
 }

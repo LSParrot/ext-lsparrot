@@ -411,6 +411,10 @@ extern void lsp_lsparrot_prepare_call_hierarchy(lsp_server *server, zval *return
 			lsp_hier_item(&item, word, container ? LSP_HIER_KIND_METHOD : LSP_HIER_KIND_FUNCTION,
 				document->path, document->text, word_start, word_start + ZSTR_LEN(word), 0, 0, container, container);
 			add_next_index_zval(return_value, &item);
+			if (container) {
+				zend_string_release(container);
+				container = NULL;
+			}
 			resolved = true;
 		}
 	}

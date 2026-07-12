@@ -1103,6 +1103,12 @@ extern bool lsp_protocol_next_message(lsp_server *server, zval *message)
 			return false;
 		}
 
+		/* SIGTERM: stop as if the client had sent exit; teardown still
+		 * runs so caches persist and children are stopped cleanly. */
+		if (lsp_terminate_requested()) {
+			return false;
+		}
+
 		timeout = lsp_server_has_background_work(server) ? 0.05 : -1.0;
 		filled = lsp_transport_fill(timeout);
 		if (filled == 0) {

@@ -1016,3 +1016,67 @@ extern void lsp_process_close(lsp_process_id process)
 	(void) process;
 #endif
 }
+
+/* ----------------------------------------------------------------------
+ * SIGTERM guard
+ *
+ * Editors commonly stop a language server with SIGTERM. Dying mid-way
+ * through a request or through teardown loses the on-disk index cache and
+ * leaves child processes to escalation timeouts, so while the server loop
+ * owns the process a SIGTERM only records a stop request: the loop exits
+ * gracefully at the next wakeup and teardown runs to completion even when
+ * the signal arrives during it. The previous disposition is restored when
+ * the server returns. SIGKILL remains available as the hard stop.
+ * ---------------------------------------------------------------------- */
+
+static volatile sig_atomic_t lsp_terminate_requested_flag = 0;
+
+#if !defined(_WIN32)
+static struct sigaction lsp_previous_sigterm_action;
+static bool lsp_sigterm_guard_active = false;
+
+static void lsp_sigterm_guard_handler(int signo)
+{
+	(void) signo;
+	lsp_terminate_requested_flag = 1;
+}
+#endif
+
+extern void lsp_terminate_guard_install(void)
+{
+#if !defined(_WIN32)
+	struct sigaction action;
+
+	if (lsp_sigterm_guard_active) {
+		return;
+	}
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = lsp_sigterm_guard_handler;
+	sigemptyset(&action.sa_mask);
+	/* No SA_RESTART: the signal must interrupt poll() so the loop notices
+	 * the stop request promptly. */
+	action.sa_flags = 0;
+	if (sigaction(SIGTERM, &action, &lsp_previous_sigterm_action) == 0) {
+		lsp_sigterm_guard_active = true;
+	}
+#endif
+	lsp_terminate_requested_flag = 0;
+}
+
+extern void lsp_terminate_guard_restore(void)
+{
+#if !defined(_WIN32)
+	if (!lsp_sigterm_guard_active) {
+		return;
+	}
+
+	sigaction(SIGTERM, &lsp_previous_sigterm_action, NULL);
+	lsp_sigterm_guard_active = false;
+#endif
+}
+
+extern bool lsp_terminate_requested(void)
+{
+	return lsp_terminate_requested_flag != 0;
+}
