@@ -153,16 +153,24 @@ $first = lsp_read_until_id($pipes[1], 2, microtime(true) + 15);
 $firstElapsed = microtime(true) - $firstStarted;
 $firstText = (string) ($first['result']['contents']['value'] ?? '');
 
-// Give the deferred job time to finish and get pumped into the type cache.
-usleep(1800000);
+// Poll follow-up hovers until the deferred result lands in the type cache.
+// The fake analyzer needs ~0.8s plus interpreter startup, which can stretch
+// well past a fixed sleep on loaded CI runners, so keep asking instead of
+// guessing a delay.
+$second = null;
+$secondText = '';
+$hoverId = 3;
+$pollDeadline = microtime(true) + 30;
+do {
+    usleep(300000);
+    fwrite($pipes[0], lsp_frame(['jsonrpc' => '2.0', 'id' => $hoverId, 'method' => 'textDocument/hover', 'params' => ['textDocument' => ['uri' => $uri], 'position' => ['line' => 9, 'character' => 9]]]));
+    $second = lsp_read_until_id($pipes[1], $hoverId, microtime(true) + 15);
+    $secondText = (string) ($second['result']['contents']['value'] ?? '');
+    $hoverId++;
+} while (!str_contains($secondText, 'Mystery') && microtime(true) < $pollDeadline);
 
-// Second hover: the deferred result must now be served from the cache.
-fwrite($pipes[0], lsp_frame(['jsonrpc' => '2.0', 'id' => 3, 'method' => 'textDocument/hover', 'params' => ['textDocument' => ['uri' => $uri], 'position' => ['line' => 9, 'character' => 9]]]));
-$second = lsp_read_until_id($pipes[1], 3, microtime(true) + 15);
-$secondText = (string) ($second['result']['contents']['value'] ?? '');
-
-fwrite($pipes[0], lsp_frame(['jsonrpc' => '2.0', 'id' => 4, 'method' => 'shutdown', 'params' => []]));
-lsp_read_until_id($pipes[1], 4, microtime(true) + 15);
+fwrite($pipes[0], lsp_frame(['jsonrpc' => '2.0', 'id' => 900, 'method' => 'shutdown', 'params' => []]));
+lsp_read_until_id($pipes[1], 900, microtime(true) + 15);
 fwrite($pipes[0], lsp_frame(['jsonrpc' => '2.0', 'method' => 'exit', 'params' => []]));
 fclose($pipes[0]);
 stream_get_contents($pipes[1]);
