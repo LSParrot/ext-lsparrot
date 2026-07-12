@@ -340,10 +340,10 @@ extern void lsp_lsparrot_semantic_tokens(lsp_server *server, zval *return_value,
 		if (id == T_LNUMBER || id == T_DNUMBER) {
 			type = LSP_SEM_NUMBER;
 		} else if (id == T_VARIABLE) {
-			type = token_text && zend_string_equals_literal(token_text, "$this")
-				? LSP_SEM_KEYWORD
-				: (previous_id == T_PAAMAYIM_NEKUDOTAYIM ? LSP_SEM_PROPERTY : LSP_SEM_VARIABLE)
-			;
+			/* $this is a variable, not a keyword: tagging it keyword paints
+			 * it like `public`/`return` in clients that trust semantic
+			 * tokens over the grammar. */
+			type = previous_id == T_PAAMAYIM_NEKUDOTAYIM ? LSP_SEM_PROPERTY : LSP_SEM_VARIABLE;
 		} else if (lsp_semantic_id_is_keyword(id)) {
 			type = LSP_SEM_KEYWORD;
 			if (id == T_CLASS || id == T_INTERFACE || id == T_TRAIT || id == T_ENUM) {

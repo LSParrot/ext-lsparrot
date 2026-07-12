@@ -637,15 +637,16 @@ static inline void lsp_refactor_add_import_action(zval *actions, lsp_document *d
 	size_t insert_offset;
 	bool after_existing_use;
 
-	current_namespace = lsp_document_namespace(document->text);
-	if (lsp_symbol_in_current_namespace(current_namespace, kind, fqcn, fqcn_length) || lsp_document_has_import(document->text, kind, fqcn)) {
-		if (current_namespace != zend_empty_string) {
-			zend_string_release(current_namespace);
-		}
+	/* The cached derived imports fall back to token scanning while the
+	 * document does not parse — exactly the state a missing-import quick
+	 * fix is requested in. The AST-only lsp_document_has_import() returned
+	 * false for every mid-edit document, offering duplicate imports. */
+	current_namespace = lsp_document_namespace_cached(document);
+	if (lsp_symbol_in_current_namespace(current_namespace, kind, fqcn, fqcn_length) ||
+		lsp_document_has_import_cached(document, kind, fqcn, fqcn_length) ||
+		lsp_document_import_binds_short_name(document, kind, fqcn, fqcn_length)
+	) {
 		return;
-	}
-	if (current_namespace != zend_empty_string) {
-		zend_string_release(current_namespace);
 	}
 
 	insert_offset = lsp_import_insert_offset(document->text, &after_existing_use);

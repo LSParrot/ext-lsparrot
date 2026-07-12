@@ -355,27 +355,79 @@ static inline void lsp_default_range(zval *range)
 	add_assoc_zval(range, "end", &end);
 }
 
-static inline void lsp_add_document_symbol(zval *items, zend_string *name, zend_long kind, zend_long one_based_line)
+#define LSP_SYMBOL_FRAME_MAX 16
+
+typedef struct _lsp_document_symbol_frame {
+	zval item;       /* DocumentSymbol under construction */
+	zval children;
+	zend_long body_depth;
+	size_t start_offset;
+	bool is_enum;
+	bool is_class_like;
+} lsp_document_symbol_frame;
+
+static inline void lsp_document_symbol_leaf(zval *target, lsp_document *document, zend_string *name, zend_long kind, size_t start_offset, size_t end_offset, size_t name_offset, size_t name_length)
 {
 	zval item, range, selection_range;
 
 	array_init(&item);
 	add_assoc_str(&item, "name", zend_string_copy(name));
 	add_assoc_long(&item, "kind", kind);
-	lsp_line_range(&range, zend_empty_string, one_based_line);
-	lsp_line_range(&selection_range, zend_empty_string, one_based_line);
+	lsp_range_from_offsets(document->text, start_offset, end_offset, &range);
 	add_assoc_zval(&item, "range", &range);
+	lsp_range_from_offsets(document->text, name_offset, name_offset + name_length, &selection_range);
 	add_assoc_zval(&item, "selectionRange", &selection_range);
-	add_next_index_zval(items, &item);
+	add_next_index_zval(target, &item);
 }
 
+static inline void lsp_document_symbol_frame_open(lsp_document_symbol_frame *frame, lsp_document *document, zend_string *name, zend_long kind, size_t start_offset, size_t name_offset, size_t name_length, zend_long body_depth, bool is_enum, bool is_class_like)
+{
+	zval selection_range;
+
+	array_init(&frame->item);
+	add_assoc_str(&frame->item, "name", zend_string_copy(name));
+	add_assoc_long(&frame->item, "kind", kind);
+	lsp_range_from_offsets(document->text, name_offset, name_offset + name_length, &selection_range);
+	add_assoc_zval(&frame->item, "selectionRange", &selection_range);
+	array_init(&frame->children);
+	frame->body_depth = body_depth;
+	frame->start_offset = start_offset;
+	frame->is_enum = is_enum;
+	frame->is_class_like = is_class_like;
+}
+
+static inline void lsp_document_symbol_frame_close(lsp_document_symbol_frame *frame, lsp_document *document, zval *target, size_t end_offset)
+{
+	zval range;
+
+	lsp_range_from_offsets(document->text, frame->start_offset, end_offset, &range);
+	add_assoc_zval(&frame->item, "range", &range);
+
+	if (zend_hash_num_elements(Z_ARRVAL(frame->children)) > 0) {
+		add_assoc_zval(&frame->item, "children", &frame->children);
+	} else {
+		zval_ptr_dtor(&frame->children);
+	}
+
+	add_next_index_zval(target, &frame->item);
+}
+
+/* Hierarchical DocumentSymbol tree from the token stream: classes own their
+ * methods and enum cases as children, with real ranges (declaration through
+ * closing brace) and name-based selection ranges. Token-driven so it also
+ * works on documents that do not currently parse. */
 static inline void lsp_document_symbols(zval *return_value, lsp_document *document)
 {
-	zend_long kind;
-	zend_string *label;
-	zval *tokens_zv, *token;
+	lsp_document_symbol_frame frames[LSP_SYMBOL_FRAME_MAX];
+	zend_long depth = 0, kind, pending_kind = 0;
+	zend_string *label, *pending_name = NULL;
+	zval *tokens_zv, *token, *name_token;
+	zval *target;
 	HashTable *tokens;
-	uint32_t i, count;
+	uint32_t i, count, name_index;
+	int frame_count = 0;
+	size_t token_offset, pending_start = 0, pending_name_offset = 0, pending_name_length = 0;
+	bool pending_is_class = false, pending_active = false, previous_is_new = false;
 
 	array_init(return_value);
 	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
@@ -387,24 +439,119 @@ static inline void lsp_document_symbols(zval *return_value, lsp_document *docume
 	count = zend_hash_num_elements(tokens);
 	for (i = 0; i < count; i++) {
 		token = zend_hash_index_find(tokens, i);
-		label = NULL;
-		kind = 5;
-
 		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
 			continue;
 		}
 
-			if (lsp_token_name_equals(token, "T_FUNCTION")) {
-				label = lsp_next_string_token(tokens, i + 1);
-				kind = 12;
-			} else if (lsp_token_is_class_like(token)) {
-				label = lsp_next_string_token(tokens, i + 1);
-				kind = lsp_token_name_equals(token, "T_INTERFACE") ? 11 : (lsp_token_name_equals(token, "T_ENUM") ? 10 : 5);
+		if (lsp_token_name_equals(token, "T_WHITESPACE") || lsp_token_name_equals(token, "T_COMMENT") || lsp_token_name_equals(token, "T_DOC_COMMENT")) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+
+		if (lsp_token_is_char(token, '{') || lsp_token_name_equals(token, "T_CURLY_OPEN") || lsp_token_name_equals(token, "T_DOLLAR_OPEN_CURLY_BRACES")) {
+			depth++;
+			if (pending_active && frame_count < LSP_SYMBOL_FRAME_MAX) {
+				lsp_document_symbol_frame_open(&frames[frame_count], document, pending_name, pending_kind, pending_start, pending_name_offset, pending_name_length, depth, pending_is_class && pending_kind == 10, pending_is_class);
+				frame_count++;
+				pending_active = false;
+				pending_name = NULL;
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		if (lsp_token_is_char(token, '}')) {
+			if (frame_count > 0 && frames[frame_count - 1].body_depth == depth) {
+				frame_count--;
+				target = frame_count > 0 ? &frames[frame_count - 1].children : return_value;
+				lsp_document_symbol_frame_close(&frames[frame_count], document, target, token_offset + 1);
+			}
+			if (depth > 0) {
+				depth--;
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		if (pending_active && lsp_token_is_char(token, ';')) {
+			/* Bodyless declaration (abstract/interface method). */
+			target = frame_count > 0 ? &frames[frame_count - 1].children : return_value;
+			lsp_document_symbol_leaf(target, document, pending_name, pending_kind, pending_start, token_offset + 1, pending_name_offset, pending_name_length);
+			pending_active = false;
+			pending_name = NULL;
+			continue;
+		}
+
+		if (lsp_token_is_class_like(token)) {
+			if (previous_is_new) {
+				/* Anonymous class: no symbol, braces tracked by depth. */
+				previous_is_new = false;
+				continue;
 			}
 
-		if (label) {
-			lsp_add_document_symbol(return_value, label, kind, lsp_token_long(token, "line", 1));
+			label = lsp_next_string_token(tokens, i + 1);
+			if (label) {
+				kind = lsp_token_name_equals(token, "T_INTERFACE") ? 11 : (lsp_token_name_equals(token, "T_ENUM") ? 10 : 5);
+				name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
+				pending_active = true;
+				pending_is_class = true;
+				pending_kind = kind;
+				pending_name = label;
+				pending_start = token_offset;
+				pending_name_offset = name_token ? (size_t) lsp_token_long(name_token, "offset", 0) : token_offset;
+				pending_name_length = ZSTR_LEN(label);
+			}
+			previous_is_new = false;
+			continue;
 		}
+
+		if (lsp_token_name_equals(token, "T_FUNCTION")) {
+			name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
+			label = name_token ? lsp_token_string(name_token, "text") : NULL;
+			if (label) {
+				kind = frame_count > 0 && frames[frame_count - 1].body_depth == depth && frames[frame_count - 1].is_class_like
+					? (zend_string_equals_literal(label, "__construct") ? 9 : 6)
+					: 12
+				;
+				pending_active = true;
+				pending_is_class = false;
+				pending_kind = kind;
+				pending_name = label;
+				pending_start = token_offset;
+				pending_name_offset = (size_t) lsp_token_long(name_token, "offset", 0);
+				pending_name_length = ZSTR_LEN(label);
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_CASE") &&
+			frame_count > 0 &&
+			frames[frame_count - 1].is_enum &&
+			frames[frame_count - 1].body_depth == depth
+		) {
+			label = lsp_next_string_token(tokens, i + 1);
+			if (label) {
+				name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
+				lsp_document_symbol_leaf(&frames[frame_count - 1].children, document, label, 22,
+					token_offset,
+					(name_token ? (size_t) lsp_token_long(name_token, "offset", 0) : token_offset) + ZSTR_LEN(label),
+					name_token ? (size_t) lsp_token_long(name_token, "offset", 0) : token_offset,
+					ZSTR_LEN(label));
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		previous_is_new = lsp_token_name_equals(token, "T_NEW");
+	}
+
+	/* Close frames left open by an unfinished document. */
+	while (frame_count > 0) {
+		frame_count--;
+		target = frame_count > 0 ? &frames[frame_count - 1].children : return_value;
+		lsp_document_symbol_frame_close(&frames[frame_count], document, target, ZSTR_LEN(document->text));
 	}
 }
 

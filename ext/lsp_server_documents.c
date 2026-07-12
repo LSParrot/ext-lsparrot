@@ -1130,7 +1130,7 @@ extern void lsp_document_derived_ensure(lsp_document *document)
 
 	document->derived_namespace = lsp_document_namespace(document->text);
 	document->derived_imports = emalloc(sizeof(HashTable));
-	zend_hash_init(document->derived_imports, 8, NULL, NULL, 0);
+	zend_hash_init(document->derived_imports, 8, NULL, ZVAL_PTR_DTOR, 0);
 	lsp_document_collect_imports(document->text, document->derived_imports);
 	document->derived_import_insert_offset = lsp_import_insert_offset(document->text, &document->derived_import_after_use);
 	document->derived_valid = true;

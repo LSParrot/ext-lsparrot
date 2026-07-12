@@ -890,6 +890,11 @@ extern zend_string *lsp_class_declared_name(zend_string *text, size_t class_star
 	return NULL;
 }
 
+extern zend_string *lsp_parameter_declared_type_before_variable(zend_string *text, size_t variable_offset, size_t param_start)
+{
+	return lsp_parameter_type_before_variable(text, variable_offset, param_start);
+}
+
 extern zend_string *lsp_property_completion_detail(zend_string *text, zval *variable_token, bool is_static)
 {
 	zend_string *variable, *type, *detail;

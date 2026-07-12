@@ -95,6 +95,12 @@ static inline const char *lsp_token_name(int token)
 		case T_DNUMBER: return "T_DNUMBER";
 		case T_CONSTANT_ENCAPSED_STRING: return "T_CONSTANT_ENCAPSED_STRING";
 		case T_INLINE_HTML: return "T_INLINE_HTML";
+		case T_CASE: return "T_CASE";
+		case T_EXTENDS: return "T_EXTENDS";
+		case T_IMPLEMENTS: return "T_IMPLEMENTS";
+		case T_NEW: return "T_NEW";
+		case T_CURLY_OPEN: return "T_CURLY_OPEN";
+		case T_DOLLAR_OPEN_CURLY_BRACES: return "T_DOLLAR_OPEN_CURLY_BRACES";
 		default: return token < 256 ? "CHAR" : "UNKNOWN";
 	}
 }

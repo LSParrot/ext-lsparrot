@@ -2433,6 +2433,55 @@ static inline zend_string *lsp_resolve_ast_property_group_declared_class(zend_st
 	return NULL;
 }
 
+static inline zend_string *lsp_resolve_ast_promoted_property_declared_class(zend_string *contents, zend_ast_decl *method, zend_string *property_name)
+{
+	zend_ast_list *params;
+	zend_ast *param;
+	zend_string *name, *type, *class_name;
+	uint32_t i;
+
+	if (!method->name ||
+		!zend_string_equals_literal_ci(method->name, "__construct") ||
+		!method->child[0] ||
+		!zend_ast_is_list(method->child[0])
+	) {
+		return NULL;
+	}
+
+	params = zend_ast_get_list(method->child[0]);
+	for (i = 0; i < params->children; i++) {
+		param = params->child[i];
+		if (!param || param->kind != ZEND_AST_PARAM || !param->child[0]) {
+			continue;
+		}
+
+		/* Only params carrying a visibility flag promote to properties. */
+		if ((param->attr & (ZEND_ACC_PUBLIC | ZEND_ACC_PROTECTED | ZEND_ACC_PRIVATE)) == 0) {
+			continue;
+		}
+
+		name = lsp_ast_string_value(param->child[1]);
+		if (!name ||
+			ZSTR_LEN(name) != ZSTR_LEN(property_name) ||
+			strncmp(ZSTR_VAL(name), ZSTR_VAL(property_name), ZSTR_LEN(name)) != 0
+		) {
+			continue;
+		}
+
+		type = lsp_inference_ast_type_string(param->child[0]);
+		if (!type) {
+			return NULL;
+		}
+
+		class_name = lsp_resolve_class_name(contents, type);
+		zend_string_release(type);
+
+		return class_name;
+	}
+
+	return NULL;
+}
+
 static inline zend_string *lsp_resolve_ast_declared_class_name(zend_string *contents, zend_string *raw_name)
 {
 	zend_string *namespace_name, *declared;
@@ -2494,6 +2543,20 @@ static inline zend_string *lsp_resolve_ast_class_property_declared_class(zend_st
 		}
 	}
 
+	/* Constructor-promoted properties (`__construct(private Repo $repo)`)
+	 * declare no PROP_GROUP; their type lives on the constructor param. */
+	for (i = 0; i < statements->children; i++) {
+		statement = statements->child[i];
+		if (!statement || statement->kind != ZEND_AST_METHOD) {
+			continue;
+		}
+
+		class_name = lsp_resolve_ast_promoted_property_declared_class(contents, (zend_ast_decl *) statement, property_name);
+		if (class_name) {
+			return class_name;
+		}
+	}
+
 	return NULL;
 }
 
@@ -2546,8 +2609,8 @@ static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_st
 	zval tokens_zv, *token;
 	HashTable *tokens;
 	uint32_t i, count;
-	size_t class_start = 0, body_start = 0, body_end = 0, token_offset;
-	bool property_matches;
+	size_t class_start = 0, body_start = 0, body_end = 0, token_offset, promoted_param_start;
+	bool property_matches, promoted;
 
 	ZVAL_UNDEF(&tokens_zv);
 	if (!lsp_find_class_header_for_name(contents, receiver_class, &class_start, &body_start, &body_end, &body_depth)) {
@@ -2567,10 +2630,20 @@ static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_st
 			Z_TYPE_P(token) != IS_ARRAY ||
 			!lsp_token_in_bounds(token, body_start, body_end) ||
 			!lsp_token_at_depth(contents, token, body_depth) ||
-			!lsp_token_name_equals(token, "T_VARIABLE") ||
-			!lsp_token_is_property_declaration(tokens, i, contents, body_depth)
+			!lsp_token_name_equals(token, "T_VARIABLE")
 		) {
 			continue;
+		}
+
+		promoted = false;
+		promoted_param_start = 0;
+		if (!lsp_token_is_property_declaration(tokens, i, contents, body_depth)) {
+			/* Constructor-promoted properties declare their type on the
+			 * __construct parameter. */
+			promoted = lsp_token_is_promoted_property(tokens, i, contents, body_depth, &promoted_param_start);
+			if (!promoted) {
+				continue;
+			}
 		}
 
 		variable = lsp_token_string(token, "text");
@@ -2584,7 +2657,10 @@ static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_st
 		}
 
 		token_offset = (size_t) lsp_token_long(token, "offset", 0);
-		type = lsp_inference_property_type_before_variable_fallback(contents, token_offset);
+		type = promoted
+			? lsp_parameter_declared_type_before_variable(contents, token_offset, promoted_param_start)
+			: lsp_inference_property_type_before_variable_fallback(contents, token_offset)
+		;
 		if (!type) {
 			zval_ptr_dtor(&tokens_zv);
 

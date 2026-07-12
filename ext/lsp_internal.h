@@ -830,6 +830,10 @@ zend_string *lsp_psalm_parse_type_output(zend_string *output, zend_string *expre
 zend_string *lsp_document_namespace_cached(lsp_document *document);
 bool lsp_document_has_import_cached(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
 bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
+void lsp_add_inherited_project_class_method_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
+zend_string *lsp_parameter_declared_type_before_variable(zend_string *text, size_t variable_offset, size_t param_start);
+bool lsp_token_is_promoted_property(HashTable *tokens, uint32_t index, zend_string *text, zend_long body_depth, size_t *param_start);
+zend_string *lsp_document_import_bound_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
 size_t lsp_document_import_insert_offset_cached(lsp_document *document, bool *after_existing_use);
 void lsp_document_collect_imports(zend_string *text, HashTable *imports);
 void lsp_perf_stats_record(lsp_server *server, zend_string *method, double elapsed_seconds);

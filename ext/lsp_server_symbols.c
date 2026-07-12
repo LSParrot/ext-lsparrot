@@ -1547,6 +1547,7 @@ static inline void lsp_collect_use_statement_imports(zend_ast *use_ast, zend_str
 	zend_ast_list *list;
 	zend_ast *elem;
 	zend_string *name, *full_name, *key, *alias;
+	zval bound;
 	const char *alias_value;
 	size_t alias_length;
 	uint32_t i, elem_kind;
@@ -1573,10 +1574,6 @@ static inline void lsp_collect_use_statement_imports(zend_ast *use_ast, zend_str
 		}
 
 		full_name = lsp_import_full_name(prefix, name);
-		key = lsp_import_set_key(elem_kind, ZSTR_VAL(full_name), ZSTR_LEN(full_name));
-		zend_hash_add_empty_element(imports, key);
-		zend_string_release(key);
-
 		alias = elem->child[1] ? lsp_ast_string_value(elem->child[1]) : NULL;
 		if (alias) {
 			alias_value = ZSTR_VAL(alias);
@@ -1584,6 +1581,14 @@ static inline void lsp_collect_use_statement_imports(zend_ast *use_ast, zend_str
 		} else {
 			lsp_import_terminal_segment(ZSTR_VAL(full_name), ZSTR_LEN(full_name), &alias_value, &alias_length);
 		}
+
+		/* The exact-FQCN key records which short name the import binds, so
+		 * completion can insert the alias instead of an unresolvable bare
+		 * class name. */
+		key = lsp_import_set_key(elem_kind, ZSTR_VAL(full_name), ZSTR_LEN(full_name));
+		ZVAL_STR(&bound, zend_string_init(alias_value, alias_length, 0));
+		zend_hash_update(imports, key, &bound);
+		zend_string_release(key);
 
 		key = lsp_import_alias_set_key(elem_kind, alias_value, alias_length);
 		zend_hash_add_empty_element(imports, key);
@@ -1655,6 +1660,7 @@ static inline bool lsp_collect_import_token_is_name_part(zval *token)
 static inline void lsp_collect_import_candidate(HashTable *imports, uint32_t target_kind, smart_str *prefix, smart_str *name, zend_string *alias)
 {
 	zend_string *key, *full_name;
+	zval bound;
 	const char *alias_value;
 	size_t alias_length;
 
@@ -1665,7 +1671,14 @@ static inline void lsp_collect_import_candidate(HashTable *imports, uint32_t tar
 	smart_str_0(name);
 	if (prefix->s && ZSTR_LEN(prefix->s) > 0) {
 		smart_str_0(prefix);
-		full_name = strpprintf(0, "%s\\%s", ZSTR_VAL(prefix->s), ZSTR_VAL(name->s));
+		/* The tokenized group prefix keeps its trailing namespace separator
+		 * (`use App\{First};` lexes as "App\" + '{'), so only add one when
+		 * it is missing. */
+		if (ZSTR_VAL(prefix->s)[ZSTR_LEN(prefix->s) - 1] == '\\') {
+			full_name = strpprintf(0, "%s%s", ZSTR_VAL(prefix->s), ZSTR_VAL(name->s));
+		} else {
+			full_name = strpprintf(0, "%s\\%s", ZSTR_VAL(prefix->s), ZSTR_VAL(name->s));
+		}
 	} else {
 		full_name = zend_string_copy(name->s);
 	}
@@ -1676,16 +1689,17 @@ static inline void lsp_collect_import_candidate(HashTable *imports, uint32_t tar
 		full_name = trimmed;
 	}
 
-	key = lsp_import_set_key(target_kind, ZSTR_VAL(full_name), ZSTR_LEN(full_name));
-	zend_hash_add_empty_element(imports, key);
-	zend_string_release(key);
-
 	if (alias) {
 		alias_value = ZSTR_VAL(alias);
 		alias_length = ZSTR_LEN(alias);
 	} else {
 		lsp_import_terminal_segment(ZSTR_VAL(full_name), ZSTR_LEN(full_name), &alias_value, &alias_length);
 	}
+
+	key = lsp_import_set_key(target_kind, ZSTR_VAL(full_name), ZSTR_LEN(full_name));
+	ZVAL_STR(&bound, zend_string_init(alias_value, alias_length, 0));
+	zend_hash_update(imports, key, &bound);
+	zend_string_release(key);
 
 	key = lsp_import_alias_set_key(target_kind, alias_value, alias_length);
 	zend_hash_add_empty_element(imports, key);
@@ -1858,6 +1872,28 @@ extern bool lsp_document_has_import_cached(lsp_document *document, char kind, co
 	zend_string_release(key);
 
 	return exists;
+}
+
+/* Returns the short name the document's import of `fqcn` binds (the alias for
+ * `use X as Y`, the terminal segment otherwise), or NULL when not imported.
+ * The returned string is borrowed from the derived-import table. */
+extern zend_string *lsp_document_import_bound_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length)
+{
+	zend_string *key;
+	zval *value;
+	uint32_t target_kind;
+
+	lsp_document_derived_ensure(document);
+	if (!document->derived_imports || zend_hash_num_elements(document->derived_imports) == 0) {
+		return NULL;
+	}
+
+	target_kind = lsp_symbol_import_ast_kind(kind);
+	key = lsp_import_set_key(target_kind, fqcn, fqcn_length);
+	value = zend_hash_find(document->derived_imports, key);
+	zend_string_release(key);
+
+	return value && Z_TYPE_P(value) == IS_STRING ? Z_STR_P(value) : NULL;
 }
 
 extern bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length)
@@ -2109,7 +2145,7 @@ static inline zend_string *lsp_symbol_item_ctx_import_range(lsp_symbol_item_ctx 
 static inline void lsp_add_project_symbol_completion_item(zval *items, lsp_symbol_item_ctx *ctx, char kind, const char *fqcn, size_t fqcn_length, const char *label_value, size_t label_length, const char *path, size_t path_length)
 {
 	smart_str json = {0};
-	zend_string *new_text, *import_text, *detail, *encoded;
+	zend_string *new_text, *import_text, *detail, *encoded, *bound_name;
 	zval entry;
 	zend_long score;
 	char sort_prefix;
@@ -2131,6 +2167,17 @@ static inline void lsp_add_project_symbol_completion_item(zval *items, lsp_symbo
 	qualify_inline = needs_import && lsp_document_import_binds_short_name(ctx->document, kind, fqcn, fqcn_length);
 	if (qualify_inline) {
 		needs_import = false;
+	}
+
+	/* A class imported under an alias (`use Lib\Widget as W`) is only
+	 * reachable through the alias: label and inserted text must use it,
+	 * or the completion produces an unresolvable bare class name. */
+	if (!needs_import && !qualify_inline && !ctx->import_context && !ctx->prefix_is_qualified) {
+		bound_name = lsp_document_import_bound_name(ctx->document, kind, fqcn, fqcn_length);
+		if (bound_name && (ZSTR_LEN(bound_name) != label_length || strncasecmp(ZSTR_VAL(bound_name), label_value, label_length) != 0)) {
+			label_value = ZSTR_VAL(bound_name);
+			label_length = ZSTR_LEN(bound_name);
+		}
 	}
 
 	if (ctx->import_context || ctx->prefix_is_qualified) {

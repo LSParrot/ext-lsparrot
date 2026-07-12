@@ -113,6 +113,7 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 static inline bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth)
 {
 	zend_string *path, *contents, *parent_class;
+	zval traits, *trait_zv;
 	bool found;
 
 	if (depth > 64) {
@@ -133,8 +134,30 @@ static inline bool lsp_project_method_definition_for_class(lsp_server *server, z
 
 	parent_class = NULL;
 	found = lsp_method_definition_in_contents(path, contents, member_name, return_value, &parent_class);
+	if (found) {
+		zend_string_release(contents);
+		zend_string_release(path);
+		if (parent_class) {
+			zend_string_release(parent_class);
+		}
+
+		return true;
+	}
+
+	/* Methods brought in by traits declare in the trait's own file. */
+	lsp_collect_class_trait_names(contents, &traits);
 	zend_string_release(contents);
 	zend_string_release(path);
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
+		if (Z_TYPE_P(trait_zv) == IS_STRING &&
+			lsp_project_method_definition_for_class(server, Z_STR_P(trait_zv), member_name, return_value, depth + 1)
+		) {
+			found = true;
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+	zval_ptr_dtor(&traits);
+
 	if (found) {
 		if (parent_class) {
 			zend_string_release(parent_class);
@@ -264,6 +287,64 @@ static inline bool lsp_definition_label_matches(zend_string *label, zend_string 
 	;
 }
 
+/* Match `member_name` among the names declared by the `const`/`case`
+ * statement starting at token `index`; a const name is the T_STRING directly
+ * before '=', an enum case name the first T_STRING after `case`. */
+static inline bool lsp_definition_constant_name_location(zend_string *path, zend_string *contents, HashTable *tokens, uint32_t index, uint32_t count, zend_string *member_name, zval *return_value)
+{
+	zend_string *text;
+	zval *token, *candidate = NULL;
+	uint32_t j;
+	size_t name_offset;
+	bool is_case;
+
+	is_case = lsp_token_name_equals(zend_hash_index_find(tokens, index), "T_CASE");
+
+	for (j = index + 1; j < count; j++) {
+		token = zend_hash_index_find(tokens, j);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		if (lsp_token_is_char(token, ';') || lsp_token_is_char(token, '}')) {
+			break;
+		}
+
+		if (lsp_token_name_equals(token, "T_STRING")) {
+			if (is_case && candidate) {
+				/* Only the first name after `case` is the declaration. */
+				break;
+			}
+			candidate = token;
+			continue;
+		}
+
+		if ((lsp_token_is_char(token, '=') || is_case) && candidate) {
+			text = lsp_token_string(candidate, "text");
+			if (text && lsp_definition_label_matches(text, member_name)) {
+				name_offset = (size_t) lsp_token_long(candidate, "offset", 0);
+				lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(text), return_value);
+
+				return true;
+			}
+			candidate = NULL;
+		}
+	}
+
+	/* Bodyless enum case (`case Hearts;`) ends at the terminator. */
+	if (is_case && candidate) {
+		text = lsp_token_string(candidate, "text");
+		if (text && lsp_definition_label_matches(text, member_name)) {
+			name_offset = (size_t) lsp_token_long(candidate, "offset", 0);
+			lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(text), return_value);
+
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static inline bool lsp_static_member_definition_in_contents(zend_string *path, zend_string *contents, zend_string *member_name, bool public_only, zval *return_value, zend_string **parent_class)
 {
 	zend_long body_depth = 0;
@@ -296,13 +377,34 @@ static inline bool lsp_static_member_definition_in_contents(zend_string *path, z
 			continue;
 		}
 
-		static_member = lsp_definition_member_is_static(tokens, i, contents, body_depth);
-		if (!static_member) {
+		/* Class constants and enum cases resolve through :: regardless of
+		 * staticness. */
+		if (lsp_token_name_equals(token, "T_CONST") || lsp_token_name_equals(token, "T_CASE")) {
+			visibility = lsp_definition_member_visibility(tokens, i, contents, body_depth);
+			if (!lsp_definition_static_visibility_allows(visibility, public_only)) {
+				continue;
+			}
+
+			if (lsp_definition_constant_name_location(path, contents, tokens, i, count, member_name, return_value)) {
+				zval_ptr_dtor(&tokens_zv);
+
+				return true;
+			}
+
 			continue;
 		}
 
+		static_member = lsp_definition_member_is_static(tokens, i, contents, body_depth);
+
 		visibility = lsp_definition_member_visibility(tokens, i, contents, body_depth);
 		if (!lsp_definition_static_visibility_allows(visibility, public_only)) {
+			continue;
+		}
+
+		/* parent::/self::/static:: (public_only == false) legally target
+		 * instance METHODS as well; other receivers and all property
+		 * accesses require an actual static member. */
+		if (!static_member && (public_only || !lsp_token_name_equals(token, "T_FUNCTION"))) {
 			continue;
 		}
 
