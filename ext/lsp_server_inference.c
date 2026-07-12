@@ -1353,7 +1353,10 @@ static inline bool lsp_type_segment_is_fluent_this(const char *start, const char
 		start++;
 	}
 
+	/* `self` resolves to the declaring class; for fluent-chain purposes the
+	 * container class is the best approximation, same as static/$this. */
 	return ((size_t) (end - start) == sizeof("static") - 1 && strncasecmp(start, "static", sizeof("static") - 1) == 0) ||
+		((size_t) (end - start) == sizeof("self") - 1 && strncasecmp(start, "self", sizeof("self") - 1) == 0) ||
 		((size_t) (end - start) == sizeof("$this") - 1 && strncmp(start, "$this", sizeof("$this") - 1) == 0)
 	;
 }
@@ -1784,7 +1787,19 @@ static inline zend_string *lsp_infer_variable_container_type(lsp_server *server,
 		return type;
 	}
 
-	return lsp_infer_method_call_assignment_type(server, document, variable, offset);
+	type = lsp_infer_method_call_assignment_type(server, document, variable, offset);
+	if (type) {
+		return type;
+	}
+
+	/* Declared parameter types and `new X` assignments are how most chain
+	 * receivers outside $this get their type. */
+	type = lsp_parameter_declared_type_for_variable(document, variable, offset);
+	if (type) {
+		return type;
+	}
+
+	return lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
 }
 
 static inline zend_string *lsp_resolve_variable_method_return_class(lsp_server *server, lsp_document *document, zend_string *variable, zend_string *method_name, size_t offset)
