@@ -232,6 +232,7 @@ static inline void lsp_did_close(lsp_server *server, zval *params)
 	}
 
 	lsp_psalm_ls_document_close(server, uri);
+	lsp_server_evict_document_caches(server, uri);
 	zend_hash_del(&server->documents, uri);
 	lsp_publish_empty_diagnostics(uri);
 }

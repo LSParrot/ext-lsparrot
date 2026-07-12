@@ -413,6 +413,9 @@ extern zend_string *lsp_phpstan_type_for_expression(lsp_server *server, lsp_docu
 		zend_string_release(output);
 	}
 
+	/* One shadow copy is written per (version, offset) probe; without the
+	 * unlink they accumulate in the project for the whole session. */
+	VCWD_UNLINK(ZSTR_VAL(analysis_file));
 	zend_string_release(analysis_file);
 	zend_string_release(project_root);
 

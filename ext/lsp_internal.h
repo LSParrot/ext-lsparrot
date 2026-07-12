@@ -635,6 +635,7 @@ static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits
 }
 
 void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, zend_string *uri);
+void lsp_lsparrot_parse_to_zval_ex(zval *return_value, zend_string *code, zend_string *uri, bool include_tree);
 void lsp_lsparrot_tokens_to_zval(zval *return_value, zend_string *source);
 void lsp_tokens_cache_set_enabled(bool enabled);
 void lsp_server_run(zval *options);
@@ -743,6 +744,8 @@ zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type);
 
 bool lsp_text_is_word_boundary(zend_string *text, size_t offset);
 zend_long lsp_brace_depth_at(zend_string *text, size_t offset);
+void lsp_brace_cache_clear(void);
+void lsp_resolve_cache_clear(void);
 bool lsp_find_matching_brace(zend_string *text, size_t open_offset, size_t *close_offset);
 bool lsp_token_is_char(zval *token, char value);
 bool lsp_token_in_bounds(zval *token, size_t start, size_t end);
@@ -809,6 +812,7 @@ lsp_document *lsp_document_from_uri(lsp_server *server, zend_string *uri);
 void lsp_document_analyze(lsp_document *document);
 void lsp_document_derived_invalidate(lsp_document *document);
 void lsp_document_derived_ensure(lsp_document *document);
+void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri);
 zend_string *lsp_document_namespace_cached(lsp_document *document);
 bool lsp_document_has_import_cached(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
 bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);

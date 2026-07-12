@@ -1229,6 +1229,10 @@ static inline bool lsp_analyzer_completion_cache_or_schedule(lsp_server *server,
 		zend_hash_update(&server->completion_cache, key, &built_items);
 		lsp_append_cached_analyzer_completion_items(server, items, key);
 		built = true;
+	} else {
+		/* The builder array_inits its output unconditionally; discard it on
+		 * the not-built paths or every member completion leaks a hashtable. */
+		zval_ptr_dtor(&built_items);
 	}
 
 	zend_string_release(key);

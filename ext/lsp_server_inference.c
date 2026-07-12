@@ -20,21 +20,117 @@ extern bool lsp_text_is_word_boundary(zend_string *text, size_t offset)
 	return offset >= ZSTR_LEN(text) || !lsp_doc_is_identifier_char(value[offset]);
 }
 
-extern zend_long lsp_brace_depth_at(zend_string *text, size_t offset)
-{
-	const char *value = ZSTR_VAL(text);
-	zend_long depth = 0;
-	size_t i, length = offset > ZSTR_LEN(text) ? ZSTR_LEN(text) : offset;
+/* lsp_brace_depth_at used to rescan the document from offset zero on every
+ * call, and features call it once per token — O(tokens x file size) per
+ * request. Cache the brace events per text (keyed by string identity, the
+ * same scheme as the token cache) and answer with a binary search. */
+typedef struct _lsp_brace_event {
+	uint32_t position;
+	int32_t depth_after;
+} lsp_brace_event;
 
-	for (i = 0; i < length; i++) {
-		if (value[i] == '{') {
-			depth++;
-		} else if (value[i] == '}' && depth > 0) {
-			depth--;
+typedef struct _lsp_brace_cache_entry {
+	zend_string *text;
+	lsp_brace_event *events;
+	uint32_t count;
+} lsp_brace_cache_entry;
+
+#define LSP_BRACE_CACHE_SIZE 8
+
+static lsp_brace_cache_entry lsp_brace_cache[LSP_BRACE_CACHE_SIZE];
+static uint32_t lsp_brace_cache_next = 0;
+
+static inline lsp_brace_cache_entry *lsp_brace_cache_entry_for(zend_string *text)
+{
+	lsp_brace_cache_entry *slot;
+	const char *value = ZSTR_VAL(text);
+	lsp_brace_event *events;
+	int32_t depth = 0;
+	size_t i, length = ZSTR_LEN(text);
+	uint32_t count = 0, capacity;
+
+	for (i = 0; i < LSP_BRACE_CACHE_SIZE; i++) {
+		if (lsp_brace_cache[i].text == text) {
+			return &lsp_brace_cache[i];
 		}
 	}
 
-	return depth;
+	capacity = 64;
+	events = safe_emalloc(capacity, sizeof(lsp_brace_event), 0);
+	for (i = 0; i < length; i++) {
+		if (value[i] != '{' && value[i] != '}') {
+			continue;
+		}
+
+		if (value[i] == '{') {
+			depth++;
+		} else if (depth > 0) {
+			depth--;
+		} else {
+			/* Stray closer at depth zero: no depth change to record. */
+			continue;
+		}
+
+		if (count == capacity) {
+			capacity *= 2;
+			events = safe_erealloc(events, capacity, sizeof(lsp_brace_event), 0);
+		}
+
+		events[count].position = (uint32_t) i;
+		events[count].depth_after = depth;
+		count++;
+	}
+
+	slot = &lsp_brace_cache[lsp_brace_cache_next];
+	lsp_brace_cache_next = (lsp_brace_cache_next + 1) % LSP_BRACE_CACHE_SIZE;
+
+	if (slot->text) {
+		zend_string_release(slot->text);
+		efree(slot->events);
+	}
+
+	slot->text = zend_string_copy(text);
+	slot->events = events;
+	slot->count = count;
+
+	return slot;
+}
+
+extern void lsp_brace_cache_clear(void)
+{
+	uint32_t i;
+
+	for (i = 0; i < LSP_BRACE_CACHE_SIZE; i++) {
+		if (lsp_brace_cache[i].text) {
+			zend_string_release(lsp_brace_cache[i].text);
+			efree(lsp_brace_cache[i].events);
+			lsp_brace_cache[i].text = NULL;
+			lsp_brace_cache[i].events = NULL;
+			lsp_brace_cache[i].count = 0;
+		}
+	}
+
+	lsp_brace_cache_next = 0;
+}
+
+extern zend_long lsp_brace_depth_at(zend_string *text, size_t offset)
+{
+	const lsp_brace_cache_entry *entry = lsp_brace_cache_entry_for(text);
+	uint32_t lo = 0, hi = entry->count, mid;
+	size_t length = offset > ZSTR_LEN(text) ? ZSTR_LEN(text) : offset;
+
+	/* Find the number of events strictly before `length`; the depth after
+	 * the last such event is the depth at the offset. */
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		if ((size_t) entry->events[mid].position < length) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+
+	return lo == 0 ? 0 : (zend_long) entry->events[lo - 1].depth_after;
 }
 
 extern bool lsp_find_matching_brace(zend_string *text, size_t open_offset, size_t *close_offset)

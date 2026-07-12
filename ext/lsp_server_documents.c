@@ -15,6 +15,30 @@
 
 extern void lsp_document_analyze(lsp_document *document);
 
+/* Completion/type cache keys embed ":uri:version:"; entries for older
+ * versions can never hit again, so drop them when the document changes or
+ * closes instead of accumulating one stale entry per keystroke. */
+extern void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri)
+{
+	zend_string *key, *needle;
+
+	needle = strpprintf(0, ":%s:", ZSTR_VAL(uri));
+
+	ZEND_HASH_FOREACH_STR_KEY(&server->completion_cache, key) {
+		if (key && strstr(ZSTR_VAL(key), ZSTR_VAL(needle))) {
+			zend_hash_del(&server->completion_cache, key);
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	ZEND_HASH_FOREACH_STR_KEY(&server->type_cache, key) {
+		if (key && strstr(ZSTR_VAL(key), ZSTR_VAL(needle))) {
+			zend_hash_del(&server->type_cache, key);
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	zend_string_release(needle);
+}
+
 extern lsp_document *lsp_document_open_or_change(lsp_server *server, zend_string *uri, zend_long version, zend_string *text)
 {
 	lsp_document *document;
@@ -26,6 +50,7 @@ extern lsp_document *lsp_document_open_or_change(lsp_server *server, zend_string
 		document->text = zend_string_copy(text);
 		document->version = version;
 		lsp_document_analyze(document);
+		lsp_server_evict_document_caches(server, uri);
 
 		return document;
 	}
@@ -1020,7 +1045,7 @@ extern void lsp_document_analyze(lsp_document *document)
 	}
 
 	lsp_document_derived_invalidate(document);
-	lsp_lsparrot_parse_to_zval(&document->lsparrot, document->text, document->uri);
+	lsp_lsparrot_parse_to_zval_ex(&document->lsparrot, document->text, document->uri, false);
 }
 
 extern void lsp_document_derived_invalidate(lsp_document *document)

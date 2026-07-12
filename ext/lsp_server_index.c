@@ -724,22 +724,151 @@ static inline void lsp_scan_psr0_dir(lsp_server *server, zend_string *dir, uint3
 	lsp_dir_close(handle);
 }
 
+static inline void lsp_index_collect_class_like_kinds_in_ast(zend_ast *ast, zval *kinds)
+{
+	zend_ast_list *list;
+	zend_ast_decl *decl;
+	zend_string *key;
+	uint32_t i, count;
+
+	if (!ast) {
+		return;
+	}
+
+	if (zend_ast_is_list(ast)) {
+		list = zend_ast_get_list(ast);
+		for (i = 0; i < list->children; i++) {
+			lsp_index_collect_class_like_kinds_in_ast(list->child[i], kinds);
+		}
+
+		return;
+	}
+
+	if (ast->kind == ZEND_AST_CLASS) {
+		decl = (zend_ast_decl *) ast;
+		if ((decl->flags & ZEND_ACC_ANON_CLASS) == 0 && decl->name) {
+			key = zend_string_tolower(decl->name);
+			add_assoc_long_ex(kinds, ZSTR_VAL(key), ZSTR_LEN(key), (zend_long) lsp_ast_class_like_symbol_kind(decl));
+			zend_string_release(key);
+		}
+
+		return;
+	}
+
+	if (zend_ast_is_special(ast) || php_ver_abstract.ast_is_opaque_node(ast->kind)) {
+		return;
+	}
+
+	count = zend_ast_get_num_children(ast);
+	for (i = 0; i < count; i++) {
+		lsp_index_collect_class_like_kinds_in_ast(ast->child[i], kinds);
+	}
+}
+
+static inline void lsp_index_collect_class_like_kinds_from_tokens(zend_string *contents, zval *kinds)
+{
+	zend_string *label, *key;
+	zval tokens_zv, *token;
+	HashTable *tokens;
+	uint32_t i, count;
+
+	ZVAL_UNDEF(&tokens_zv);
+	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
+		if (!Z_ISUNDEF(tokens_zv)) {
+			zval_ptr_dtor(&tokens_zv);
+		}
+
+		return;
+	}
+
+	tokens = Z_ARRVAL(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY || !lsp_token_is_class_like(token)) {
+			continue;
+		}
+
+		label = lsp_next_string_token(tokens, i + 1);
+		if (!label) {
+			continue;
+		}
+
+		key = zend_string_tolower(label);
+		add_assoc_long_ex(kinds, ZSTR_VAL(key), ZSTR_LEN(key), (zend_long) lsp_class_like_symbol_kind_from_token(token));
+		zend_string_release(key);
+	}
+
+	zval_ptr_dtor(&tokens_zv);
+}
+
+/* Files declaring several classmap entries were previously re-read and
+ * re-compiled once PER ENTRY; parse each unique path once and answer the
+ * remaining entries from the memoized declaration map. */
+static inline char lsp_class_like_symbol_kind_for_file_memoized(HashTable *memo, zend_string *path, zend_string *fqcn)
+{
+	const char *label_value;
+	zend_arena *ast_arena;
+	zend_ast *ast;
+	zend_string *contents, *label;
+	zval *entry, kinds, *kind_zv;
+	size_t label_length;
+	char kind = LSP_SYMBOL_CLASS;
+
+	entry = zend_hash_find(memo, path);
+	if (!entry) {
+		array_init(&kinds);
+		contents = lsp_read_file(path);
+		if (contents != zend_empty_string) {
+			ast = lsp_compile_string_to_ast_silent(contents, path, &ast_arena);
+			if (ast) {
+				lsp_index_collect_class_like_kinds_in_ast(ast, &kinds);
+				lsp_compiled_ast_destroy(ast, ast_arena);
+			} else {
+				lsp_index_collect_class_like_kinds_from_tokens(contents, &kinds);
+			}
+			zend_string_release(contents);
+		}
+
+		entry = zend_hash_update(memo, path, &kinds);
+	}
+
+	label_value = lsp_basename_from_fqcn(ZSTR_VAL(fqcn), ZSTR_LEN(fqcn), &label_length);
+	label = zend_string_alloc(label_length, 0);
+	memcpy(ZSTR_VAL(label), label_value, label_length);
+	ZSTR_VAL(label)[label_length] = '\0';
+	zend_str_tolower(ZSTR_VAL(label), label_length);
+
+	kind_zv = entry && Z_TYPE_P(entry) == IS_ARRAY ? zend_hash_find(Z_ARRVAL_P(entry), label) : NULL;
+	if (kind_zv && Z_TYPE_P(kind_zv) == IS_LONG) {
+		kind = (char) Z_LVAL_P(kind_zv);
+	}
+
+	zend_string_release(label);
+
+	return kind;
+}
+
 static inline void lsp_index_classmap(lsp_server *server, zend_string *composer_dir)
 {
 	zend_string *classmap_path = lsp_join_path2(composer_dir, "autoload_classmap.php"), *class_name;
 	zval *path_zv, classmap;
+	HashTable file_kinds;
 
 	if (!lsp_include_array_file(classmap_path, &classmap)) {
 		zend_string_release(classmap_path);
 		return;
 	}
 
+	zend_hash_init(&file_kinds, 64, NULL, ZVAL_PTR_DTOR, 0);
 	ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(classmap), class_name, path_zv) {
 		if (!class_name || Z_TYPE_P(path_zv) != IS_STRING) {
 			continue;
 		}
-		lsp_symbol_index_add_symbol_kind(&server->symbol_index, lsp_class_like_symbol_kind_for_file(Z_STR_P(path_zv), class_name), class_name, Z_STR_P(path_zv));
+		lsp_symbol_index_add_symbol_kind(&server->symbol_index, lsp_class_like_symbol_kind_for_file_memoized(&file_kinds, Z_STR_P(path_zv), class_name), class_name, Z_STR_P(path_zv));
 	} ZEND_HASH_FOREACH_END();
+	zend_hash_destroy(&file_kinds);
 
 	zval_ptr_dtor(&classmap);
 	zend_string_release(classmap_path);

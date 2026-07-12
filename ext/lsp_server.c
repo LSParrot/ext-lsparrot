@@ -46,6 +46,8 @@ extern void lsp_server_run(zval *options)
 	lsp_tokens_cache_set_enabled(true);
 	lsp_server_loop(&server);
 	lsp_tokens_cache_set_enabled(false);
+	lsp_brace_cache_clear();
+	lsp_resolve_cache_clear();
 	lsp_transport_shutdown();
 	lsp_index_stop_worker(&server);
 	lsp_project_index_persist(&server);
