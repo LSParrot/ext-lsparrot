@@ -24,8 +24,8 @@ LSParrot\start_lsp(['analyzer' => 'lsparrot']);
 --EXPECTF--
 Content-Length: %d
 
-%A"jsonrpc":"2.0","id":1,"result"%A"semanticTokensProvider":{"legend":{"tokenTypes":["namespace","class"%A"full":true}%AContent-Length: %d
+%A"jsonrpc":"2.0","id":1,"result"%A"semanticTokensProvider":{"legend":{"tokenTypes":["namespace","class"%A"full":{"delta":true},"range":true}%AContent-Length: %d
 
-%A"jsonrpc":"2.0","id":2,"result":{"data":[1,0,5,9,0,0,6,3,1,0,1,4,6,9,0,0,7,8,9,0,0,9,3,5,0,1,8,2,7,0,0,5,1,12,0]}%AContent-Length: %d
+%A"jsonrpc":"2.0","id":2,"result":{"resultId":"%d","data":[1,0,5,9,0,0,6,3,1,8,1,4,6,9,0,0,7,8,9,0,0,9,3,5,8,1,8,2,7,0,0,5,1,12,0]}%AContent-Length: %d
 
 {"jsonrpc":"2.0","id":3,"result":null}

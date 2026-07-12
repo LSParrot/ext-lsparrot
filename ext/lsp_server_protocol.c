@@ -95,7 +95,14 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	array_init(&semantic_tokens);
 	lsp_semantic_token_legend(&legend);
 	add_assoc_zval(&semantic_tokens, "legend", &legend);
-	add_assoc_bool(&semantic_tokens, "full", true);
+	{
+		zval semantic_full;
+
+		array_init(&semantic_full);
+		add_assoc_bool(&semantic_full, "delta", true);
+		add_assoc_zval(&semantic_tokens, "full", &semantic_full);
+	}
+	add_assoc_bool(&semantic_tokens, "range", true);
 	add_assoc_zval(&capabilities, "semanticTokensProvider", &semantic_tokens);
 	array_init(&signature);
 	array_init(&signature_triggers);
@@ -958,6 +965,18 @@ static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zv
 
 	if (zend_string_equals_literal(method, "textDocument/foldingRange")) {
 		lsp_document_request_no_position(server, params, lsp_lsparrot_folding_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/semanticTokens/range")) {
+		lsp_document_request_params(server, params, lsp_lsparrot_semantic_tokens_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/semanticTokens/full/delta")) {
+		lsp_document_request_params(server, params, lsp_lsparrot_semantic_tokens_full_delta, return_value);
 
 		return true;
 	}
