@@ -212,23 +212,47 @@ typedef struct _lsp_runner_session {
 	zend_string *analyzer;
 	zend_string *project_root;
 	uint64_t jobs_completed;
+	double last_activity;
 	zend_long next_job_id;
+	/* Deferred type-query descriptors keyed by job id: interactive requests
+	 * stop waiting after a short budget, and the answer is collected here
+	 * later (lsp_runner_pump_pending) into the type cache. */
+	HashTable pending;
+	bool pending_initialized;
 } lsp_runner_session;
 
 static inline void lsp_runner_session_free(lsp_runner_session *session)
 {
+	zval *descriptor;
+	zend_string *analysis_file;
 	int status = 0;
 
 	if (lsp_process_id_valid(session->pipes.process)) {
 		lsp_pipe_close(&session->pipes.input);
 		lsp_pipe_close(&session->pipes.output);
 		lsp_pipe_close(&session->pipes.error);
+		/* A wedged runner (or an analyzer child it forked) may ignore
+		 * SIGTERM; never block the single-threaded request loop on it —
+		 * escalate to SIGKILL after a short grace period. */
 		lsp_process_terminate(session->pipes.process);
-		lsp_process_wait(session->pipes.process, &status);
+		if (!lsp_process_wait_timeout(session->pipes.process, &status, 2.0)) {
+			lsp_process_terminate_force(session->pipes.process);
+			lsp_process_wait_timeout(session->pipes.process, &status, 1.0);
+		}
 		lsp_process_close(session->pipes.process);
 	}
 
 	smart_str_free(&session->rx);
+
+	if (session->pending_initialized) {
+		ZEND_HASH_FOREACH_VAL(&session->pending, descriptor) {
+			analysis_file = lsp_array_string(descriptor, "analysisFile");
+			if (analysis_file) {
+				VCWD_UNLINK(ZSTR_VAL(analysis_file));
+			}
+		} ZEND_HASH_FOREACH_END();
+		zend_hash_destroy(&session->pending);
+	}
 
 	if (session->analyzer) {
 		zend_string_release(session->analyzer);
@@ -331,6 +355,8 @@ static inline lsp_runner_session *lsp_runner_session_start(const char *analyzer,
 	session->analyzer = zend_string_init(analyzer, strlen(analyzer), 0);
 	session->project_root = zend_string_copy(project_root);
 	session->next_job_id = 1;
+	zend_hash_init(&session->pending, 4, NULL, ZVAL_PTR_DTOR, 0);
+	session->pending_initialized = true;
 
 	return session;
 }
@@ -346,7 +372,10 @@ static inline lsp_runner_session *lsp_runner_session_ensure(lsp_server *server, 
 	if (existing) {
 		zend_string_release(key);
 
-		return (lsp_runner_session *) Z_PTR_P(existing);
+		session = (lsp_runner_session *) Z_PTR_P(existing);
+		session->last_activity = lsp_now_seconds();
+
+		return session;
 	}
 
 	session = lsp_runner_session_start(analyzer, project_root);
@@ -356,11 +385,61 @@ static inline lsp_runner_session *lsp_runner_session_ensure(lsp_server *server, 
 		return NULL;
 	}
 
+	session->last_activity = lsp_now_seconds();
 	ZVAL_PTR(&ptr, session);
 	zend_hash_update(&server->runner_sessions, key, &ptr);
 	zend_string_release(key);
 
 	return session;
+}
+
+/* Resident runners keep a booted PHP process per (analyzer, project) for
+ * interactive type queries. Long editing sessions touching many projects
+ * would otherwise accumulate processes forever; reap sessions that have been
+ * idle past the timeout and have nothing pending. */
+#define LSP_RUNNER_IDLE_TIMEOUT_SECONDS 300.0
+
+/* Forked index workers inherit every runner pipe fd; extra references keep
+ * the pipes open and delay EOF-based subprocess-exit detection in the
+ * parent. Children call this right after fork(). */
+extern void lsp_runner_close_pipes_in_child(lsp_server *server)
+{
+	lsp_runner_session *session;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(&server->runner_sessions, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		lsp_pipe_close(&session->pipes.input);
+		lsp_pipe_close(&session->pipes.output);
+		lsp_pipe_close(&session->pipes.error);
+	} ZEND_HASH_FOREACH_END();
+}
+
+extern void lsp_runner_reap_idle_sessions(lsp_server *server)
+{
+	lsp_runner_session *session;
+	zend_string *key;
+	zval *value;
+	double now = lsp_now_seconds();
+
+	ZEND_HASH_FOREACH_STR_KEY_VAL(&server->runner_sessions, key, value) {
+		if (!key || Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		if (session->pending_initialized && zend_hash_num_elements(&session->pending) > 0) {
+			continue;
+		}
+
+		if (session->last_activity > 0.0 && now - session->last_activity > LSP_RUNNER_IDLE_TIMEOUT_SECONDS) {
+			zend_hash_del(&server->runner_sessions, key);
+		}
+	} ZEND_HASH_FOREACH_END();
 }
 
 static inline void lsp_runner_session_drop(lsp_server *server, lsp_runner_session *session)
@@ -459,7 +538,28 @@ static inline bool lsp_runner_parse_frame(lsp_runner_session *session, zval *mes
 	return true;
 }
 
-static inline zend_string *lsp_runner_wait_response(lsp_runner_session *session, zend_long job_id, double timeout)
+/* A frame whose id is not the one being awaited belongs to a deferred type
+ * query; hand it to the analyzer layer and drop the pending record. */
+static inline void lsp_runner_resolve_pending_frame(lsp_server *server, lsp_runner_session *session, zval *message)
+{
+	zval *id_zv, *descriptor, *output_zv;
+
+	id_zv = zend_hash_str_find(Z_ARRVAL_P(message), "id", sizeof("id") - 1);
+	if (!id_zv || Z_TYPE_P(id_zv) != IS_LONG) {
+		return;
+	}
+
+	descriptor = zend_hash_index_find(&session->pending, (zend_ulong) Z_LVAL_P(id_zv));
+	if (!descriptor) {
+		return;
+	}
+
+	output_zv = zend_hash_str_find(Z_ARRVAL_P(message), "output", sizeof("output") - 1);
+	lsp_analyzer_deferred_type_completed(server, descriptor, output_zv && Z_TYPE_P(output_zv) == IS_STRING ? Z_STR_P(output_zv) : NULL);
+	zend_hash_index_del(&session->pending, (zend_ulong) Z_LVAL_P(id_zv));
+}
+
+static inline zend_string *lsp_runner_wait_response(lsp_server *server, lsp_runner_session *session, zend_long job_id, double timeout, bool *closed)
 {
 	smart_str discard = {0};
 	zend_string *output = NULL;
@@ -467,7 +567,7 @@ static inline zend_string *lsp_runner_wait_response(lsp_runner_session *session,
 	double deadline;
 	bool output_closed = false, error_closed = false, matched;
 
-	deadline = lsp_now_seconds() + (timeout > 0.0 ? timeout : 30.0) + 5.0;
+	deadline = lsp_now_seconds() + (timeout > 0.0 ? timeout : 30.0);
 
 	for (;;) {
 		lsp_pipe_read_available(session->pipes.output, &session->rx, &output_closed);
@@ -485,6 +585,8 @@ static inline zend_string *lsp_runner_wait_response(lsp_runner_session *session,
 				} else {
 					output = zend_empty_string;
 				}
+			} else {
+				lsp_runner_resolve_pending_frame(server, session, &message);
 			}
 
 			zval_ptr_dtor(&message);
@@ -495,6 +597,10 @@ static inline zend_string *lsp_runner_wait_response(lsp_runner_session *session,
 		}
 
 		if (output_closed || lsp_now_seconds() >= deadline) {
+			if (closed) {
+				*closed = output_closed;
+			}
+
 			return NULL;
 		}
 
@@ -572,7 +678,8 @@ extern zend_string *lsp_runner_run_capture(lsp_server *server, const char *analy
 	sent = lsp_pipe_write_all_timeout(session->pipes.input, ZSTR_VAL(frame), ZSTR_LEN(frame), 5.0);
 	zend_string_release(frame);
 
-	output = sent ? lsp_runner_wait_response(session, job_id, timeout) : NULL;
+	/* +5s grace so the runner's own timeout frame can still arrive. */
+	output = sent ? lsp_runner_wait_response(server, session, job_id, (timeout > 0.0 ? timeout : 30.0) + 5.0, NULL) : NULL;
 	if (!output) {
 		/* The runner is wedged or dead: drop the session and fall back to a
 		 * direct one-shot spawn so the request still completes. */
@@ -584,6 +691,137 @@ extern zend_string *lsp_runner_run_capture(lsp_server *server, const char *analy
 	session->jobs_completed++;
 
 	return output;
+}
+
+/* Interactive variant: waits only wait_timeout for the resident runner. When
+ * the answer is not ready in time, the job keeps running and `descriptor`
+ * (ownership transferred) is parked on the session; lsp_runner_pump_pending
+ * later routes the output to lsp_analyzer_deferred_type_completed. */
+extern zend_string *lsp_runner_run_capture_deferred(lsp_server *server, const char *analyzer, zend_string *project_root, lsp_command *command, zend_string *cwd, double wait_timeout, double job_timeout, zval *descriptor, bool *deferred)
+{
+	lsp_runner_session *session;
+	zend_string *job, *frame, *output;
+	zend_long job_id;
+	bool sent, closed = false;
+
+	*deferred = false;
+
+	if (!lsp_runner_command_can_use_project_runner(analyzer, project_root, command)) {
+		/* No resident runner for this command: a one-shot spawn cannot
+		 * outlive the request, so it gets the bounded interactive budget. */
+		return lsp_run_command_capture(command, cwd, wait_timeout);
+	}
+
+	session = lsp_runner_session_ensure(server, analyzer, project_root);
+	if (!session) {
+		return lsp_run_command_capture(command, cwd, wait_timeout);
+	}
+
+	job_id = session->next_job_id++;
+	job = lsp_runner_encode_job(job_id, command, cwd, job_timeout);
+	if (!job) {
+		return lsp_run_command_capture(command, cwd, wait_timeout);
+	}
+
+	frame = strpprintf(0, "Content-Length: %zu\r\n\r\n%s", ZSTR_LEN(job), ZSTR_VAL(job));
+	zend_string_release(job);
+	sent = lsp_pipe_write_all_timeout(session->pipes.input, ZSTR_VAL(frame), ZSTR_LEN(frame), 5.0);
+	zend_string_release(frame);
+
+	if (!sent) {
+		lsp_runner_session_drop(server, session);
+
+		return lsp_run_command_capture(command, cwd, wait_timeout);
+	}
+
+	output = lsp_runner_wait_response(server, session, job_id, wait_timeout, &closed);
+	if (output) {
+		session->jobs_completed++;
+
+		return output;
+	}
+
+	if (closed) {
+		lsp_runner_session_drop(server, session);
+
+		return lsp_run_command_capture(command, cwd, wait_timeout);
+	}
+
+	/* Timed out but the runner is alive: park the job and collect it later. */
+	zend_hash_index_update(&session->pending, (zend_ulong) job_id, descriptor);
+	*deferred = true;
+
+	return NULL;
+}
+
+extern void lsp_runner_pump_pending(lsp_server *server)
+{
+	lsp_runner_session *session;
+	smart_str discard = {0};
+	zval *value, message;
+	bool closed;
+
+	ZEND_HASH_FOREACH_VAL(&server->runner_sessions, value) {
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		if (!session || zend_hash_num_elements(&session->pending) == 0) {
+			continue;
+		}
+
+		closed = false;
+		lsp_pipe_read_available(session->pipes.output, &session->rx, &closed);
+		lsp_pipe_read_available(session->pipes.error, &discard, &closed);
+		smart_str_free(&discard);
+
+		while (lsp_runner_parse_frame(session, &message)) {
+			lsp_runner_resolve_pending_frame(server, session, &message);
+			zval_ptr_dtor(&message);
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
+extern uint32_t lsp_runner_pending_count(lsp_server *server)
+{
+	lsp_runner_session *session;
+	zval *value;
+	uint32_t count = 0;
+
+	ZEND_HASH_FOREACH_VAL(&server->runner_sessions, value) {
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		if (session) {
+			count += zend_hash_num_elements(&session->pending);
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return count;
+}
+
+extern bool lsp_runner_has_pending_for_uri(lsp_server *server, zend_string *uri)
+{
+	lsp_runner_session *session;
+	zend_string *pending_uri;
+	zval *value, *descriptor;
+	bool found = false;
+
+	ZEND_HASH_FOREACH_VAL(&server->runner_sessions, value) {
+		session = (lsp_runner_session *) Z_PTR_P(value);
+		if (!session) {
+			continue;
+		}
+
+		ZEND_HASH_FOREACH_VAL(&session->pending, descriptor) {
+			pending_uri = lsp_array_string(descriptor, "uri");
+			if (pending_uri && zend_string_equals(pending_uri, uri)) {
+				found = true;
+				break;
+			}
+		} ZEND_HASH_FOREACH_END();
+
+		if (found) {
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return found;
 }
 
 extern void lsp_runner_shutdown_all(lsp_server *server)
@@ -608,6 +846,16 @@ extern void lsp_runner_status(lsp_server *server, zval *target)
 		alive = lsp_process_id_valid(session->pipes.process) &&
 			!lsp_process_wait_nonblocking(session->pipes.process, &status)
 		;
+		if (!alive && lsp_process_id_valid(session->pipes.process)) {
+			/* The probe above reaped the runner, so its pid may be reused
+			 * by an unrelated process at any moment; forget it so teardown
+			 * cannot signal a stale id. */
+			lsp_pipe_close(&session->pipes.input);
+			lsp_pipe_close(&session->pipes.output);
+			lsp_pipe_close(&session->pipes.error);
+			lsp_process_close(session->pipes.process);
+			session->pipes.process = LSP_INVALID_PROCESS_ID;
+		}
 
 		array_init(&entry);
 		add_assoc_str(&entry, "analyzer", zend_string_copy(session->analyzer));

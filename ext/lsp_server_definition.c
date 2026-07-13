@@ -57,21 +57,29 @@ static inline void lsp_definition_location_from_offsets(zend_string *path, zend_
 	add_assoc_zval(location, "range", &range);
 }
 
-static inline bool lsp_method_definition_in_contents(zend_string *path, zend_string *contents, zend_string *member_name, zval *return_value, zend_string **parent_class)
+static inline bool lsp_method_definition_in_contents(zend_string *path, zend_string *contents, zend_string *class_name, zend_string *member_name, zval *return_value, zend_string **parent_class)
 {
 	zend_long body_depth = 0;
 	zend_string *label;
 	zval tokens_zv, *token, *name_token;
 	HashTable *tokens;
 	uint32_t i, count, name_index;
-	size_t class_start = 0, body_start = 0, body_end = 0, name_offset;
+	size_t class_start = 0, body_start = 0, body_end = 0, name_offset, promoted_param_start;
+	bool class_found;
 
 	*parent_class = NULL;
 
 	ZVAL_UNDEF(&tokens_zv);
 	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
 
-	if (Z_TYPE(tokens_zv) != IS_ARRAY || !lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth)) {
+	/* Files may declare several classes; scan the one actually targeted and
+	 * only fall back to the first class when the name cannot be matched. */
+	class_found = class_name && lsp_find_class_header_for_name(contents, class_name, &class_start, &body_start, &body_end, &body_depth);
+	if (!class_found) {
+		class_found = lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth);
+	}
+
+	if (Z_TYPE(tokens_zv) != IS_ARRAY || !class_found) {
 		if (!Z_ISUNDEF(tokens_zv)) {
 			zval_ptr_dtor(&tokens_zv);
 		}
@@ -87,7 +95,35 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 			continue;
 		}
 
-		if (!lsp_token_name_equals(token, "T_FUNCTION") || !lsp_token_at_depth(contents, token, body_depth)) {
+		if (!lsp_token_at_depth(contents, token, body_depth)) {
+			continue;
+		}
+
+		/* Property declarations (including constructor-promoted params). */
+		if (lsp_token_name_equals(token, "T_VARIABLE")) {
+			label = lsp_token_string(token, "text");
+			if (!label ||
+				ZSTR_LEN(label) != ZSTR_LEN(member_name) + 1 ||
+				ZSTR_VAL(label)[0] != '$' ||
+				memcmp(ZSTR_VAL(label) + 1, ZSTR_VAL(member_name), ZSTR_LEN(member_name)) != 0
+			) {
+				continue;
+			}
+
+			if (!lsp_token_is_property_declaration(tokens, i, contents, body_depth) &&
+				!lsp_token_is_promoted_property(tokens, i, contents, body_depth, &promoted_param_start)
+			) {
+				continue;
+			}
+
+			name_offset = (size_t) lsp_token_long(token, "offset", 0);
+			lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(label), return_value);
+			zval_ptr_dtor(&tokens_zv);
+
+			return true;
+		}
+
+		if (!lsp_token_name_equals(token, "T_FUNCTION")) {
 			continue;
 		}
 
@@ -110,9 +146,10 @@ static inline bool lsp_method_definition_in_contents(zend_string *path, zend_str
 	return false;
 }
 
-static inline bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth)
+extern bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth)
 {
 	zend_string *path, *contents, *parent_class;
+	zval traits, *trait_zv;
 	bool found;
 
 	if (depth > 64) {
@@ -132,9 +169,31 @@ static inline bool lsp_project_method_definition_for_class(lsp_server *server, z
 	}
 
 	parent_class = NULL;
-	found = lsp_method_definition_in_contents(path, contents, member_name, return_value, &parent_class);
+	found = lsp_method_definition_in_contents(path, contents, class_name, member_name, return_value, &parent_class);
+	if (found) {
+		zend_string_release(contents);
+		zend_string_release(path);
+		if (parent_class) {
+			zend_string_release(parent_class);
+		}
+
+		return true;
+	}
+
+	/* Methods brought in by traits declare in the trait's own file. */
+	lsp_collect_class_trait_names_for(contents, class_name, &traits);
 	zend_string_release(contents);
 	zend_string_release(path);
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
+		if (Z_TYPE_P(trait_zv) == IS_STRING &&
+			lsp_project_method_definition_for_class(server, Z_STR_P(trait_zv), member_name, return_value, depth + 1)
+		) {
+			found = true;
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+	zval_ptr_dtor(&traits);
+
 	if (found) {
 		if (parent_class) {
 			zend_string_release(parent_class);
@@ -264,7 +323,65 @@ static inline bool lsp_definition_label_matches(zend_string *label, zend_string 
 	;
 }
 
-static inline bool lsp_static_member_definition_in_contents(zend_string *path, zend_string *contents, zend_string *member_name, bool public_only, zval *return_value, zend_string **parent_class)
+/* Match `member_name` among the names declared by the `const`/`case`
+ * statement starting at token `index`; a const name is the T_STRING directly
+ * before '=', an enum case name the first T_STRING after `case`. */
+static inline bool lsp_definition_constant_name_location(zend_string *path, zend_string *contents, HashTable *tokens, uint32_t index, uint32_t count, zend_string *member_name, zval *return_value)
+{
+	zend_string *text;
+	zval *token, *candidate = NULL;
+	uint32_t j;
+	size_t name_offset;
+	bool is_case;
+
+	is_case = lsp_token_name_equals(zend_hash_index_find(tokens, index), "T_CASE");
+
+	for (j = index + 1; j < count; j++) {
+		token = zend_hash_index_find(tokens, j);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		if (lsp_token_is_char(token, ';') || lsp_token_is_char(token, '}')) {
+			break;
+		}
+
+		if (lsp_token_name_equals(token, "T_STRING")) {
+			if (is_case && candidate) {
+				/* Only the first name after `case` is the declaration. */
+				break;
+			}
+			candidate = token;
+			continue;
+		}
+
+		if ((lsp_token_is_char(token, '=') || is_case) && candidate) {
+			text = lsp_token_string(candidate, "text");
+			if (text && lsp_definition_label_matches(text, member_name)) {
+				name_offset = (size_t) lsp_token_long(candidate, "offset", 0);
+				lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(text), return_value);
+
+				return true;
+			}
+			candidate = NULL;
+		}
+	}
+
+	/* Bodyless enum case (`case Hearts;`) ends at the terminator. */
+	if (is_case && candidate) {
+		text = lsp_token_string(candidate, "text");
+		if (text && lsp_definition_label_matches(text, member_name)) {
+			name_offset = (size_t) lsp_token_long(candidate, "offset", 0);
+			lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(text), return_value);
+
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static inline bool lsp_static_member_definition_in_contents(zend_string *path, zend_string *contents, zend_string *class_name, zend_string *member_name, bool public_only, zval *return_value, zend_string **parent_class)
 {
 	zend_long body_depth = 0;
 	lsp_method_visibility visibility;
@@ -273,14 +390,20 @@ static inline bool lsp_static_member_definition_in_contents(zend_string *path, z
 	HashTable *tokens;
 	uint32_t i, count, name_index;
 	size_t class_start = 0, body_start = 0, body_end = 0, name_offset;
-	bool static_member;
+	bool static_member, class_found;
 
 	*parent_class = NULL;
 
 	ZVAL_UNDEF(&tokens_zv);
 	lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
 
-	if (Z_TYPE(tokens_zv) != IS_ARRAY || !lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth)) {
+	/* Same multi-class rule as lsp_method_definition_in_contents. */
+	class_found = class_name && lsp_find_class_header_for_name(contents, class_name, &class_start, &body_start, &body_end, &body_depth);
+	if (!class_found) {
+		class_found = lsp_find_first_class_header(contents, &class_start, &body_start, &body_end, &body_depth);
+	}
+
+	if (Z_TYPE(tokens_zv) != IS_ARRAY || !class_found) {
 		if (!Z_ISUNDEF(tokens_zv)) {
 			zval_ptr_dtor(&tokens_zv);
 		}
@@ -296,13 +419,34 @@ static inline bool lsp_static_member_definition_in_contents(zend_string *path, z
 			continue;
 		}
 
-		static_member = lsp_definition_member_is_static(tokens, i, contents, body_depth);
-		if (!static_member) {
+		/* Class constants and enum cases resolve through :: regardless of
+		 * staticness. */
+		if (lsp_token_name_equals(token, "T_CONST") || lsp_token_name_equals(token, "T_CASE")) {
+			visibility = lsp_definition_member_visibility(tokens, i, contents, body_depth);
+			if (!lsp_definition_static_visibility_allows(visibility, public_only)) {
+				continue;
+			}
+
+			if (lsp_definition_constant_name_location(path, contents, tokens, i, count, member_name, return_value)) {
+				zval_ptr_dtor(&tokens_zv);
+
+				return true;
+			}
+
 			continue;
 		}
 
+		static_member = lsp_definition_member_is_static(tokens, i, contents, body_depth);
+
 		visibility = lsp_definition_member_visibility(tokens, i, contents, body_depth);
 		if (!lsp_definition_static_visibility_allows(visibility, public_only)) {
+			continue;
+		}
+
+		/* parent::/self::/static:: (public_only == false) legally target
+		 * instance METHODS as well; other receivers and all property
+		 * accesses require an actual static member. */
+		if (!static_member && (public_only || !lsp_token_name_equals(token, "T_FUNCTION"))) {
 			continue;
 		}
 
@@ -364,7 +508,7 @@ static inline bool lsp_project_static_member_definition_for_class(lsp_server *se
 	}
 
 	parent_class = NULL;
-	found = lsp_static_member_definition_in_contents(path, contents, member_name, public_only, return_value, &parent_class);
+	found = lsp_static_member_definition_in_contents(path, contents, class_name, member_name, public_only, return_value, &parent_class);
 	zend_string_release(contents);
 	zend_string_release(path);
 	if (found) {
@@ -420,7 +564,7 @@ static inline bool lsp_definition_word_bounds(zend_string *text, zend_string *wo
 	return true;
 }
 
-static inline bool lsp_static_member_receiver_class(lsp_document *document, size_t offset, zend_string *word, zend_string **class_name, bool *public_only)
+extern bool lsp_static_member_receiver_class(lsp_document *document, size_t offset, zend_string *word, zend_string **class_name, bool *public_only)
 {
 	const char *value;
 	zend_string *receiver, *resolved;
@@ -487,7 +631,7 @@ static inline bool lsp_static_member_receiver_class(lsp_document *document, size
 		return *class_name != NULL;
 	}
 
-	resolved = lsp_resolve_class_name(document->text, receiver);
+	resolved = lsp_resolve_class_name_at(document->text, receiver, offset);
 	if (resolved) {
 		zend_string_release(receiver);
 		*class_name = resolved;
@@ -791,7 +935,7 @@ static inline bool lsp_project_member_definition(lsp_server *server, lsp_documen
 	return found;
 }
 
-static inline zend_string *lsp_use_statement_class_name_at(zend_string *text, size_t offset)
+extern zend_string *lsp_use_statement_class_name_at(zend_string *text, size_t offset)
 {
 	const char *value = ZSTR_VAL(text), *statement_start, *statement_end, *p, *name_start, *name_end, *alias_keyword;
 	size_t start, end, length = ZSTR_LEN(text);
@@ -876,9 +1020,10 @@ static inline bool lsp_project_class_definition(lsp_server *server, zend_string 
 	zend_string *path, *contents, *label, *uri;
 	zval tokens_zv, *token, *name_token, range, start, end_range;
 	HashTable *tokens;
+	zend_long target_depth = 0;
 	uint32_t i, count, name_index;
-	size_t class_label_length, name_offset;
-	bool located = false;
+	size_t class_label_length, name_offset, target_class_start = 0, target_body_start = 0, target_body_end = 0;
+	bool located = false, have_target;
 
 	path = lsp_find_project_symbol_path(server, LSP_SYMBOL_CLASS, class_name);
 	if (!path) {
@@ -890,6 +1035,10 @@ static inline bool lsp_project_class_definition(lsp_server *server, zend_string 
 		class_label = lsp_basename_from_fqcn(ZSTR_VAL(class_name), ZSTR_LEN(class_name), &class_label_length);
 		ZVAL_UNDEF(&tokens_zv);
 		lsp_lsparrot_tokens_to_zval(&tokens_zv, contents);
+
+		/* Several classes in the file can share the short name across
+		 * namespaces; anchor on the header whose resolved FQCN matches. */
+		have_target = lsp_find_class_header_for_name(contents, class_name, &target_class_start, &target_body_start, &target_body_end, &target_depth);
 
 		if (Z_TYPE(tokens_zv) == IS_ARRAY) {
 			tokens = Z_ARRVAL(tokens_zv);
@@ -910,6 +1059,9 @@ static inline bool lsp_project_class_definition(lsp_server *server, zend_string 
 				 * cmd-hover in VSCode) show the declaration instead of a
 				 * single character at column zero. */
 				name_offset = (size_t) lsp_token_long(name_token, "offset", 0);
+				if (have_target && (name_offset < target_class_start || name_offset >= target_body_start)) {
+					continue;
+				}
 				lsp_definition_location_from_offsets(path, contents, name_offset, name_offset + ZSTR_LEN(label), return_value);
 				located = true;
 				break;
@@ -1088,6 +1240,48 @@ extern void lsp_lsparrot_code_lens(lsp_server *server, zval *return_value, lsp_d
 	}
 }
 
+/* textDocument/typeDefinition: for a variable, jump to the class of its
+ * inferred type; for anything else fall back to the class the word resolves
+ * to (which for class names matches plain definition). */
+extern void lsp_lsparrot_type_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
+{
+	zend_long line, character;
+	zend_string *word, *class_name;
+	size_t offset;
+
+	lsp_position_from_zval(position, &line, &character);
+	offset = lsp_offset_at(document->text, line, character);
+	word = lsp_word_at(document->text, offset);
+
+	if (ZSTR_LEN(word) == 0) {
+		zend_string_release(word);
+		ZVAL_NULL(return_value);
+
+		return;
+	}
+
+	if (ZSTR_VAL(word)[0] == '$') {
+		class_name = lsp_infer_receiver_class(server, document, word, offset);
+	} else {
+		class_name = lsp_resolve_class_name_at(document->text, word, offset);
+	}
+
+	zend_string_release(word);
+
+	if (!class_name) {
+		ZVAL_NULL(return_value);
+
+		return;
+	}
+
+	lsp_index_join_worker(server);
+	if (!lsp_project_class_definition(server, class_name, return_value)) {
+		ZVAL_NULL(return_value);
+	}
+
+	zend_string_release(class_name);
+}
+
 extern void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
 {
 	zend_long line, character, target_line;
@@ -1118,7 +1312,7 @@ extern void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_
 
 	class_name = lsp_use_statement_class_name_at(document->text, offset);
 	if (!class_name && ZSTR_LEN(word) > 0) {
-		class_name = lsp_resolve_class_name(document->text, word);
+		class_name = lsp_resolve_class_name_at(document->text, word, offset);
 	}
 
 	if (class_name) {

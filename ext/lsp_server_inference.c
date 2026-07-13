@@ -13,6 +13,8 @@
 
 #include "lsp_internal.h"
 
+static inline zend_string *lsp_infer_property_fetch_assignment_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset);
+
 extern bool lsp_text_is_word_boundary(zend_string *text, size_t offset)
 {
 	const char *value = ZSTR_VAL(text);
@@ -20,21 +22,117 @@ extern bool lsp_text_is_word_boundary(zend_string *text, size_t offset)
 	return offset >= ZSTR_LEN(text) || !lsp_doc_is_identifier_char(value[offset]);
 }
 
-extern zend_long lsp_brace_depth_at(zend_string *text, size_t offset)
-{
-	const char *value = ZSTR_VAL(text);
-	zend_long depth = 0;
-	size_t i, length = offset > ZSTR_LEN(text) ? ZSTR_LEN(text) : offset;
+/* lsp_brace_depth_at used to rescan the document from offset zero on every
+ * call, and features call it once per token — O(tokens x file size) per
+ * request. Cache the brace events per text (keyed by string identity, the
+ * same scheme as the token cache) and answer with a binary search. */
+typedef struct _lsp_brace_event {
+	uint32_t position;
+	int32_t depth_after;
+} lsp_brace_event;
 
-	for (i = 0; i < length; i++) {
-		if (value[i] == '{') {
-			depth++;
-		} else if (value[i] == '}' && depth > 0) {
-			depth--;
+typedef struct _lsp_brace_cache_entry {
+	zend_string *text;
+	lsp_brace_event *events;
+	uint32_t count;
+} lsp_brace_cache_entry;
+
+#define LSP_BRACE_CACHE_SIZE 8
+
+static lsp_brace_cache_entry lsp_brace_cache[LSP_BRACE_CACHE_SIZE];
+static uint32_t lsp_brace_cache_next = 0;
+
+static inline lsp_brace_cache_entry *lsp_brace_cache_entry_for(zend_string *text)
+{
+	lsp_brace_cache_entry *slot;
+	const char *value = ZSTR_VAL(text);
+	lsp_brace_event *events;
+	int32_t depth = 0;
+	size_t i, length = ZSTR_LEN(text);
+	uint32_t count = 0, capacity;
+
+	for (i = 0; i < LSP_BRACE_CACHE_SIZE; i++) {
+		if (lsp_brace_cache[i].text == text) {
+			return &lsp_brace_cache[i];
 		}
 	}
 
-	return depth;
+	capacity = 64;
+	events = safe_emalloc(capacity, sizeof(lsp_brace_event), 0);
+	for (i = 0; i < length; i++) {
+		if (value[i] != '{' && value[i] != '}') {
+			continue;
+		}
+
+		if (value[i] == '{') {
+			depth++;
+		} else if (depth > 0) {
+			depth--;
+		} else {
+			/* Stray closer at depth zero: no depth change to record. */
+			continue;
+		}
+
+		if (count == capacity) {
+			capacity *= 2;
+			events = safe_erealloc(events, capacity, sizeof(lsp_brace_event), 0);
+		}
+
+		events[count].position = (uint32_t) i;
+		events[count].depth_after = depth;
+		count++;
+	}
+
+	slot = &lsp_brace_cache[lsp_brace_cache_next];
+	lsp_brace_cache_next = (lsp_brace_cache_next + 1) % LSP_BRACE_CACHE_SIZE;
+
+	if (slot->text) {
+		zend_string_release(slot->text);
+		efree(slot->events);
+	}
+
+	slot->text = zend_string_copy(text);
+	slot->events = events;
+	slot->count = count;
+
+	return slot;
+}
+
+extern void lsp_brace_cache_clear(void)
+{
+	uint32_t i;
+
+	for (i = 0; i < LSP_BRACE_CACHE_SIZE; i++) {
+		if (lsp_brace_cache[i].text) {
+			zend_string_release(lsp_brace_cache[i].text);
+			efree(lsp_brace_cache[i].events);
+			lsp_brace_cache[i].text = NULL;
+			lsp_brace_cache[i].events = NULL;
+			lsp_brace_cache[i].count = 0;
+		}
+	}
+
+	lsp_brace_cache_next = 0;
+}
+
+extern zend_long lsp_brace_depth_at(zend_string *text, size_t offset)
+{
+	const lsp_brace_cache_entry *entry = lsp_brace_cache_entry_for(text);
+	uint32_t lo = 0, hi = entry->count, mid;
+	size_t length = offset > ZSTR_LEN(text) ? ZSTR_LEN(text) : offset;
+
+	/* Find the number of events strictly before `length`; the depth after
+	 * the last such event is the depth at the offset. */
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		if ((size_t) entry->events[mid].position < length) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+
+	return lo == 0 ? 0 : (zend_long) entry->events[lo - 1].depth_after;
 }
 
 extern bool lsp_find_matching_brace(zend_string *text, size_t open_offset, size_t *close_offset)
@@ -1076,7 +1174,6 @@ static inline zend_string *lsp_infer_method_call_assignment_declared_type(lsp_do
 static inline zend_string *lsp_infer_method_call_assignment_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
 {
 	zend_string *return_type, *class_name;
-	const char *slash;
 
 	return_type = lsp_infer_method_call_assignment_type(server, document, receiver, offset);
 
@@ -1084,8 +1181,10 @@ static inline zend_string *lsp_infer_method_call_assignment_class(lsp_server *se
 		return NULL;
 	}
 
-	slash = memchr(ZSTR_VAL(return_type), '\\', ZSTR_LEN(return_type));
-	class_name = slash ? zend_string_copy(return_type) : lsp_resolve_class_name(document->text, return_type);
+	/* Qualified return types still need import/namespace resolution: a
+	 * leading backslash must be stripped for index lookups and a relative
+	 * name such as Sub\Widget resolves against the declaring file. */
+	class_name = lsp_resolve_class_name(document->text, return_type);
 	zend_string_release(return_type);
 
 	return class_name;
@@ -1256,7 +1355,10 @@ static inline bool lsp_type_segment_is_fluent_this(const char *start, const char
 		start++;
 	}
 
+	/* `self` resolves to the declaring class; for fluent-chain purposes the
+	 * container class is the best approximation, same as static/$this. */
 	return ((size_t) (end - start) == sizeof("static") - 1 && strncasecmp(start, "static", sizeof("static") - 1) == 0) ||
+		((size_t) (end - start) == sizeof("self") - 1 && strncasecmp(start, "self", sizeof("self") - 1) == 0) ||
 		((size_t) (end - start) == sizeof("$this") - 1 && strncmp(start, "$this", sizeof("$this") - 1) == 0)
 	;
 }
@@ -1361,7 +1463,7 @@ static inline zend_string *lsp_project_method_return_type_recursive(lsp_server *
 		return NULL;
 	}
 
-	lsp_collect_class_trait_names(contents, &traits);
+	lsp_collect_class_trait_names_for(contents, class_name, &traits);
 
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
 		if (Z_TYPE_P(trait_zv) != IS_STRING) {
@@ -1687,7 +1789,19 @@ static inline zend_string *lsp_infer_variable_container_type(lsp_server *server,
 		return type;
 	}
 
-	return lsp_infer_method_call_assignment_type(server, document, variable, offset);
+	type = lsp_infer_method_call_assignment_type(server, document, variable, offset);
+	if (type) {
+		return type;
+	}
+
+	/* Declared parameter types and `new X` assignments are how most chain
+	 * receivers outside $this get their type. */
+	type = lsp_parameter_declared_type_for_variable(document, variable, offset);
+	if (type) {
+		return type;
+	}
+
+	return lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
 }
 
 static inline zend_string *lsp_resolve_variable_method_return_class(lsp_server *server, lsp_document *document, zend_string *variable, zend_string *method_name, size_t offset)
@@ -1819,13 +1933,210 @@ static inline zend_string *lsp_infer_method_array_access_assignment_class(lsp_se
 	return NULL;
 }
 
-static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
+/* `$x = $recv->method(...)`: resolve $recv's class and the method's return
+ * class. The $this-> variant is handled by the dedicated scanner; this covers
+ * every other variable receiver. */
+static inline zend_string *lsp_infer_external_call_assignment_class(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text), *end, *match, *q, *recv_start, *method_start, *p;
+	zend_string *receiver, *method_name, *resolved;
+
+	end = value + lsp_current_statement_scan_limit(document->text, offset);
+	p = value;
+	while (p < end) {
+		match = strstr(p, ZSTR_VAL(variable));
+		if (!match || match >= end) {
+			break;
+		}
+
+		p = match + 1;
+		if (match > value && (lsp_doc_is_identifier_char(match[-1]) || match[-1] == '$')) {
+			continue;
+		}
+
+		q = match + ZSTR_LEN(variable);
+		if (q < end && lsp_doc_is_identifier_char(*q)) {
+			continue;
+		}
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		if (q >= end || *q != '=' || (q + 1 < end && (q[1] == '=' || q[1] == '>'))) {
+			continue;
+		}
+
+		q++;
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		if (q >= end || *q != '$') {
+			continue;
+		}
+
+		recv_start = q;
+		q++;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+
+		receiver = zend_string_init(recv_start, (size_t) (q - recv_start), 0);
+		if (zend_string_equals_literal(receiver, "$this")) {
+			zend_string_release(receiver);
+			continue;
+		}
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		if (q + 1 >= end || q[0] != '-' || q[1] != '>') {
+			zend_string_release(receiver);
+			continue;
+		}
+
+		q += 2;
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+		method_start = q;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+		if (q == method_start || q >= end || *q != '(') {
+			zend_string_release(receiver);
+			continue;
+		}
+
+		method_name = zend_string_init(method_start, (size_t) (q - method_start), 0);
+		resolved = lsp_resolve_variable_method_return_class(server, document, receiver, method_name, offset);
+		zend_string_release(method_name);
+		zend_string_release(receiver);
+
+		if (resolved) {
+			return resolved;
+		}
+	}
+
+	return NULL;
+}
+
+/* `foreach ($container as $item)` / `as $key => $item`: infer $item's class
+ * from the container's array-ish type (`Foo[]`, `array<Foo>`, ...). */
+static inline zend_string *lsp_infer_foreach_element_class(lsp_server *server, lsp_document *document, zend_string *variable, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text);
+	zend_string *container, *container_type, *element_type, *resolved;
+	size_t limit, p, open, close, as_pos, bound_start, bound_end, container_end, depth, i;
+
+	limit = offset > ZSTR_LEN(document->text) ? ZSTR_LEN(document->text) : offset;
+	resolved = NULL;
+
+	for (p = 0; p + sizeof("foreach") - 1 < limit; p++) {
+		if (strncasecmp(value + p, "foreach", sizeof("foreach") - 1) != 0 ||
+			(p > 0 && lsp_doc_is_identifier_char(value[p - 1])) ||
+			lsp_doc_is_identifier_char(value[p + sizeof("foreach") - 1])
+		) {
+			continue;
+		}
+
+		open = p + sizeof("foreach") - 1;
+		while (open < limit && isspace((unsigned char) value[open])) {
+			open++;
+		}
+		if (open >= limit || value[open] != '(') {
+			continue;
+		}
+
+		depth = 1;
+		as_pos = 0;
+		close = 0;
+		for (i = open + 1; i < ZSTR_LEN(document->text); i++) {
+			if (value[i] == '(' || value[i] == '[') {
+				depth++;
+			} else if (value[i] == ')' || value[i] == ']') {
+				depth--;
+				if (depth == 0) {
+					close = i;
+					break;
+				}
+			} else if (depth == 1 &&
+				(value[i] == 'a' || value[i] == 'A') &&
+				i + 1 < ZSTR_LEN(document->text) &&
+				(value[i + 1] == 's' || value[i + 1] == 'S') &&
+				!lsp_doc_is_identifier_char(value[i - 1]) &&
+				(i + 2 >= ZSTR_LEN(document->text) || !lsp_doc_is_identifier_char(value[i + 2]))
+			) {
+				as_pos = i;
+			}
+		}
+
+		/* The hovered/completed use site must be past the foreach header. */
+		if (!close || !as_pos || limit <= close) {
+			continue;
+		}
+
+		/* Bound variable: the LAST $ident before ')' (covers `$k => $v`). */
+		bound_end = close;
+		while (bound_end > as_pos && isspace((unsigned char) value[bound_end - 1])) {
+			bound_end--;
+		}
+		bound_start = bound_end;
+		while (bound_start > as_pos && (lsp_doc_is_identifier_char(value[bound_start - 1]) || value[bound_start - 1] == '$')) {
+			bound_start--;
+		}
+		if (bound_end <= bound_start ||
+			value[bound_start] != '$' ||
+			bound_end - bound_start != ZSTR_LEN(variable) ||
+			memcmp(value + bound_start, ZSTR_VAL(variable), ZSTR_LEN(variable)) != 0
+		) {
+			continue;
+		}
+
+		container_end = as_pos;
+		while (container_end > open + 1 && isspace((unsigned char) value[container_end - 1])) {
+			container_end--;
+		}
+		i = open + 1;
+		while (i < container_end && isspace((unsigned char) value[i])) {
+			i++;
+		}
+		if (i >= container_end || value[i] != '$') {
+			continue;
+		}
+
+		container = zend_string_init(value + i, container_end - i, 0);
+		container_type = lsp_infer_variable_phpdoc_type(document, container, p);
+		if (!container_type) {
+			container_type = lsp_parameter_declared_type_for_variable(document, container, p);
+		}
+		zend_string_release(container);
+		if (!container_type) {
+			continue;
+		}
+
+		element_type = lsp_type_array_element_type(container_type);
+		zend_string_release(container_type);
+		if (!element_type) {
+			continue;
+		}
+
+		if (resolved) {
+			zend_string_release(resolved);
+		}
+		resolved = lsp_resolve_class_name(document->text, element_type);
+		zend_string_release(element_type);
+	}
+
+	return resolved;
+}
+
+extern zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
 {
 	zend_string *type, *class_name, *resolved;
 
 	type = lsp_phpdoc_type_for_word(document->text, receiver);
 	if (type) {
-		class_name = lsp_resolve_class_name(document->text, type);
+		class_name = lsp_resolve_class_name_at(document->text, type, offset);
 		zend_string_release(type);
 
 		if (class_name) {
@@ -1835,7 +2146,7 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 
 	type = lsp_phpdoc_property_type_for_word(document->text, receiver, offset);
 	if (type) {
-		class_name = lsp_resolve_class_name(document->text, type);
+		class_name = lsp_resolve_class_name_at(document->text, type, offset);
 		zend_string_release(type);
 
 		if (class_name) {
@@ -1845,16 +2156,21 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 
 	class_name = lsp_infer_new_assignment_class(document->text, receiver, offset);
 	if (class_name) {
+		/* Resolve imports and the current namespace before consulting
+		 * loaded classes, so `use App\DateTime; new DateTime()` does not
+		 * get shadowed by the builtin sharing the short name. */
+		resolved = lsp_resolve_class_name_at(document->text, class_name, offset);
+		if (resolved) {
+			zend_string_release(class_name);
+
+			return resolved;
+		}
+
 		if (zend_lookup_class(class_name)) {
 			return class_name;
 		}
 
-		resolved = lsp_resolve_class_name(document->text, class_name);
 		zend_string_release(class_name);
-
-		if (resolved) {
-			return resolved;
-		}
 	}
 
 	class_name = lsp_infer_method_array_access_assignment_class(server, document, receiver, offset);
@@ -1867,9 +2183,14 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 		return class_name;
 	}
 
+	class_name = lsp_infer_property_fetch_assignment_class(server, document, receiver, offset);
+	if (class_name) {
+		return class_name;
+	}
+
 	type = lsp_parameter_declared_type_for_variable(document, receiver, offset);
 	if (type) {
-		class_name = lsp_resolve_class_name(document->text, type);
+		class_name = lsp_resolve_class_name_at(document->text, type, offset);
 		zend_string_release(type);
 
 		if (class_name) {
@@ -1877,7 +2198,12 @@ static inline zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_docu
 		}
 	}
 
-	return NULL;
+	class_name = lsp_infer_external_call_assignment_class(server, document, receiver, offset);
+	if (class_name) {
+		return class_name;
+	}
+
+	return lsp_infer_foreach_element_class(server, document, receiver, offset);
 }
 
 static inline bool lsp_static_method_call_before_offset(lsp_document *document, size_t offset, zend_string **method_name, zend_string **class_name)
@@ -2331,6 +2657,55 @@ static inline zend_string *lsp_resolve_ast_property_group_declared_class(zend_st
 	return NULL;
 }
 
+static inline zend_string *lsp_resolve_ast_promoted_property_declared_class(zend_string *contents, zend_ast_decl *method, zend_string *property_name)
+{
+	zend_ast_list *params;
+	zend_ast *param;
+	zend_string *name, *type, *class_name;
+	uint32_t i;
+
+	if (!method->name ||
+		!zend_string_equals_literal_ci(method->name, "__construct") ||
+		!method->child[0] ||
+		!zend_ast_is_list(method->child[0])
+	) {
+		return NULL;
+	}
+
+	params = zend_ast_get_list(method->child[0]);
+	for (i = 0; i < params->children; i++) {
+		param = params->child[i];
+		if (!param || param->kind != ZEND_AST_PARAM || !param->child[0]) {
+			continue;
+		}
+
+		/* Only params carrying a visibility flag promote to properties. */
+		if ((param->attr & (ZEND_ACC_PUBLIC | ZEND_ACC_PROTECTED | ZEND_ACC_PRIVATE)) == 0) {
+			continue;
+		}
+
+		name = lsp_ast_string_value(param->child[1]);
+		if (!name ||
+			ZSTR_LEN(name) != ZSTR_LEN(property_name) ||
+			strncmp(ZSTR_VAL(name), ZSTR_VAL(property_name), ZSTR_LEN(name)) != 0
+		) {
+			continue;
+		}
+
+		type = lsp_inference_ast_type_string(param->child[0]);
+		if (!type) {
+			return NULL;
+		}
+
+		class_name = lsp_resolve_class_name(contents, type);
+		zend_string_release(type);
+
+		return class_name;
+	}
+
+	return NULL;
+}
+
 static inline zend_string *lsp_resolve_ast_declared_class_name(zend_string *contents, zend_string *raw_name)
 {
 	zend_string *namespace_name, *declared;
@@ -2392,6 +2767,20 @@ static inline zend_string *lsp_resolve_ast_class_property_declared_class(zend_st
 		}
 	}
 
+	/* Constructor-promoted properties (`__construct(private Repo $repo)`)
+	 * declare no PROP_GROUP; their type lives on the constructor param. */
+	for (i = 0; i < statements->children; i++) {
+		statement = statements->child[i];
+		if (!statement || statement->kind != ZEND_AST_METHOD) {
+			continue;
+		}
+
+		class_name = lsp_resolve_ast_promoted_property_declared_class(contents, (zend_ast_decl *) statement, property_name);
+		if (class_name) {
+			return class_name;
+		}
+	}
+
 	return NULL;
 }
 
@@ -2444,8 +2833,8 @@ static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_st
 	zval tokens_zv, *token;
 	HashTable *tokens;
 	uint32_t i, count;
-	size_t class_start = 0, body_start = 0, body_end = 0, token_offset;
-	bool property_matches;
+	size_t class_start = 0, body_start = 0, body_end = 0, token_offset, promoted_param_start;
+	bool property_matches, promoted;
 
 	ZVAL_UNDEF(&tokens_zv);
 	if (!lsp_find_class_header_for_name(contents, receiver_class, &class_start, &body_start, &body_end, &body_depth)) {
@@ -2465,10 +2854,20 @@ static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_st
 			Z_TYPE_P(token) != IS_ARRAY ||
 			!lsp_token_in_bounds(token, body_start, body_end) ||
 			!lsp_token_at_depth(contents, token, body_depth) ||
-			!lsp_token_name_equals(token, "T_VARIABLE") ||
-			!lsp_token_is_property_declaration(tokens, i, contents, body_depth)
+			!lsp_token_name_equals(token, "T_VARIABLE")
 		) {
 			continue;
+		}
+
+		promoted = false;
+		promoted_param_start = 0;
+		if (!lsp_token_is_property_declaration(tokens, i, contents, body_depth)) {
+			/* Constructor-promoted properties declare their type on the
+			 * __construct parameter. */
+			promoted = lsp_token_is_promoted_property(tokens, i, contents, body_depth, &promoted_param_start);
+			if (!promoted) {
+				continue;
+			}
 		}
 
 		variable = lsp_token_string(token, "text");
@@ -2482,7 +2881,10 @@ static inline zend_string *lsp_resolve_property_declared_class_in_tokens(zend_st
 		}
 
 		token_offset = (size_t) lsp_token_long(token, "offset", 0);
-		type = lsp_inference_property_type_before_variable_fallback(contents, token_offset);
+		type = promoted
+			? lsp_parameter_declared_type_before_variable(contents, token_offset, promoted_param_start)
+			: lsp_inference_property_type_before_variable_fallback(contents, token_offset)
+		;
 		if (!type) {
 			zval_ptr_dtor(&tokens_zv);
 
@@ -2552,6 +2954,108 @@ static inline zend_string *lsp_resolve_project_property_declared_class(lsp_serve
 
 	class_name = lsp_resolve_property_declared_class_in_text(contents, receiver_class, property_name);
 	zend_string_release(contents);
+
+	return class_name;
+}
+
+/* `$x = $this->prop;` / `$x = $other->prop;` — assignment from a bare
+ * property fetch. The property's declared (or promoted/constructor) type
+ * gives $x its class, matching what PhpStorm resolves instantly. Method-call
+ * assignments take the earlier lsp_infer_method_call_assignment_class path;
+ * this one requires the fetch NOT to be a call. */
+static inline zend_string *lsp_infer_property_fetch_assignment_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset)
+{
+	const char *value = ZSTR_VAL(document->text), *end = value + lsp_current_statement_scan_limit(document->text, offset),
+		*p = value, *match, *q, *recv_start, *recv_end, *prop_start, *prop_end;
+	zend_string *recv_variable, *receiver_class, *property_name, *class_name = NULL;
+
+	while (p < end) {
+		match = strstr(p, ZSTR_VAL(receiver));
+		if (!match || match >= end) {
+			break;
+		}
+
+		q = match + ZSTR_LEN(receiver);
+		if (lsp_doc_is_identifier_char(*q)) {
+			p = match + 1;
+			continue;
+		}
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+
+		if (q >= end || *q != '=' || (q + 1 < end && q[1] == '=')) {
+			p = match + 1;
+			continue;
+		}
+
+		q++;
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+
+		if (q >= end || *q != '$') {
+			p = match + 1;
+			continue;
+		}
+
+		recv_start = q++;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+		recv_end = q;
+
+		if (q + 2 >= end || q[0] != '-' || q[1] != '>') {
+			p = match + 1;
+			continue;
+		}
+
+		q += 2;
+		if (q >= end || !lsp_doc_is_identifier_start(*q)) {
+			p = match + 1;
+			continue;
+		}
+
+		prop_start = q++;
+		while (q < end && lsp_doc_is_identifier_char(*q)) {
+			q++;
+		}
+		prop_end = q;
+
+		while (q < end && isspace((unsigned char) *q)) {
+			q++;
+		}
+
+		/* A '(' means a method call; another '->' means a chain — both are
+		 * handled by other strategies. Only a terminated bare fetch counts. */
+		if (q >= end || *q != ';') {
+			p = match + 1;
+			continue;
+		}
+
+		recv_variable = zend_string_init(recv_start, recv_end - recv_start, 0);
+		if (zend_string_equals_literal(recv_variable, "$this")) {
+			receiver_class = lsp_inference_declared_class_name(document->text);
+		} else {
+			/* Scan limit shrinks to this assignment, so recursion always
+			 * terminates even for self-referential chains. */
+			receiver_class = lsp_infer_receiver_class(server, document, recv_variable, (size_t) (match - value));
+		}
+		zend_string_release(recv_variable);
+
+		if (receiver_class) {
+			property_name = zend_string_init(prop_start, prop_end - prop_start, 0);
+			if (class_name) {
+				zend_string_release(class_name);
+			}
+			class_name = lsp_resolve_project_property_declared_class(server, document, receiver_class, property_name);
+			zend_string_release(property_name);
+			zend_string_release(receiver_class);
+		}
+
+		p = match + 1;
+	}
 
 	return class_name;
 }
@@ -2975,12 +3479,22 @@ extern zend_string *lsp_infer_variable_type(lsp_server *server, lsp_document *do
 		return type;
 	}
 
+	type = lsp_infer_property_fetch_assignment_class(server, document, variable, offset);
+	if (type) {
+		return type;
+	}
+
 	type = lsp_infer_new_assignment_class(document->text, variable, lsp_current_statement_scan_limit(document->text, offset));
 	if (type) {
 		return type;
 	}
 
-	return NULL;
+	type = lsp_infer_external_call_assignment_class(server, document, variable, offset);
+	if (type) {
+		return type;
+	}
+
+	return lsp_infer_foreach_element_class(server, document, variable, offset);
 }
 
 extern zend_string *lsp_infer_variable_phpdoc_type(lsp_document *document, zend_string *variable, size_t offset)

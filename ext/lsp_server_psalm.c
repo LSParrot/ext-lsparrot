@@ -260,12 +260,39 @@ static inline zend_string *lsp_psalm_trace_type_from_decoded(zval *decoded, zend
 	return NULL;
 }
 
+extern zend_string *lsp_psalm_parse_type_output(zend_string *output, zend_string *expression, zend_long trace_line)
+{
+	zend_string *json, *type;
+	zval decoded;
+
+	if (!output || !expression) {
+		return NULL;
+	}
+
+	json = lsp_json_slice_from(output, '[');
+	ZVAL_UNDEF(&decoded);
+	php_json_decode_ex(&decoded, ZSTR_VAL(json), ZSTR_LEN(json), PHP_JSON_OBJECT_AS_ARRAY, 512);
+	zend_string_release(json);
+
+	type = NULL;
+	if (Z_TYPE(decoded) == IS_ARRAY) {
+		type = lsp_psalm_trace_type_from_decoded(&decoded, expression, trace_line);
+	}
+
+	if (!Z_ISUNDEF(decoded)) {
+		zval_ptr_dtor(&decoded);
+	}
+
+	return type;
+}
+
 extern zend_string *lsp_psalm_type_for_expression(lsp_server *server, lsp_document *document, zend_string *expression, size_t offset)
 {
 	lsp_command command;
 	zend_long trace_line, level;
-	zend_string *project_root, *analysis_file, *config, *generated_config, *output, *json, *type, *cache_key, *root_arg, *config_arg;
-	zval decoded, *cached, cache_value;
+	zend_string *project_root, *analysis_file, *config, *generated_config, *output, *type, *cache_key, *root_arg, *config_arg;
+	zval *cached, cache_value, descriptor;
+	bool deferred = false;
 
 	if (!server->psalm_enabled || !lsp_psalm_type_expression_safe(expression)) {
 		return NULL;
@@ -281,9 +308,15 @@ extern zend_string *lsp_psalm_type_for_expression(lsp_server *server, lsp_docume
 			return type;
 		}
 
-		zend_string_release(cache_key);
+		/* IS_DOUBLE marks a query still running in the background; retry
+		 * only once its deadline has passed. */
+		if (Z_TYPE_P(cached) != IS_DOUBLE || lsp_now_seconds() < Z_DVAL_P(cached)) {
+			zend_string_release(cache_key);
 
-		return NULL;
+			return NULL;
+		}
+
+		zend_hash_del(&server->type_cache, cache_key);
 	}
 
 	project_root = lsp_document_project_root(server, document);
@@ -349,28 +382,42 @@ extern zend_string *lsp_psalm_type_for_expression(lsp_server *server, lsp_docume
 		zend_string_release(config);
 	}
 
-	output = lsp_runner_run_capture(server, "psalm", project_root, &command, project_root, server->options.analyzer_diagnostics_timeout);
+	array_init(&descriptor);
+	add_assoc_string(&descriptor, "analyzer", "psalm");
+	add_assoc_str(&descriptor, "cacheKey", zend_string_copy(cache_key));
+	add_assoc_str(&descriptor, "analysisFile", zend_string_copy(analysis_file));
+	add_assoc_long(&descriptor, "markerLine", trace_line);
+	add_assoc_str(&descriptor, "expression", zend_string_copy(expression));
+	add_assoc_str(&descriptor, "uri", zend_string_copy(document->uri));
+
+	output = lsp_runner_run_capture_deferred(server, "psalm", project_root, &command, project_root,
+		server->options.analyzer_type_query_timeout, server->options.analyzer_diagnostics_timeout, &descriptor, &deferred);
 	lsp_command_destroy(&command);
-	json = lsp_json_slice_from(output, '[');
-	ZVAL_UNDEF(&decoded);
-	php_json_decode_ex(&decoded, ZSTR_VAL(json), ZSTR_LEN(json), PHP_JSON_OBJECT_AS_ARRAY, 512);
-	zend_string_release(json);
+	zend_string_release(project_root);
 
-	type = NULL;
-	if (Z_TYPE(decoded) == IS_ARRAY) {
-		type = lsp_psalm_trace_type_from_decoded(&decoded, expression, trace_line);
+	if (deferred) {
+		/* The runner keeps working; mark the key as in flight (retry after
+		 * the deadline) and let the pump fill the real value in. The shadow
+		 * file must survive until the background analysis finishes. */
+		ZVAL_DOUBLE(&cache_value, lsp_now_seconds() + server->options.analyzer_diagnostics_timeout + 10.0);
+		zend_hash_update(&server->type_cache, cache_key, &cache_value);
+		zend_string_release(cache_key);
+		zend_string_release(analysis_file);
+
+		return NULL;
 	}
 
-	if (!Z_ISUNDEF(decoded)) {
-		zval_ptr_dtor(&decoded);
-	}
+	zval_ptr_dtor(&descriptor);
 
-	if (output != zend_empty_string) {
+	type = lsp_psalm_parse_type_output(output, expression, trace_line);
+	if (output && output != zend_empty_string) {
 		zend_string_release(output);
 	}
 
+	/* One shadow copy is written per probe; without the unlink they
+	 * accumulate in the project for the whole session. */
+	VCWD_UNLINK(ZSTR_VAL(analysis_file));
 	zend_string_release(analysis_file);
-	zend_string_release(project_root);
 	if (lsp_type_is_unhelpful(type)) {
 		if (type) {
 			zend_string_release(type);
@@ -462,31 +509,35 @@ static inline bool lsp_start_psalm_project_analyzer(lsp_server *server, zend_str
 
 extern void lsp_start_pending_psalm_project_analyzer(lsp_server *server)
 {
-	zend_string *project_root = NULL, *candidate = NULL;
+	zend_string *project_root = NULL, *candidate;
 	zval *state_zv;
-	bool started = false;
+	zend_long capacity;
 
-	if (server->psalm_job.running) {
-		return;
+	/* Independent projects analyze concurrently up to the worker budget. */
+	capacity = lsp_analyzer_parallel_workers(server);
+	if (capacity < 1) {
+		capacity = 1;
 	}
 
-	ZEND_HASH_FOREACH_STR_KEY_VAL(&server->psalm_projects, project_root, state_zv) {
-		if (project_root && Z_TYPE_P(state_zv) == IS_LONG && Z_LVAL_P(state_zv) == LSP_ANALYZER_PROJECT_PENDING) {
-			candidate = zend_string_copy(project_root);
-			break;
+	while ((zend_long) lsp_analyzer_running_project_jobs(server) < capacity) {
+		candidate = NULL;
+		ZEND_HASH_FOREACH_STR_KEY_VAL(&server->psalm_projects, project_root, state_zv) {
+			if (project_root && Z_TYPE_P(state_zv) == IS_LONG && Z_LVAL_P(state_zv) == LSP_ANALYZER_PROJECT_PENDING) {
+				candidate = zend_string_copy(project_root);
+				break;
+			}
+		} ZEND_HASH_FOREACH_END();
+
+		if (!candidate) {
+			return;
 		}
-	} ZEND_HASH_FOREACH_END();
 
-	if (!candidate) {
-		return;
+		if (!lsp_start_psalm_project_analyzer(server, candidate)) {
+			zend_hash_del(&server->psalm_projects, candidate);
+		}
+
+		zend_string_release(candidate);
 	}
-
-	started = lsp_start_psalm_project_analyzer(server, candidate);
-	if (!started) {
-		zend_hash_del(&server->psalm_projects, candidate);
-	}
-
-	zend_string_release(candidate);
 }
 
 extern void lsp_schedule_psalm_project_analyzer(lsp_server *server, zend_string *project_root)
@@ -511,7 +562,7 @@ extern void lsp_append_psalm_cached_diagnostics(lsp_server *server, lsp_document
 {
 	zend_long line, severity;
 	zend_string *project_root, *output_file, *output, *json, *failure_message;
-	zval decoded, *file_zv, *issue_zv, *line_zv, *message_text_zv, *type_zv, *severity_zv, range;
+	zval decoded, *file_zv, *issue_zv, *line_zv, *message_text_zv, *type_zv, *severity_zv, *column_from_zv, *column_to_zv, range;
 
 	if (!server->psalm_enabled) {
 		return;
@@ -579,12 +630,22 @@ extern void lsp_append_psalm_cached_diagnostics(lsp_server *server, lsp_document
 		type_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "type", sizeof("type") - 1);
 
 		severity_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "severity", sizeof("severity") - 1);
-		if (severity_zv && Z_TYPE_P(severity_zv) == IS_STRING && zend_string_equals_literal(Z_STR_P(severity_zv), "info")) {
-			severity = 3;
+		if (severity_zv && Z_TYPE_P(severity_zv) == IS_STRING) {
+			if (zend_string_equals_literal(Z_STR_P(severity_zv), "info")) {
+				severity = 3;
+			} else if (zend_string_equals_literal(Z_STR_P(severity_zv), "error")) {
+				severity = 1;
+			}
 		}
 
+		column_from_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "column_from", sizeof("column_from") - 1);
+		column_to_zv = zend_hash_str_find(Z_ARRVAL_P(issue_zv), "column_to", sizeof("column_to") - 1);
+
 		line = line_zv && Z_TYPE_P(line_zv) == IS_LONG ? Z_LVAL_P(line_zv) : 1;
-		lsp_line_range(&range, document->text, line);
+		lsp_line_range_columns(&range, document->text, line,
+			column_from_zv && Z_TYPE_P(column_from_zv) == IS_LONG ? Z_LVAL_P(column_from_zv) : 0,
+			column_to_zv && Z_TYPE_P(column_to_zv) == IS_LONG ? Z_LVAL_P(column_to_zv) : 0
+		);
 		lsp_add_analyzer_diagnostic(diagnostics, "psalm", Z_STR_P(message_text_zv),
 			type_zv && Z_TYPE_P(type_zv) == IS_STRING ? Z_STR_P(type_zv) : NULL, &range, severity
 		);

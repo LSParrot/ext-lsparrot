@@ -111,7 +111,7 @@ static inline bool lsp_static_member_access_context(lsp_document *document, size
 		return true;
 	}
 
-	resolved = lsp_resolve_class_name(document->text, raw);
+	resolved = lsp_resolve_class_name_at(document->text, raw, offset);
 	if (resolved) {
 		zend_string_release(raw);
 		*class_name = resolved;
@@ -169,6 +169,7 @@ static inline bool lsp_add_static_member_completions(lsp_server *server, zval *i
 
 	if (parent_class_access) {
 		lsp_add_inherited_static_project_class_member_completions(server, items, class_name, member_prefix);
+		lsp_add_inherited_project_class_method_completions(server, items, class_name, member_prefix);
 		lsp_add_parent_reflection_class_member_completions(server, items, class_name, member_prefix);
 	} else {
 		lsp_add_static_project_class_member_completions(server, items, class_name, member_prefix);
@@ -366,10 +367,11 @@ static inline void lsp_add_return_type_builtin_completions(zval *items, zend_str
 static inline void lsp_add_current_document_class_like_completions(zval *items, lsp_document *document, HashTable *tokens, zend_string *prefix)
 {
 	zend_long kind;
-	zend_string *label, *detail;
+	zend_string *label, *detail, *namespace_name;
 	zval *token;
 	uint32_t i, count;
 
+	namespace_name = lsp_document_namespace_cached(document);
 	count = zend_hash_num_elements(tokens);
 	for (i = 0; i < count; i++) {
 		token = zend_hash_index_find(tokens, i);
@@ -387,7 +389,7 @@ static inline void lsp_add_current_document_class_like_completions(zval *items, 
 			lsp_token_name_equals(token, "T_INTERFACE") ? "interface" : (lsp_token_name_equals(token, "T_TRAIT") ? "trait" : (lsp_token_name_equals(token, "T_ENUM") ? "enum" : "class")),
 			ZSTR_VAL(label)
 		);
-		lsp_add_completion_item_ex(items, label, kind, detail, "lsparrot");
+		lsp_add_completion_item_qualified(items, label, kind, detail, namespace_name);
 		zend_string_release(detail);
 	}
 }
@@ -1228,6 +1230,10 @@ static inline bool lsp_analyzer_completion_cache_or_schedule(lsp_server *server,
 		zend_hash_update(&server->completion_cache, key, &built_items);
 		lsp_append_cached_analyzer_completion_items(server, items, key);
 		built = true;
+	} else {
+		/* The builder array_inits its output unconditionally; discard it on
+		 * the not-built paths or every member completion leaks a hashtable. */
+		zval_ptr_dtor(&built_items);
 	}
 
 	zend_string_release(key);
@@ -1418,7 +1424,7 @@ extern void lsp_lsparrot_completion(lsp_server *server, zval *return_value, lsp_
 			}
 		} else if (lsp_token_is_class_like(token)) {
 			label = lsp_next_string_token(tokens, i + 1);
-			kind = lsp_token_name_equals(token, "T_INTERFACE") ? 11 : (lsp_token_name_equals(token, "T_ENUM") ? 10 : 7);
+			kind = lsp_token_name_equals(token, "T_INTERFACE") ? 8 : (lsp_token_name_equals(token, "T_TRAIT") ? 9 : (lsp_token_name_equals(token, "T_ENUM") ? 13 : 7));
 			if (label) {
 				detail = strpprintf(0, "%s %s", lsp_token_name_equals(token, "T_INTERFACE") ? "interface" : (lsp_token_name_equals(token, "T_TRAIT") ? "trait" : (lsp_token_name_equals(token, "T_ENUM") ? "enum" : "class")), ZSTR_VAL(label));
 			}
@@ -1436,7 +1442,11 @@ extern void lsp_lsparrot_completion(lsp_server *server, zval *return_value, lsp_
 			continue;
 		}
 
-		lsp_add_completion_item(&items, label, kind, detail);
+		if (lsp_token_is_class_like(token)) {
+			lsp_add_completion_item_qualified(&items, label, kind, detail, lsp_document_namespace_cached(document));
+		} else {
+			lsp_add_completion_item(&items, label, kind, detail);
+		}
 		zend_string_release(detail);
 	}
 

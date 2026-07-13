@@ -111,6 +111,11 @@ typedef struct _lsp_document {
 	size_t derived_import_insert_offset;
 	bool derived_import_after_use;
 	bool derived_valid;
+	/* documentSymbol outline memoized per text revision: editors poll the
+	 * outline continuously (breadcrumbs, sticky scroll), and the token walk
+	 * costs ~20ms on large files. */
+	zval outline_cache;
+	zend_string *outline_cache_text;
 } lsp_document;
 
 typedef struct _lsp_dir {
@@ -130,12 +135,25 @@ typedef enum _lsp_psalm_transport {
 	LSP_PSALM_TRANSPORT_LANGUAGE_SERVER
 } lsp_psalm_transport;
 
+typedef enum _lsp_indent_style {
+	LSP_INDENT_STYLE_CLIENT = 0,
+	LSP_INDENT_STYLE_SPACE = 1,
+	LSP_INDENT_STYLE_TAB = 2,
+} lsp_indent_style;
+
 typedef struct _lsp_options {
 	size_t symbol_index_size;
 	zend_long worker_count;
 	zend_long phpstan_level;
 	zend_long psalm_level;
+	bool formatting_enabled;
+	bool formatting_reindent;
+	bool formatting_trim_trailing_whitespace;
+	bool formatting_insert_final_newline;
+	lsp_indent_style formatting_indent_style;
+	zend_long formatting_indent_size;
 	double analyzer_diagnostics_timeout;
+	double analyzer_type_query_timeout;
 	bool analyzer_auto;
 	bool analyzer_phpstan;
 	bool analyzer_psalm;
@@ -226,11 +244,15 @@ typedef struct _lsp_server {
 	HashTable psalm_ls_projects;
 	HashTable perf_stats;
 	HashTable runner_sessions;
+	HashTable workspace_roots;
 	zend_string *root;
 	lsp_options options;
 	lsp_symbol_index symbol_index;
-	lsp_analyzer_job phpstan_job;
-	lsp_analyzer_job psalm_job;
+	/* Project-wide diagnostics jobs keyed by project root: independent
+	 * Composer projects in a workspace analyze concurrently, bounded by
+	 * lsp_analyzer_parallel_workers. */
+	HashTable phpstan_jobs;
+	HashTable psalm_jobs;
 	lsp_analyzer_job phpstan_completion_job;
 	lsp_analyzer_job psalm_completion_job;
 	lsp_process_id index_worker_pid;
@@ -300,7 +322,13 @@ static inline void lsp_command_destroy(lsp_command *command)
 
 static inline zend_string *lsp_type_cache_key(const char *analyzer, lsp_document *document, zend_string *expression, size_t offset)
 {
-	return strpprintf(0, "%s:type:%s:" ZEND_LONG_FMT ":%zu:%s", analyzer, ZSTR_VAL(document->uri), document->version, offset, ZSTR_VAL(expression));
+	/* Deliberately no version/offset: an expression's analyzer type rarely
+	 * changes while typing on the same document, and version-scoped keys
+	 * meant a fresh analyzer run per keystroke. Entries are evicted on
+	 * didSave/didClose instead. */
+	(void) offset;
+
+	return strpprintf(0, "%s:type:%s:%s", analyzer, ZSTR_VAL(document->uri), ZSTR_VAL(expression));
 }
 
 static inline bool lsp_type_is_unhelpful(zend_string *type)
@@ -514,9 +542,13 @@ static inline zend_string *lsp_ast_string_value(zend_ast *ast)
 void lsp_lsparrot_tokens_to_zval(zval *return_value, zend_string *source);
 bool lsp_doc_is_identifier_char(char c);
 zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type);
+zend_string *lsp_resolve_class_name_at(zend_string *text, zend_string *type, size_t offset);
+zend_string *lsp_document_namespace_at(zend_string *text, size_t offset);
+zend_string *lsp_document_namespace_at_ex(zend_string *text, size_t offset, bool *multiple);
 bool lsp_token_in_bounds(zval *token, size_t start, size_t end);
 bool lsp_token_at_depth(zend_string *text, zval *token, zend_long depth);
 bool lsp_find_first_class_bounds(zend_string *text, size_t *body_start, size_t *body_end, zend_long *body_depth);
+bool lsp_find_class_header_for_name(zend_string *text, zend_string *class_name, size_t *class_start, size_t *body_start, size_t *body_end, zend_long *body_depth);
 
 static inline bool lsp_keyword_at_slice(const char *value, size_t start, size_t end, const char *keyword, size_t *keyword_end)
 {
@@ -549,7 +581,7 @@ static inline void lsp_add_resolved_trait_name(zval *traits, zend_string *text, 
 	}
 
 	raw = zend_string_init(name_start, name_end - name_start, 0);
-	resolved = lsp_resolve_class_name(text, raw);
+	resolved = lsp_resolve_class_name_at(text, raw, (size_t) (name_start - ZSTR_VAL(text)));
 	zend_string_release(raw);
 	if (resolved) {
 		add_next_index_str(traits, resolved);
@@ -580,24 +612,22 @@ static inline void lsp_collect_trait_names_from_use_slice(zval *traits, zend_str
 	}
 }
 
-static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits)
+/* Collects trait names used inside one specific class body. traits must
+ * already be initialized as an array; entries append to it. */
+static inline void lsp_collect_class_trait_names_in_bounds(zend_string *text, size_t body_start, size_t body_end, zend_long body_depth, zval *traits)
 {
 	const char *value, *slice_start, *slice_end;
-	zend_long body_depth, offset;
+	zend_long offset;
 	zval tokens_zv, *token;
 	HashTable *tokens;
 	uint32_t i, count;
-	size_t body_start, body_end, text_length;
+	size_t text_length;
 
-	array_init(traits);
 	value = ZSTR_VAL(text);
 	text_length = ZSTR_LEN(text);
-	body_start = 0;
-	body_end = 0;
-	body_depth = 0;
 	ZVAL_UNDEF(&tokens_zv);
 	lsp_lsparrot_tokens_to_zval(&tokens_zv, text);
-	if (Z_TYPE(tokens_zv) != IS_ARRAY || !lsp_find_first_class_bounds(text, &body_start, &body_end, &body_depth)) {
+	if (Z_TYPE(tokens_zv) != IS_ARRAY) {
 		if (!Z_ISUNDEF(tokens_zv)) {
 			zval_ptr_dtor(&tokens_zv);
 		}
@@ -634,7 +664,36 @@ static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits
 	zval_ptr_dtor(&tokens_zv);
 }
 
+/* Legacy shape: traits of the FIRST class in the file. Prefer the _for /
+ * _in_bounds variants — files can declare several classes. */
+static inline void lsp_collect_class_trait_names(zend_string *text, zval *traits)
+{
+	zend_long body_depth = 0;
+	size_t body_start = 0, body_end = 0;
+
+	array_init(traits);
+	if (lsp_find_first_class_bounds(text, &body_start, &body_end, &body_depth)) {
+		lsp_collect_class_trait_names_in_bounds(text, body_start, body_end, body_depth, traits);
+	}
+}
+
+/* Traits of the class declaring the given (fully qualified) name; falls back
+ * to the first class when the name cannot be matched. */
+static inline void lsp_collect_class_trait_names_for(zend_string *text, zend_string *class_name, zval *traits)
+{
+	zend_long body_depth = 0;
+	size_t class_start = 0, body_start = 0, body_end = 0;
+
+	array_init(traits);
+	if (lsp_find_class_header_for_name(text, class_name, &class_start, &body_start, &body_end, &body_depth) ||
+		lsp_find_first_class_bounds(text, &body_start, &body_end, &body_depth)
+	) {
+		lsp_collect_class_trait_names_in_bounds(text, body_start, body_end, body_depth, traits);
+	}
+}
+
 void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, zend_string *uri);
+void lsp_lsparrot_parse_to_zval_ex(zval *return_value, zend_string *code, zend_string *uri, bool include_tree);
 void lsp_lsparrot_tokens_to_zval(zval *return_value, zend_string *source);
 void lsp_tokens_cache_set_enabled(bool enabled);
 void lsp_server_run(zval *options);
@@ -666,6 +725,8 @@ void lsp_options_from_zval(lsp_options *options, zval *value);
 void lsp_options_destroy(lsp_options *options);
 void lsp_position_from_zval(zval *position, zend_long *line, zend_long *character);
 size_t lsp_offset_at(zend_string *text, zend_long line, zend_long character);
+size_t lsp_utf16_units_to_byte_offset(const char *value, size_t line_start, size_t length, zend_long character);
+zend_long lsp_byte_offset_to_utf16_units(const char *value, size_t line_start, size_t end_offset);
 zend_string *lsp_prefix_at(zend_string *text, size_t offset);
 zend_string *lsp_word_at(zend_string *text, size_t offset);
 bool lsp_matches_prefix_string(zend_string *label, zend_string *prefix);
@@ -684,6 +745,7 @@ zval *lsp_next_function_name_token_ex(HashTable *tokens, uint32_t start, uint32_
 void lsp_add_completion_item_ex(zval *items, zend_string *label, zend_long kind, zend_string *detail, const char *source);
 void lsp_add_variable_completion_item_ex(zval *items, zend_string *label, zend_string *detail, const char *source, zend_string *text, size_t start_offset, size_t end_offset);
 void lsp_add_completion_item(zval *items, zend_string *label, zend_long kind, zend_string *detail);
+void lsp_add_completion_item_qualified(zval *items, zend_string *label, zend_long kind, zend_string *detail, zend_string *namespace_name);
 void lsp_add_keyword_completion(zval *items, const char *keyword, zend_string *prefix);
 void lsp_deduplicate_completion_items(zval *items);
 bool lsp_completion_attach_items(zval *return_value, zval *items);
@@ -691,7 +753,7 @@ zend_long lsp_symbol_workspace_kind(char kind);
 void lsp_range_from_offsets(zend_string *text, size_t start_offset, size_t end_offset, zval *range);
 bool lsp_path_value_contains_vendor(const char *path, size_t path_length);
 zend_string *lsp_document_namespace(zend_string *text);
-bool lsp_symbol_in_current_namespace(zend_string *current_namespace, const char *fqcn, size_t fqcn_length);
+bool lsp_symbol_in_current_namespace(zend_string *current_namespace, char kind, const char *fqcn, size_t fqcn_length);
 bool lsp_document_has_import(zend_string *text, char kind, const char *fqcn);
 size_t lsp_import_insert_offset(zend_string *text, bool *after_existing_use);
 zend_string *lsp_symbol_import_text(char kind, const char *fqcn, bool compact);
@@ -740,6 +802,8 @@ zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type);
 
 bool lsp_text_is_word_boundary(zend_string *text, size_t offset);
 zend_long lsp_brace_depth_at(zend_string *text, size_t offset);
+void lsp_brace_cache_clear(void);
+void lsp_resolve_cache_clear(void);
 bool lsp_find_matching_brace(zend_string *text, size_t open_offset, size_t *close_offset);
 bool lsp_token_is_char(zval *token, char value);
 bool lsp_token_in_bounds(zval *token, size_t start, size_t end);
@@ -754,6 +818,7 @@ bool lsp_method_is_public(HashTable *tokens, uint32_t index, zend_string *text, 
 bool lsp_path_value_contains_analysis_helper(const char *path, size_t path_length);
 zend_string *lsp_find_project_symbol_path(lsp_server *server, char expected_kind, zend_string *fqcn);
 bool lsp_member_access_class_context(lsp_server *server, lsp_document *document, size_t offset, zend_string *prefix, zend_string **class_name, zend_string **member_prefix);
+zend_string *lsp_infer_receiver_class(lsp_server *server, lsp_document *document, zend_string *receiver, size_t offset);
 
 size_t lsp_method_signature_end(HashTable *tokens, uint32_t name_index, zend_string *text, zend_long body_depth);
 zend_string *lsp_function_signature_detail(zend_string *text, zval *name_token, HashTable *tokens, uint32_t name_index, zend_long body_depth, const char *prefix);
@@ -786,6 +851,37 @@ bool lsp_offset_is_inside_class_body(zend_string *text, size_t offset);
 void lsp_lsparrot_completion(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_hover(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_type_definition(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_folding_range(lsp_server *server, zval *return_value, lsp_document *document);
+void lsp_options_apply_runtime(lsp_options *options, zval *params);
+void lsp_lsparrot_prepare_call_hierarchy(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_call_hierarchy_incoming(lsp_server *server, zval *return_value, zval *params);
+void lsp_lsparrot_call_hierarchy_outgoing(lsp_server *server, zval *return_value, zval *params);
+void lsp_lsparrot_prepare_type_hierarchy(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
+void lsp_lsparrot_type_hierarchy_supertypes(lsp_server *server, zval *return_value, zval *params);
+void lsp_lsparrot_type_hierarchy_subtypes(lsp_server *server, zval *return_value, zval *params);
+void lsp_workspace_roots_add(lsp_server *server, zend_string *root);
+void lsp_workspace_roots_remove(lsp_server *server, zend_string *root);
+bool lsp_path_is_under_any_root(lsp_server *server, zend_string *path);
+void lsp_workspace_roots_each(lsp_server *server, void (*callback)(lsp_server *server, zend_string *root, void *context), void *context);
+void lsp_workspace_parse_folders(lsp_server *server, zval *params);
+void lsp_workspace_did_change_folders(lsp_server *server, zval *params);
+void lsp_lsparrot_will_rename_files(lsp_server *server, zval *return_value, zval *params);
+HashTable *lsp_analyzer_job_table(lsp_server *server, const char *analyzer);
+lsp_analyzer_job *lsp_analyzer_job_slot(lsp_server *server, const char *analyzer, zend_string *project_root);
+uint32_t lsp_analyzer_running_project_jobs(lsp_server *server);
+bool lsp_analyzer_job_table_running(HashTable *jobs);
+void lsp_analyzer_job_entry_destroy(zval *value);
+void lsp_reap_analyzer_job_table(lsp_server *server, HashTable *jobs, const char *analyzer);
+void lsp_lsparrot_semantic_tokens_range(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
+void lsp_lsparrot_semantic_tokens_full_delta(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
+void lsp_semantic_tokens_cache_clear(void);
+void lsp_semantic_tokens_cache_evict(zend_string *uri);
+void lsp_runner_reap_idle_sessions(lsp_server *server);
+void lsp_runner_close_pipes_in_child(lsp_server *server);
+void lsp_psalm_ls_close_pipes_in_child(lsp_server *server);
+void lsp_lsparrot_selection_range(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
+void lsp_lsparrot_document_link(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_lsparrot_code_lens(lsp_server *server, zval *return_value, lsp_document *document);
 void lsp_lsparrot_signature_help(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_references(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
@@ -795,7 +891,7 @@ void lsp_lsparrot_code_action(lsp_server *server, zval *return_value, lsp_docume
 void lsp_add_analyzer_quick_fixes(zval *actions, lsp_document *document, zval *params);
 void lsp_lsparrot_prepare_rename(lsp_server *server, zval *return_value, lsp_document *document, zval *position);
 void lsp_lsparrot_rename(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
-void lsp_lsparrot_formatting(lsp_server *server, zval *return_value, lsp_document *document);
+void lsp_lsparrot_formatting(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_range_formatting(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_inlay_hint(lsp_server *server, zval *return_value, lsp_document *document, zval *params);
 void lsp_lsparrot_semantic_tokens(lsp_server *server, zval *return_value, lsp_document *document);
@@ -806,8 +902,27 @@ lsp_document *lsp_document_from_uri(lsp_server *server, zend_string *uri);
 void lsp_document_analyze(lsp_document *document);
 void lsp_document_derived_invalidate(lsp_document *document);
 void lsp_document_derived_ensure(lsp_document *document);
+void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri, bool include_type_cache);
+void lsp_analyzer_deferred_type_completed(lsp_server *server, zval *descriptor, zend_string *output);
+zend_string *lsp_runner_run_capture_deferred(lsp_server *server, const char *analyzer, zend_string *project_root, lsp_command *command, zend_string *cwd, double wait_timeout, double job_timeout, zval *descriptor, bool *deferred);
+void lsp_runner_pump_pending(lsp_server *server);
+bool lsp_runner_has_pending_for_uri(lsp_server *server, zend_string *uri);
+uint32_t lsp_runner_pending_count(lsp_server *server);
+zend_string *lsp_phpstan_parse_type_output(zend_string *output, zend_string *analysis_file, zend_long dump_line);
+zend_string *lsp_psalm_parse_type_output(zend_string *output, zend_string *expression, zend_long trace_line);
 zend_string *lsp_document_namespace_cached(lsp_document *document);
 bool lsp_document_has_import_cached(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
+bool lsp_document_import_binds_short_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
+void lsp_add_inherited_project_class_method_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix);
+zend_string *lsp_parameter_declared_type_before_variable(zend_string *text, size_t variable_offset, size_t param_start);
+zend_string *lsp_inherited_member_detail(lsp_server *server, zend_string *class_name, zend_string *member);
+bool lsp_static_member_receiver_class(lsp_document *document, size_t offset, zend_string *word, zend_string **class_name, bool *public_only);
+bool lsp_project_method_definition_for_class(lsp_server *server, zend_string *class_name, zend_string *member_name, zval *return_value, uint32_t depth);
+bool lsp_find_function_scope_at(HashTable *tokens, zend_string *text, size_t offset, size_t *param_start, size_t *param_end, size_t *body_start, size_t *body_end, zend_long *body_depth);
+bool lsp_token_is_promoted_property(HashTable *tokens, uint32_t index, zend_string *text, zend_long body_depth, size_t *param_start);
+zend_string *lsp_document_import_bound_name(lsp_document *document, char kind, const char *fqcn, size_t fqcn_length);
+zend_string *lsp_document_import_fqcn_for_bound_name(lsp_document *document, char kind, zend_string *name);
+zend_string *lsp_use_statement_class_name_at(zend_string *text, size_t offset);
 size_t lsp_document_import_insert_offset_cached(lsp_document *document, bool *after_existing_use);
 void lsp_document_collect_imports(zend_string *text, HashTable *imports);
 void lsp_perf_stats_record(lsp_server *server, zend_string *method, double elapsed_seconds);
@@ -848,6 +963,9 @@ void lsp_process_wait(lsp_process_id process, int *status);
 void lsp_process_terminate(lsp_process_id process);
 void lsp_process_terminate_force(lsp_process_id process);
 void lsp_process_close(lsp_process_id process);
+void lsp_terminate_guard_install(void);
+void lsp_terminate_guard_restore(void);
+bool lsp_terminate_requested(void);
 void lsp_pipe_close(lsp_pipe_handle *pipe);
 bool lsp_pipe_write_all_timeout(lsp_pipe_handle pipe, const char *data, size_t length, double timeout);
 bool lsp_pipe_read_available(lsp_pipe_handle pipe, smart_str *output, bool *closed);
@@ -891,9 +1009,12 @@ void lsp_reschedule_psalm_project_analyzer(lsp_server *server, zend_string *proj
 bool lsp_scan_should_skip_dir_name(const char *name);
 zend_string *lsp_composer_config_string(zend_string *root, const char *key);
 zend_string *lsp_composer_vendor_dir(zend_string *project_root);
+zval *lsp_composer_json_decoded(zend_string *project_root);
+void lsp_composer_cache_clear(void);
 bool lsp_path_is_under_composer_vendor_dir(zend_string *path, zend_string *project_root);
 bool lsp_path_is_in_workspace_composer_vendor(zend_string *workspace_root, zend_string *path);
 void lsp_line_range(zval *range, zend_string *text, zend_long one_based_line);
+void lsp_line_range_columns(zval *range, zend_string *text, zend_long one_based_line, zend_long column_from, zend_long column_to);
 void lsp_publish_document_diagnostics(lsp_server *server, lsp_document *document);
 zend_string *lsp_document_project_root(lsp_server *server, lsp_document *document);
 zend_string *lsp_phpstan_type_for_expression(lsp_server *server, lsp_document *document, zend_string *expression, size_t offset);

@@ -2750,7 +2750,7 @@ extern zend_string *lsp_type_array_element_type(zend_string *type)
 	while (end > value && isspace((unsigned char) end[-1])) {
 		end--;
 	}
-	if (end - value > 2 && end[-1] == ']' && end[-2] == ']') {
+	if (end - value > 2 && end[-1] == ']' && end[-2] == '[') {
 		return lsp_string_trim_slice(value, end - 2);
 	}
 
@@ -3269,6 +3269,91 @@ static inline zend_string *lsp_resolve_imported_class_name(zend_string *text, ze
 	return lsp_resolve_imported_class_name_from_tokenized_text(text, type, type_segment_length, type_segment_end);
 }
 
+/* lsp_resolve_class_name re-parses the whole document to walk its use
+ * statements; features resolve many names per request against the same text,
+ * so memoize (text, base name) -> resolved FQCN with the same string-identity
+ * keying as the token cache. */
+#define LSP_RESOLVE_CACHE_SIZE 64
+
+typedef struct _lsp_resolve_cache_entry {
+	zend_string *text;
+	zend_string *base;
+	zend_string *resolved;
+} lsp_resolve_cache_entry;
+
+static lsp_resolve_cache_entry lsp_resolve_cache[LSP_RESOLVE_CACHE_SIZE];
+static uint32_t lsp_resolve_cache_next = 0;
+
+static inline bool lsp_resolve_cache_lookup(zend_string *text, zend_string *base, zend_string **resolved)
+{
+	uint32_t i;
+
+	for (i = 0; i < LSP_RESOLVE_CACHE_SIZE; i++) {
+		if (lsp_resolve_cache[i].text == text && lsp_resolve_cache[i].base && zend_string_equals(lsp_resolve_cache[i].base, base)) {
+			*resolved = zend_string_copy(lsp_resolve_cache[i].resolved);
+
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static inline void lsp_resolve_cache_store(zend_string *text, zend_string *base, zend_string *resolved)
+{
+	lsp_resolve_cache_entry *slot;
+
+	slot = &lsp_resolve_cache[lsp_resolve_cache_next];
+	lsp_resolve_cache_next = (lsp_resolve_cache_next + 1) % LSP_RESOLVE_CACHE_SIZE;
+
+	if (slot->text) {
+		zend_string_release(slot->text);
+		zend_string_release(slot->base);
+		zend_string_release(slot->resolved);
+	}
+
+	slot->text = zend_string_copy(text);
+	slot->base = zend_string_copy(base);
+	slot->resolved = zend_string_copy(resolved);
+}
+
+extern void lsp_resolve_cache_clear(void)
+{
+	uint32_t i;
+
+	for (i = 0; i < LSP_RESOLVE_CACHE_SIZE; i++) {
+		if (lsp_resolve_cache[i].text) {
+			zend_string_release(lsp_resolve_cache[i].text);
+			zend_string_release(lsp_resolve_cache[i].base);
+			zend_string_release(lsp_resolve_cache[i].resolved);
+			lsp_resolve_cache[i].text = NULL;
+			lsp_resolve_cache[i].base = NULL;
+			lsp_resolve_cache[i].resolved = NULL;
+		}
+	}
+
+	lsp_resolve_cache_next = 0;
+}
+
+static inline bool lsp_type_is_fully_qualified(zend_string *type)
+{
+	const char *p = ZSTR_VAL(type), *end = p + ZSTR_LEN(type);
+
+	while (p < end && isspace((unsigned char) *p)) {
+		p++;
+	}
+
+	while (p < end && (*p == '?' || *p == '(')) {
+		p++;
+	}
+
+	while (p < end && isspace((unsigned char) *p)) {
+		p++;
+	}
+
+	return p < end && *p == '\\';
+}
+
 extern zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type)
 {
 	zend_string *base = lsp_type_class_name(type), *resolved, *namespace_name;
@@ -3281,27 +3366,95 @@ extern zend_string *lsp_resolve_class_name(zend_string *text, zend_string *type)
 		return NULL;
 	}
 
-	if (zend_lookup_class(base)) {
+	/* Fully qualified names bypass import/namespace resolution entirely.
+	 * lsp_type_class_name strips the leading backslash, so the check has to
+	 * look at the raw type text. */
+	if (lsp_type_is_fully_qualified(type)) {
+		return base;
+	}
+
+	if (lsp_resolve_cache_lookup(text, base, &resolved)) {
+		zend_string_release(base);
+
+		return resolved;
+	}
+
+	/* Imports and the current namespace take precedence over globally loaded
+	 * classes: a builtin sharing the short name of an imported class (e.g.
+	 * `use App\Domain\Exception`) must not shadow the import. */
+	resolved = lsp_resolve_imported_class_name(text, base);
+	if (!resolved) {
+		namespace_name = lsp_document_namespace(text);
+		if (namespace_name != zend_empty_string) {
+			/* Unqualified names inside a namespace resolve to the current
+			 * namespace, matching PHP's own name resolution rules. */
+			resolved = strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(base));
+			zend_string_release(namespace_name);
+		} else {
+			resolved = zend_string_copy(base);
+		}
+	}
+
+	lsp_resolve_cache_store(text, base, resolved);
+	zend_string_release(base);
+
+	return resolved;
+}
+
+/* Offset-aware variant for files declaring several namespaces: unqualified
+ * names must resolve against the namespace governing the offset, not the
+ * file's first namespace. Single-namespace files (the overwhelmingly common
+ * case) delegate to the memoized lsp_resolve_class_name. Imports are still
+ * collected file-wide, an accepted approximation. */
+extern zend_string *lsp_resolve_class_name_at(zend_string *text, zend_string *type, size_t offset)
+{
+	zend_string *base, *resolved, *namespace_name;
+	bool multiple = false;
+
+	namespace_name = lsp_document_namespace_at_ex(text, offset, &multiple);
+	if (!multiple) {
+		if (namespace_name != zend_empty_string) {
+			zend_string_release(namespace_name);
+		}
+
+		return lsp_resolve_class_name(text, type);
+	}
+
+	base = lsp_type_class_name(type);
+	if (!base || lsp_type_is_builtin(base)) {
+		if (base) {
+			zend_string_release(base);
+		}
+		if (namespace_name != zend_empty_string) {
+			zend_string_release(namespace_name);
+		}
+
+		return NULL;
+	}
+
+	if (lsp_type_is_fully_qualified(type)) {
+		if (namespace_name != zend_empty_string) {
+			zend_string_release(namespace_name);
+		}
+
 		return base;
 	}
 
 	resolved = lsp_resolve_imported_class_name(text, base);
-	if (resolved) {
-		zend_string_release(base);
-
-		return resolved;
+	if (!resolved) {
+		if (namespace_name != zend_empty_string) {
+			resolved = strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(base));
+		} else {
+			resolved = zend_string_copy(base);
+		}
 	}
 
-	namespace_name = lsp_document_namespace(text);
 	if (namespace_name != zend_empty_string) {
-		resolved = strpprintf(0, "%s\\%s", ZSTR_VAL(namespace_name), ZSTR_VAL(base));
 		zend_string_release(namespace_name);
-		zend_string_release(base);
-
-		return resolved;
 	}
+	zend_string_release(base);
 
-	return base;
+	return resolved;
 }
 
 extern const char *lsp_primary_analyzer_source(lsp_server *server)
@@ -3323,12 +3476,12 @@ extern const char *lsp_primary_analyzer_source(lsp_server *server)
 
 extern bool lsp_doc_is_identifier_start(char c)
 {
-	return isalpha((unsigned char) c) || c == '_';
+	return isalpha((unsigned char) c) || c == '_' || (unsigned char) c >= 0x80;
 }
 
 extern bool lsp_doc_is_identifier_char(char c)
 {
-	return isalnum((unsigned char) c) || c == '_';
+	return isalnum((unsigned char) c) || c == '_' || (unsigned char) c >= 0x80;
 }
 
 extern char lsp_type_constraint_completion_kind(zend_string *text, size_t offset, zend_string *prefix)

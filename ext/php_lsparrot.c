@@ -95,6 +95,12 @@ static inline const char *lsp_token_name(int token)
 		case T_DNUMBER: return "T_DNUMBER";
 		case T_CONSTANT_ENCAPSED_STRING: return "T_CONSTANT_ENCAPSED_STRING";
 		case T_INLINE_HTML: return "T_INLINE_HTML";
+		case T_CASE: return "T_CASE";
+		case T_EXTENDS: return "T_EXTENDS";
+		case T_IMPLEMENTS: return "T_IMPLEMENTS";
+		case T_NEW: return "T_NEW";
+		case T_CURLY_OPEN: return "T_CURLY_OPEN";
+		case T_DOLLAR_OPEN_CURLY_BRACES: return "T_DOLLAR_OPEN_CURLY_BRACES";
 		default: return token < 256 ? "CHAR" : "UNKNOWN";
 	}
 }
@@ -434,7 +440,7 @@ static inline bool lsp_validate_analyzer_option(zval *value)
 	return false;
 }
 
-extern void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, zend_string *uri)
+extern void lsp_lsparrot_parse_to_zval_ex(zval *return_value, zend_string *code, zend_string *uri, bool include_tree)
 {
 	zend_arena *ast_arena = NULL;
 	zend_ast *ast = NULL;
@@ -452,8 +458,14 @@ extern void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, ze
 
 	lsp_lsparrot_tokens_to_zval(&tokens, code);
 	add_assoc_zval(return_value, "tokens", &tokens);
-	lsp_line_map_to_zval(&line_map, code);
-	add_assoc_zval(return_value, "lineMap", &line_map);
+
+	/* The LSP server only consumes "tokens" and "diagnostics"; materializing
+	 * the whole AST and line map as PHP arrays on every didChange would be
+	 * pure overhead, so they are reserved for the public lsparrot_parse(). */
+	if (include_tree) {
+		lsp_line_map_to_zval(&line_map, code);
+		add_assoc_zval(return_value, "lineMap", &line_map);
+	}
 
 	array_init(&diagnostics);
 
@@ -472,8 +484,10 @@ extern void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, ze
 	}
 
 	if (ast) {
-		lsp_ast_to_zval(&ast_zv, ast, 0);
-		add_assoc_zval(return_value, "ast", &ast_zv);
+		if (include_tree) {
+			lsp_ast_to_zval(&ast_zv, ast, 0);
+			add_assoc_zval(return_value, "ast", &ast_zv);
+		}
 		ok_zv = zend_hash_str_find(Z_ARRVAL_P(return_value), "ok", sizeof("ok") - 1);
 		if (ok_zv) {
 			ZVAL_TRUE(ok_zv);
@@ -482,11 +496,16 @@ extern void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, ze
 		if (ast_arena) {
 			zend_arena_destroy(ast_arena);
 		}
-	} else {
+	} else if (include_tree) {
 		add_assoc_null(return_value, "ast");
 	}
 
 	add_assoc_zval(return_value, "diagnostics", &diagnostics);
+}
+
+extern void lsp_lsparrot_parse_to_zval(zval *return_value, zend_string *code, zend_string *uri)
+{
+	lsp_lsparrot_parse_to_zval_ex(return_value, code, uri, true);
 }
 
 PHP_FUNCTION(LSParrot_lsparrot_parse)

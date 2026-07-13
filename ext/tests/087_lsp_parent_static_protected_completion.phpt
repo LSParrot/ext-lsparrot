@@ -1,5 +1,5 @@
 --TEST--
-LSP completes and resolves public and protected static parent members for parent::
+LSP completes and resolves public and protected parent members (static and instance) for parent::
 --EXTENSIONS--
 lsparrot
 --STDIN--
@@ -77,4 +77,4 @@ if (is_dir($root)) {
 }
 ?>
 --EXPECTREGEX--
-[\s\S]*"jsonrpc":"2\.0","id":2,"result"[\s\S]*"label":"publicStatic"[\s\S]*"label":"protectedStatic"[\s\S]*"label":"\$publicName"[\s\S]*"label":"\$protectedName"(?![\s\S]*"label":"privateStatic")(?![\s\S]*"label":"\$privateName")(?![\s\S]*"label":"instanceOnly")[\s\S]*"jsonrpc":"2\.0","id":3,"result"[\s\S]*"uri":"file:\/\/\/tmp\/lsp-parent-static-completion-test\/src\/Base\.php"[\s\S]*"line":13[\s\S]*\{"jsonrpc":"2\.0","id":4,"result":null\}
+[\s\S]*"jsonrpc":"2\.0","id":2,"result"[\s\S]*"label":"publicStatic"[\s\S]*"label":"protectedStatic"[\s\S]*"label":"\$publicName"[\s\S]*"label":"\$protectedName"[\s\S]*"label":"instanceOnly"(?![\s\S]*"label":"privateStatic")(?![\s\S]*"label":"\$privateName")[\s\S]*"jsonrpc":"2\.0","id":3,"result"[\s\S]*"uri":"file:\/\/\/tmp\/lsp-parent-static-completion-test\/src\/Base\.php"[\s\S]*"line":13[\s\S]*\{"jsonrpc":"2\.0","id":4,"result":null\}

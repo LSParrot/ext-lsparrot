@@ -29,6 +29,11 @@ extern void lsp_document_destroy(zval *value)
 		zval_ptr_dtor(&document->lsparrot);
 	}
 
+	if (document->outline_cache_text) {
+		zend_string_release(document->outline_cache_text);
+		zval_ptr_dtor(&document->outline_cache);
+	}
+
 	lsp_document_derived_invalidate(document);
 	efree(document);
 }
@@ -71,7 +76,10 @@ extern void lsp_analyzer_job_destroy(lsp_analyzer_job *job)
 	status = 0;
 	if (job->running && lsp_process_id_valid(job->pid)) {
 		lsp_process_terminate(job->pid);
-		lsp_process_wait(job->pid, &status);
+		if (!lsp_process_wait_timeout(job->pid, &status, 2.0)) {
+			lsp_process_terminate_force(job->pid);
+			lsp_process_wait_timeout(job->pid, &status, 2.0);
+		}
 	}
 
 	if (job->cache_file) {
@@ -90,12 +98,32 @@ static inline bool lsp_analyzer_job_matches_document(lsp_analyzer_job *job, lsp_
 	;
 }
 
+static inline bool lsp_analyzer_job_table_matches_document(HashTable *jobs, lsp_document *document)
+{
+	lsp_analyzer_job *job;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(jobs, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		job = (lsp_analyzer_job *) Z_PTR_P(value);
+		if (lsp_analyzer_job_matches_document(job, document)) {
+			return true;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return false;
+}
+
 extern bool lsp_analyzer_jobs_running_for_document(lsp_server *server, lsp_document *document)
 {
-	return lsp_analyzer_job_matches_document(&server->phpstan_job, document) ||
-		lsp_analyzer_job_matches_document(&server->psalm_job, document) ||
+	return lsp_analyzer_job_table_matches_document(&server->phpstan_jobs, document) ||
+		lsp_analyzer_job_table_matches_document(&server->psalm_jobs, document) ||
 		lsp_analyzer_job_matches_document(&server->phpstan_completion_job, document) ||
-		lsp_analyzer_job_matches_document(&server->psalm_completion_job, document)
+		lsp_analyzer_job_matches_document(&server->psalm_completion_job, document) ||
+		lsp_runner_has_pending_for_uri(server, document->uri)
 	;
 }
 
@@ -103,13 +131,7 @@ extern uint32_t lsp_active_process_count(lsp_server *server)
 {
 	uint32_t count = 0;
 
-	if (server->phpstan_job.running && lsp_process_id_valid(server->phpstan_job.pid)) {
-		count++;
-	}
-
-	if (server->psalm_job.running && lsp_process_id_valid(server->psalm_job.pid)) {
-		count++;
-	}
+	count += lsp_analyzer_running_project_jobs(server);
 
 	if (server->phpstan_completion_job.running && lsp_process_id_valid(server->phpstan_completion_job.pid)) {
 		count++;
@@ -218,10 +240,37 @@ extern zend_string *lsp_uri_to_path(zend_string *uri)
 	return zend_string_copy(uri);
 }
 
+/* Percent-encode every path byte a file URI cannot carry verbatim. Without
+ * this, paths containing spaces, '#' or non-ASCII produce invalid URIs that
+ * clients refuse to open or fail to match against their own buffers. */
+static inline zend_string *lsp_uri_encode_path(const char *value, size_t length)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	smart_str encoded = {0};
+	size_t i;
+	unsigned char c;
+
+	for (i = 0; i < length; i++) {
+		c = (unsigned char) value[i];
+		if (isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/') {
+			smart_str_appendc(&encoded, (char) c);
+		} else {
+			smart_str_appendc(&encoded, '%');
+			smart_str_appendc(&encoded, hex[c >> 4]);
+			smart_str_appendc(&encoded, hex[c & 0x0F]);
+		}
+	}
+
+	smart_str_0(&encoded);
+
+	return encoded.s ? encoded.s : ZSTR_EMPTY_ALLOC();
+}
+
 extern zend_string *lsp_uri_from_path(zend_string *path)
 {
+	zend_string *encoded, *uri;
 #if defined(_WIN32)
-	zend_string *uri_path, *uri;
+	zend_string *uri_path;
 	size_t i;
 
 	uri_path = zend_string_init(ZSTR_VAL(path), ZSTR_LEN(path), 0);
@@ -231,19 +280,28 @@ extern zend_string *lsp_uri_from_path(zend_string *path)
 		}
 	}
 
-	if (ZSTR_LEN(uri_path) >= 2 && lsp_is_path_separator(ZSTR_VAL(uri_path)[0]) && lsp_is_path_separator(ZSTR_VAL(uri_path)[1])) {
-		uri = strpprintf(0, "file:%s", ZSTR_VAL(uri_path));
-	} else if (ZSTR_LEN(uri_path) >= 2 && isalpha((unsigned char) ZSTR_VAL(uri_path)[0]) && ZSTR_VAL(uri_path)[1] == ':') {
-		uri = strpprintf(0, "file:///%s", ZSTR_VAL(uri_path));
+	if (ZSTR_LEN(uri_path) >= 2 && isalpha((unsigned char) ZSTR_VAL(uri_path)[0]) && ZSTR_VAL(uri_path)[1] == ':') {
+		encoded = lsp_uri_encode_path(ZSTR_VAL(uri_path) + 2, ZSTR_LEN(uri_path) - 2);
+		uri = strpprintf(0, "file:///%.2s%s", ZSTR_VAL(uri_path), ZSTR_VAL(encoded));
 	} else {
-		uri = strpprintf(0, "file://%s", ZSTR_VAL(uri_path));
+		encoded = lsp_uri_encode_path(ZSTR_VAL(uri_path), ZSTR_LEN(uri_path));
+		if (ZSTR_LEN(uri_path) >= 2 && lsp_is_path_separator(ZSTR_VAL(uri_path)[0]) && lsp_is_path_separator(ZSTR_VAL(uri_path)[1])) {
+			uri = strpprintf(0, "file:%s", ZSTR_VAL(encoded));
+		} else {
+			uri = strpprintf(0, "file://%s", ZSTR_VAL(encoded));
+		}
 	}
 
+	zend_string_release(encoded);
 	zend_string_release(uri_path);
 
 	return uri;
 #else
-	return strpprintf(0, "file://%s", ZSTR_VAL(path));
+	encoded = lsp_uri_encode_path(ZSTR_VAL(path), ZSTR_LEN(path));
+	uri = strpprintf(0, "file://%s", ZSTR_VAL(encoded));
+	zend_string_release(encoded);
+
+	return uri;
 #endif
 }
 
@@ -488,6 +546,38 @@ static inline void lsp_options_parse_psalm(lsp_options *options, zval *value)
 	options->psalm_max_response_wait_ms = wait_ms >= 0 ? wait_ms : options->psalm_max_response_wait_ms;
 }
 
+static inline void lsp_options_parse_formatting(lsp_options *options, zval *value)
+{
+	zend_string *style;
+	zend_long indent_size;
+
+	if (!value || Z_TYPE_P(value) != IS_ARRAY) {
+		return;
+	}
+
+	options->formatting_enabled = lsp_array_bool(value, "enabled", options->formatting_enabled);
+	options->formatting_reindent = lsp_array_bool(value, "reindent", options->formatting_reindent);
+	options->formatting_trim_trailing_whitespace = lsp_array_bool(value, "trimTrailingWhitespace", options->formatting_trim_trailing_whitespace);
+	options->formatting_insert_final_newline = lsp_array_bool(value, "insertFinalNewline", options->formatting_insert_final_newline);
+
+	/* 0 keeps following the client's tabSize per request. */
+	indent_size = lsp_array_long(value, "indentSize", options->formatting_indent_size);
+	if (indent_size >= 0 && indent_size <= 16) {
+		options->formatting_indent_size = indent_size;
+	}
+
+	style = lsp_array_string(value, "indentStyle");
+	if (style) {
+		if (zend_string_equals_literal_ci(style, "space") || zend_string_equals_literal_ci(style, "spaces")) {
+			options->formatting_indent_style = LSP_INDENT_STYLE_SPACE;
+		} else if (zend_string_equals_literal_ci(style, "tab") || zend_string_equals_literal_ci(style, "tabs")) {
+			options->formatting_indent_style = LSP_INDENT_STYLE_TAB;
+		} else if (zend_string_equals_literal_ci(style, "client")) {
+			options->formatting_indent_style = LSP_INDENT_STYLE_CLIENT;
+		}
+	}
+}
+
 extern void lsp_options_from_zval(lsp_options *options, zval *value)
 {
 	zend_long phpstan_level, psalm_level;
@@ -499,8 +589,15 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 	options->worker_count = 0;
 	options->phpstan_level = 6;
 	options->psalm_level = 6;
+	options->formatting_enabled = true;
+	options->formatting_reindent = true;
+	options->formatting_trim_trailing_whitespace = true;
+	options->formatting_insert_final_newline = true;
+	options->formatting_indent_style = LSP_INDENT_STYLE_CLIENT;
+	options->formatting_indent_size = 0;
 	options->memory_limit = zend_string_init("-1", sizeof("-1") - 1, 0);
 	options->analyzer_diagnostics_timeout = 60.0;
+	options->analyzer_type_query_timeout = 5.0;
 	options->analyzer_auto = true;
 	options->psalm_transport = LSP_PSALM_TRANSPORT_AUTO;
 	options->psalm_on_change = true;
@@ -549,7 +646,18 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 		if (options->analyzer_diagnostics_timeout < 0.0) {
 			options->analyzer_diagnostics_timeout = 60.0;
 		}
+
+		/* Interactive (completion/hover) type queries block the request
+		 * loop, so they get a much shorter budget than diagnostics; when
+		 * the resident runner is in use, a timed-out query keeps running
+		 * asynchronously and lands in the type cache. */
+		options->analyzer_type_query_timeout = lsp_array_double(workers, "analyzerTypeQueryTimeout", 5.0);
+		if (options->analyzer_type_query_timeout < 0.0) {
+			options->analyzer_type_query_timeout = 5.0;
+		}
 	}
+
+	lsp_options_parse_formatting(options, lsp_array_find(value, "formatting"));
 
 	phpstan = lsp_array_find(value, "phpstan");
 	lsp_options_parse_phpstan(options, phpstan);
@@ -557,6 +665,56 @@ extern void lsp_options_from_zval(lsp_options *options, zval *value)
 	psalm = lsp_array_find(value, "psalm");
 	lsp_options_parse_psalm_cli(options, psalm);
 	lsp_options_parse_psalm(options, psalm);
+}
+
+/* workspace/didChangeConfiguration: apply the live-safe option subset without
+ * a server restart. Structural options (symbol index size, worker fan-out,
+ * analyzer selection) stay fixed for the process lifetime. Accepts either
+ * the options at the top level of `settings` or nested under `lsparrot`. */
+extern void lsp_options_apply_runtime(lsp_options *options, zval *params)
+{
+	zval *settings, *scoped;
+	zend_string *memory_limit;
+	zend_long level;
+	double timeout;
+
+	settings = params ? lsp_array_find(params, "settings") : NULL;
+	if (!settings || Z_TYPE_P(settings) != IS_ARRAY) {
+		return;
+	}
+
+	scoped = lsp_array_find(settings, "lsparrot");
+	if (scoped && Z_TYPE_P(scoped) == IS_ARRAY) {
+		settings = scoped;
+	}
+
+	lsp_options_parse_formatting(options, lsp_array_find(settings, "formatting"));
+
+	level = lsp_array_long(settings, "phpstanLevel", options->phpstan_level);
+	if (level >= 0) {
+		options->phpstan_level = level;
+	}
+
+	level = lsp_array_long(settings, "psalmLevel", options->psalm_level);
+	if (level >= 0) {
+		options->psalm_level = level;
+	}
+
+	memory_limit = lsp_array_string(settings, "memoryLimit");
+	if (memory_limit && ZSTR_LEN(memory_limit) > 0) {
+		zend_string_release(options->memory_limit);
+		options->memory_limit = zend_string_copy(memory_limit);
+	}
+
+	timeout = lsp_array_double(settings, "analyzerDiagnosticsTimeout", options->analyzer_diagnostics_timeout);
+	if (timeout >= 0.0) {
+		options->analyzer_diagnostics_timeout = timeout;
+	}
+
+	timeout = lsp_array_double(settings, "analyzerTypeQueryTimeout", options->analyzer_type_query_timeout);
+	if (timeout >= 0.0) {
+		options->analyzer_type_query_timeout = timeout;
+	}
 }
 
 extern void lsp_options_destroy(lsp_options *options)
@@ -601,6 +759,78 @@ extern void lsp_position_from_zval(zval *position, zend_long *line, zend_long *c
 	}
 }
 
+/* LSP positions are UTF-16 code units (the protocol default encoding), while
+ * documents are stored as UTF-8 bytes. Incoming character offsets have to be
+ * widened to byte offsets and outgoing byte offsets narrowed back to UTF-16
+ * units, or every feature drifts on lines containing multibyte text. */
+extern size_t lsp_utf16_units_to_byte_offset(const char *value, size_t line_start, size_t length, zend_long character)
+{
+	size_t offset = line_start, step;
+	zend_long units = 0;
+	unsigned char lead;
+
+	while (offset < length && units < character) {
+		lead = (unsigned char) value[offset];
+		if (lead == '\n' || lead == '\r') {
+			break;
+		}
+
+		if (lead < 0x80) {
+			step = 1;
+			units += 1;
+		} else if ((lead & 0xE0) == 0xC0) {
+			step = 2;
+			units += 1;
+		} else if ((lead & 0xF0) == 0xE0) {
+			step = 3;
+			units += 1;
+		} else if ((lead & 0xF8) == 0xF0) {
+			/* Astral plane characters use a surrogate pair in UTF-16. */
+			step = 4;
+			units += 2;
+		} else {
+			step = 1;
+			units += 1;
+		}
+
+		offset += step;
+		if (offset > length) {
+			offset = length;
+		}
+	}
+
+	return offset;
+}
+
+extern zend_long lsp_byte_offset_to_utf16_units(const char *value, size_t line_start, size_t end_offset)
+{
+	size_t offset = line_start;
+	zend_long units = 0;
+	unsigned char lead;
+
+	while (offset < end_offset) {
+		lead = (unsigned char) value[offset];
+		if (lead < 0x80) {
+			offset += 1;
+			units += 1;
+		} else if ((lead & 0xE0) == 0xC0) {
+			offset += 2;
+			units += 1;
+		} else if ((lead & 0xF0) == 0xE0) {
+			offset += 3;
+			units += 1;
+		} else if ((lead & 0xF8) == 0xF0) {
+			offset += 4;
+			units += 2;
+		} else {
+			offset += 1;
+			units += 1;
+		}
+	}
+
+	return units;
+}
+
 extern size_t lsp_offset_at(zend_string *text, zend_long line, zend_long character)
 {
 	const char *value = ZSTR_VAL(text), *next;
@@ -616,18 +846,18 @@ extern size_t lsp_offset_at(zend_string *text, zend_long line, zend_long charact
 		offset = (size_t) (next - value) + 1;
 	}
 
-	if ((size_t) character > length - offset) {
-		return length;
-	}
-
-	return offset + (size_t) character;
+	/* Also clamps an overshooting character to the end of its line instead
+	 * of walking into later lines. */
+	return lsp_utf16_units_to_byte_offset(value, offset, length, character);
 }
 
 static inline bool lsp_is_word_char(char c)
 {
 	unsigned char ch = (unsigned char) c;
 
-	return isalnum(ch) || ch == '_' || ch == '$' || ch == '\\';
+	/* Bytes >= 0x80 are legal in PHP identifiers ([\x80-\xff] in the lexer
+	 * grammar), which is how non-ASCII variable and class names appear. */
+	return isalnum(ch) || ch == '_' || ch == '$' || ch == '\\' || ch >= 0x80;
 }
 
 extern zend_string *lsp_prefix_at(zend_string *text, size_t offset)

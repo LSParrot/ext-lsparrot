@@ -143,7 +143,7 @@ chmod($root . '/vendor/bin/phpstan', 0755);
 chmod($root . '/vendor/bin/psalm', 0755);
 LSParrot\start_lsp([
     'analyzer' => ['phpstan', 'psalm'],
-    'workers' => ['count' => 0, 'analyzerDiagnosticsTimeout' => 5],
+    'workers' => ['count' => 0, 'analyzerDiagnosticsTimeout' => 20, 'analyzerTypeQueryTimeout' => 20],
     'symbolIndex' => ['size' => '4M'],
 ]);
 ?>

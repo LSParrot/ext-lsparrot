@@ -216,6 +216,108 @@ static inline bool lsp_token_is_promoted_property_declaration(HashTable *tokens,
 	return lsp_promoted_property_constructor_param_start(tokens, index, text, body_depth, param_start);
 }
 
+extern bool lsp_token_is_promoted_property(HashTable *tokens, uint32_t index, zend_string *text, zend_long body_depth, size_t *param_start)
+{
+	return lsp_token_is_promoted_property_declaration(tokens, index, text, body_depth, param_start);
+}
+
+static inline zend_string *lsp_member_cache_entry_member_detail(zval *entry, zend_string *member)
+{
+	zend_string *label, *detail;
+	zval *collection, *item;
+	const char *keys[3] = { "properties", "methods", "constants" };
+	size_t key_index;
+
+	for (key_index = 0; key_index < 3; key_index++) {
+		collection = zend_hash_str_find(Z_ARRVAL_P(entry), keys[key_index], strlen(keys[key_index]));
+		if (!collection || Z_TYPE_P(collection) != IS_ARRAY) {
+			continue;
+		}
+
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(collection), item) {
+			label = lsp_array_string(item, "label");
+			if (!label || !zend_string_equals(label, member)) {
+				continue;
+			}
+
+			detail = lsp_array_string(item, "detail");
+			if (detail) {
+				return zend_string_copy(detail);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	return NULL;
+}
+
+static zend_string *lsp_inherited_member_detail_ex(lsp_server *server, zend_string *class_name, zend_string *member, HashTable *visited, uint32_t depth)
+{
+	zend_string *current, *next, *detail = NULL;
+	zval *entry, *parent, *traits, *trait_zv;
+
+	if (depth > 16) {
+		return NULL;
+	}
+
+	current = zend_string_copy(class_name);
+	while (current) {
+		if (zend_hash_exists(visited, current)) {
+			break;
+		}
+
+		zend_hash_add_empty_element(visited, current);
+		entry = lsp_class_member_cache_entry(server, current);
+		if (!entry || Z_TYPE_P(entry) != IS_ARRAY) {
+			break;
+		}
+
+		detail = lsp_member_cache_entry_member_detail(entry, member);
+		if (detail) {
+			break;
+		}
+
+		traits = zend_hash_str_find(Z_ARRVAL_P(entry), "traits", sizeof("traits") - 1);
+		if (traits && Z_TYPE_P(traits) == IS_ARRAY) {
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(traits), trait_zv) {
+				if (Z_TYPE_P(trait_zv) == IS_STRING) {
+					detail = lsp_inherited_member_detail_ex(server, Z_STR_P(trait_zv), member, visited, depth + 1);
+					if (detail) {
+						break;
+					}
+				}
+			} ZEND_HASH_FOREACH_END();
+		}
+		if (detail) {
+			break;
+		}
+
+		parent = zend_hash_str_find(Z_ARRVAL_P(entry), "parent", sizeof("parent") - 1);
+		next = parent && Z_TYPE_P(parent) == IS_STRING && Z_STRLEN_P(parent) > 0 ? zend_string_copy(Z_STR_P(parent)) : NULL;
+		zend_string_release(current);
+		current = next;
+	}
+
+	if (current) {
+		zend_string_release(current);
+	}
+
+	return detail;
+}
+
+/* Declaration detail (signature, property type, const/case) for a member of
+ * `class_name`, searching the ancestor chain and traits. */
+extern zend_string *lsp_inherited_member_detail(lsp_server *server, zend_string *class_name, zend_string *member)
+{
+	HashTable visited;
+	zend_string *detail;
+
+	zend_hash_init(&visited, 8, NULL, NULL, 0);
+	detail = lsp_inherited_member_detail_ex(server, class_name, member, &visited, 0);
+	zend_hash_destroy(&visited);
+
+	return detail;
+}
+
 static inline void lsp_cache_class_method(zval *methods, zend_string *label, zend_string *detail, bool is_static, lsp_method_visibility visibility)
 {
 	zval method;
@@ -226,6 +328,62 @@ static inline void lsp_cache_class_method(zval *methods, zend_string *label, zen
 	add_assoc_bool(&method, "static", is_static);
 	add_assoc_long(&method, "visibility", (zend_long) visibility);
 	add_next_index_zval(methods, &method);
+}
+
+static inline void lsp_cache_class_constant(zval *constants, zend_string *label, bool is_case, lsp_method_visibility visibility)
+{
+	zend_string *detail;
+	zval constant;
+
+	detail = strpprintf(0, "%s %s", is_case ? "case" : "const", ZSTR_VAL(label));
+	array_init(&constant);
+	add_assoc_str(&constant, "label", zend_string_copy(label));
+	add_assoc_str(&constant, "detail", detail);
+	add_assoc_bool(&constant, "case", is_case);
+	add_assoc_long(&constant, "visibility", (zend_long) visibility);
+	add_next_index_zval(constants, &constant);
+}
+
+/* Collect the names declared by a `const A = 1, B = 2;` statement (a name is
+ * the T_STRING immediately before '='), or by an `enum case Name`. */
+static inline void lsp_cache_class_constants_from(zval *constants, HashTable *tokens, uint32_t index, uint32_t count, bool is_case, lsp_method_visibility visibility)
+{
+	zend_string *last_name = NULL, *text;
+	zval *token;
+	uint32_t j;
+
+	for (j = index + 1; j < count; j++) {
+		token = zend_hash_index_find(tokens, j);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		if (lsp_token_is_char(token, ';') || lsp_token_is_char(token, '}')) {
+			if (is_case && last_name) {
+				lsp_cache_class_constant(constants, last_name, true, visibility);
+			}
+
+			return;
+		}
+
+		if (lsp_token_name_equals(token, "T_STRING")) {
+			text = lsp_token_string(token, "text");
+			if (text) {
+				last_name = text;
+			}
+			continue;
+		}
+
+		if (lsp_token_is_char(token, '=') && last_name) {
+			lsp_cache_class_constant(constants, last_name, is_case, visibility);
+			if (is_case) {
+				/* A backed case declares exactly one name; later T_STRINGs
+				 * belong to the value expression. */
+				return;
+			}
+			last_name = NULL;
+		}
+	}
 }
 
 static inline void lsp_cache_class_property(zval *properties, zend_string *label, zend_string *detail, bool is_static, lsp_method_visibility visibility)
@@ -262,6 +420,7 @@ static inline void lsp_add_cached_class_member_completions_ex(lsp_server *server
 
 			if (!label ||
 				!detail ||
+				zend_string_equals_literal(label, "__construct") ||
 				(public_only && visibility != (zend_long) LSP_METHOD_VISIBILITY_PUBLIC) ||
 				!lsp_matches_prefix_string(label, member_prefix)
 			) {
@@ -343,7 +502,7 @@ static inline void lsp_add_cached_static_class_member_completions_ex(lsp_server 
 	const char *source = lsp_primary_analyzer_source(server);
 	zend_long visibility;
 	zend_string *label, *detail, *static_label;
-	zval *methods, *method, *static_value, *properties, *property;
+	zval *methods, *method, *static_value, *properties, *property, *constants, *constant, *case_value;
 	bool property_static;
 
 	methods = zend_hash_str_find(Z_ARRVAL_P(entry), "methods", sizeof("methods") - 1);
@@ -374,38 +533,61 @@ static inline void lsp_add_cached_static_class_member_completions_ex(lsp_server 
 	}
 
 	properties = zend_hash_str_find(Z_ARRVAL_P(entry), "properties", sizeof("properties") - 1);
-	if (!properties || Z_TYPE_P(properties) != IS_ARRAY) {
-		return;
+	if (properties && Z_TYPE_P(properties) == IS_ARRAY) {
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(properties), property) {
+			if (Z_TYPE_P(property) != IS_ARRAY) {
+				continue;
+			}
+
+			static_value = zend_hash_str_find(Z_ARRVAL_P(property), "static", sizeof("static") - 1);
+			visibility = lsp_array_long(property, "visibility", (zend_long) LSP_METHOD_VISIBILITY_PUBLIC);
+			property_static = static_value && zend_is_true(static_value);
+			if (!property_static ||
+				visibility == (zend_long) LSP_METHOD_VISIBILITY_PRIVATE ||
+				(public_only && visibility != (zend_long) LSP_METHOD_VISIBILITY_PUBLIC)
+			) {
+				continue;
+			}
+
+			label = lsp_array_string(property, "label");
+			detail = lsp_array_string(property, "detail");
+			if (!label || !detail) {
+				continue;
+			}
+
+			static_label = strpprintf(0, "$%s", ZSTR_VAL(label));
+			if (lsp_matches_prefix_string(static_label, member_prefix)) {
+				lsp_add_completion_item_ex(items, static_label, 10, detail, source);
+			}
+
+			zend_string_release(static_label);
+		} ZEND_HASH_FOREACH_END();
 	}
 
-	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(properties), property) {
-		if (Z_TYPE_P(property) != IS_ARRAY) {
-			continue;
-		}
+	constants = zend_hash_str_find(Z_ARRVAL_P(entry), "constants", sizeof("constants") - 1);
+	if (constants && Z_TYPE_P(constants) == IS_ARRAY) {
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(constants), constant) {
+			if (Z_TYPE_P(constant) != IS_ARRAY) {
+				continue;
+			}
 
-		static_value = zend_hash_str_find(Z_ARRVAL_P(property), "static", sizeof("static") - 1);
-		visibility = lsp_array_long(property, "visibility", (zend_long) LSP_METHOD_VISIBILITY_PUBLIC);
-		property_static = static_value && zend_is_true(static_value);
-		if (!property_static ||
-			visibility == (zend_long) LSP_METHOD_VISIBILITY_PRIVATE ||
-			(public_only && visibility != (zend_long) LSP_METHOD_VISIBILITY_PUBLIC)
-		) {
-			continue;
-		}
+			visibility = lsp_array_long(constant, "visibility", (zend_long) LSP_METHOD_VISIBILITY_PUBLIC);
+			if (visibility == (zend_long) LSP_METHOD_VISIBILITY_PRIVATE ||
+				(public_only && visibility != (zend_long) LSP_METHOD_VISIBILITY_PUBLIC)
+			) {
+				continue;
+			}
 
-		label = lsp_array_string(property, "label");
-		detail = lsp_array_string(property, "detail");
-		if (!label || !detail) {
-			continue;
-		}
+			label = lsp_array_string(constant, "label");
+			detail = lsp_array_string(constant, "detail");
+			if (!label || !detail || !lsp_matches_prefix_string(label, member_prefix)) {
+				continue;
+			}
 
-		static_label = strpprintf(0, "$%s", ZSTR_VAL(label));
-		if (lsp_matches_prefix_string(static_label, member_prefix)) {
-			lsp_add_completion_item_ex(items, static_label, 10, detail, source);
-		}
-
-		zend_string_release(static_label);
-	} ZEND_HASH_FOREACH_END();
+			case_value = zend_hash_str_find(Z_ARRVAL_P(constant), "case", sizeof("case") - 1);
+			lsp_add_completion_item_ex(items, label, case_value && zend_is_true(case_value) ? 20 : 21, detail, source);
+		} ZEND_HASH_FOREACH_END();
+	}
 }
 
 static inline void lsp_add_cached_static_class_member_completions(lsp_server *server, zval *items, zval *entry, zend_string *member_prefix)
@@ -645,7 +827,7 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 	zend_long body_depth = 0;
 	zend_string *path, *contents, *label, *detail, *parent_class = NULL, *variable;
 	zend_stat_t st;
-	zval entry, methods, properties, traits, tokens_zv, *cached, *token, *name_token;
+	zval entry, methods, properties, traits, constants, tokens_zv, *cached, *token, *name_token;
 	HashTable *tokens;
 	uint32_t i, count, name_index;
 	size_t class_start = 0, body_start = 0, body_end = 0, promoted_param_start = 0;
@@ -674,6 +856,7 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 	array_init(&methods);
 	array_init(&properties);
 	array_init(&traits);
+	array_init(&constants);
 	ZVAL_UNDEF(&tokens_zv);
 
 	contents = document ? zend_string_copy(document->text) : lsp_read_file(path);
@@ -694,6 +877,14 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 				}
 
 				if (!lsp_token_name_equals(token, "T_FUNCTION") || !lsp_token_at_depth(contents, token, body_depth)) {
+					if ((lsp_token_name_equals(token, "T_CONST") || lsp_token_name_equals(token, "T_CASE")) && lsp_token_at_depth(contents, token, body_depth)) {
+						visibility = lsp_cached_method_visibility(tokens, i, contents, body_depth);
+						if (visibility != LSP_METHOD_VISIBILITY_PRIVATE) {
+							lsp_cache_class_constants_from(&constants, tokens, i, count, lsp_token_name_equals(token, "T_CASE"), visibility);
+						}
+						continue;
+					}
+
 					promoted_property = false;
 					promoted_param_start = 0;
 					if (lsp_token_name_equals(token, "T_VARIABLE") && lsp_token_at_depth(contents, token, body_depth)) {
@@ -738,7 +929,7 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 				name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
 
 				label = lsp_token_string(name_token, "text");
-				if (!label || zend_string_equals_literal(label, "__construct")) {
+				if (!label) {
 					continue;
 				}
 
@@ -754,7 +945,8 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 			parent_class = lsp_class_extends_name(contents, class_start, body_start);
 
 			zval_ptr_dtor(&traits);
-			lsp_collect_class_trait_names(contents, &traits);
+			array_init(&traits);
+			lsp_collect_class_trait_names_in_bounds(contents, body_start, body_end, body_depth, &traits);
 		}
 
 		if (!Z_ISUNDEF(tokens_zv)) {
@@ -774,6 +966,7 @@ extern zval *lsp_class_member_cache_entry(lsp_server *server, zend_string *class
 	add_assoc_zval(&entry, "methods", &methods);
 	add_assoc_zval(&entry, "properties", &properties);
 	add_assoc_zval(&entry, "traits", &traits);
+	add_assoc_zval(&entry, "constants", &constants);
 
 	if (parent_class) {
 		add_assoc_str(&entry, "parent", parent_class);
@@ -860,6 +1053,67 @@ static inline void lsp_add_static_project_class_member_completions_ex(lsp_server
 extern void lsp_add_static_project_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix)
 {
 	lsp_add_static_project_class_member_completions_ex(server, items, class_name, member_prefix, true);
+}
+
+/* parent:: legally calls inherited INSTANCE methods (parent::render(),
+ * parent::__construct()); walk the ancestor chain adding non-private
+ * methods, constructors included. */
+extern void lsp_add_inherited_project_class_method_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix)
+{
+	const char *source = lsp_primary_analyzer_source(server);
+	zend_long visibility;
+	zend_string *current, *next, *label, *detail;
+	zval *entry, *parent, *methods, *method;
+	HashTable visited;
+
+	zend_hash_init(&visited, 8, NULL, NULL, 0);
+
+	current = zend_string_copy(class_name);
+	while (current) {
+		if (zend_hash_exists(&visited, current)) {
+			break;
+		}
+
+		zend_hash_add_empty_element(&visited, current);
+		entry = lsp_class_member_cache_entry(server, current);
+		if (!entry || Z_TYPE_P(entry) != IS_ARRAY) {
+			break;
+		}
+
+		methods = zend_hash_str_find(Z_ARRVAL_P(entry), "methods", sizeof("methods") - 1);
+		if (methods && Z_TYPE_P(methods) == IS_ARRAY) {
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(methods), method) {
+				if (Z_TYPE_P(method) != IS_ARRAY) {
+					continue;
+				}
+
+				label = lsp_array_string(method, "label");
+				detail = lsp_array_string(method, "detail");
+				visibility = lsp_array_long(method, "visibility", (zend_long) LSP_METHOD_VISIBILITY_PUBLIC);
+				if (!label ||
+					!detail ||
+					visibility == (zend_long) LSP_METHOD_VISIBILITY_PRIVATE ||
+					!lsp_matches_prefix_string(label, member_prefix)
+				) {
+					continue;
+				}
+
+				lsp_add_completion_item_ex(items, label, 2, detail, source);
+			} ZEND_HASH_FOREACH_END();
+		}
+
+		lsp_add_entry_trait_member_completions(server, items, entry, member_prefix, &visited, false);
+		parent = zend_hash_str_find(Z_ARRVAL_P(entry), "parent", sizeof("parent") - 1);
+		next = parent && Z_TYPE_P(parent) == IS_STRING && Z_STRLEN_P(parent) > 0 ? zend_string_copy(Z_STR_P(parent)) : NULL;
+		zend_string_release(current);
+		current = next;
+	}
+
+	if (current) {
+		zend_string_release(current);
+	}
+
+	zend_hash_destroy(&visited);
 }
 
 extern void lsp_add_inherited_static_project_class_member_completions(lsp_server *server, zval *items, zend_string *class_name, zend_string *member_prefix)
@@ -997,7 +1251,7 @@ extern void lsp_add_this_member_completions(lsp_server *server, zval *items, lsp
 {
 	zend_long body_depth = 0;
 	zend_string *receiver, *member_prefix, *label, *variable, *detail, *parent_class;
-	zval *tokens_zv, *token, *name_token;
+	zval *tokens_zv, *token, *name_token, *trait_zv, traits;
 	HashTable *tokens;
 	uint32_t i, count, name_index;
 	size_t class_start = 0, body_start = 0, body_end = 0, promoted_param_start = 0;
@@ -1098,6 +1352,16 @@ extern void lsp_add_this_member_completions(lsp_server *server, zval *items, lsp
 		lsp_add_inherited_project_class_member_completions(server, items, parent_class, member_prefix);
 		zend_string_release(parent_class);
 	}
+
+	/* Members brought in by the current class's own traits. */
+	array_init(&traits);
+	lsp_collect_class_trait_names_in_bounds(document->text, body_start, body_end, body_depth, &traits);
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(traits), trait_zv) {
+		if (Z_TYPE_P(trait_zv) == IS_STRING) {
+			lsp_add_inherited_project_class_member_completions(server, items, Z_STR_P(trait_zv), member_prefix);
+		}
+	} ZEND_HASH_FOREACH_END();
+	zval_ptr_dtor(&traits);
 
 	zend_string_release(member_prefix);
 }

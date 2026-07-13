@@ -13,10 +13,13 @@
 
 #include "lsp_internal.h"
 
+#include <Zend/zend_language_parser.h>
+
 static inline void lsp_initialize(lsp_server *server, zval *params, zval *return_value)
 {
 	zend_string *root_uri = lsp_array_string(params, "rootUri"), *root_path = lsp_array_string(params, "rootPath");
 	zval capabilities, sync, save, completion, triggers, code_lens, signature, signature_triggers, code_action, code_action_kinds, rename, server_info, semantic_tokens, legend;
+	zval workspace, workspace_folders, file_operations, will_rename, filters, filter, pattern;
 
 	if (root_uri) {
 		zend_string_release(server->root);
@@ -25,6 +28,10 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 		zend_string_release(server->root);
 		server->root = zend_string_copy(root_path);
 	}
+
+	/* Multi-root: every workspace folder is indexed; the first folder (or
+	 * rootUri) anchors the index cache location. */
+	lsp_workspace_parse_folders(server, params);
 
 	lsp_resolve_analyzers(server);
 	lsp_build_project_index(server);
@@ -59,11 +66,25 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	add_assoc_zval(&completion, "triggerCharacters", &triggers);
 	add_assoc_zval(&capabilities, "completionProvider", &completion);
 
+	add_assoc_string(&capabilities, "positionEncoding", "utf-16");
 	add_assoc_bool(&capabilities, "hoverProvider", true);
 	add_assoc_bool(&capabilities, "definitionProvider", true);
+	add_assoc_bool(&capabilities, "declarationProvider", true);
+	add_assoc_bool(&capabilities, "typeDefinitionProvider", true);
 	add_assoc_bool(&capabilities, "referencesProvider", true);
 	add_assoc_bool(&capabilities, "documentHighlightProvider", true);
 	add_assoc_bool(&capabilities, "implementationProvider", true);
+	add_assoc_bool(&capabilities, "foldingRangeProvider", true);
+	add_assoc_bool(&capabilities, "callHierarchyProvider", true);
+	add_assoc_bool(&capabilities, "typeHierarchyProvider", true);
+	add_assoc_bool(&capabilities, "selectionRangeProvider", true);
+	{
+		zval document_link;
+
+		array_init(&document_link);
+		add_assoc_bool(&document_link, "resolveProvider", false);
+		add_assoc_zval(&capabilities, "documentLinkProvider", &document_link);
+	}
 	array_init(&code_lens);
 	add_assoc_bool(&code_lens, "resolveProvider", false);
 	add_assoc_zval(&capabilities, "codeLensProvider", &code_lens);
@@ -76,13 +97,20 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	array_init(&rename);
 	add_assoc_bool(&rename, "prepareProvider", true);
 	add_assoc_zval(&capabilities, "renameProvider", &rename);
-	add_assoc_bool(&capabilities, "documentFormattingProvider", true);
-	add_assoc_bool(&capabilities, "documentRangeFormattingProvider", true);
+	add_assoc_bool(&capabilities, "documentFormattingProvider", server->options.formatting_enabled);
+	add_assoc_bool(&capabilities, "documentRangeFormattingProvider", server->options.formatting_enabled);
 	add_assoc_bool(&capabilities, "inlayHintProvider", true);
 	array_init(&semantic_tokens);
 	lsp_semantic_token_legend(&legend);
 	add_assoc_zval(&semantic_tokens, "legend", &legend);
-	add_assoc_bool(&semantic_tokens, "full", true);
+	{
+		zval semantic_full;
+
+		array_init(&semantic_full);
+		add_assoc_bool(&semantic_full, "delta", true);
+		add_assoc_zval(&semantic_tokens, "full", &semantic_full);
+	}
+	add_assoc_bool(&semantic_tokens, "range", true);
 	add_assoc_zval(&capabilities, "semanticTokensProvider", &semantic_tokens);
 	array_init(&signature);
 	array_init(&signature_triggers);
@@ -92,6 +120,26 @@ static inline void lsp_initialize(lsp_server *server, zval *params, zval *return
 	add_assoc_zval(&capabilities, "signatureHelpProvider", &signature);
 	add_assoc_bool(&capabilities, "documentSymbolProvider", true);
 	add_assoc_bool(&capabilities, "workspaceSymbolProvider", true);
+
+	array_init(&workspace);
+	array_init(&workspace_folders);
+	add_assoc_bool(&workspace_folders, "supported", true);
+	add_assoc_bool(&workspace_folders, "changeNotifications", true);
+	add_assoc_zval(&workspace, "workspaceFolders", &workspace_folders);
+	array_init(&file_operations);
+	array_init(&will_rename);
+	array_init(&filters);
+	array_init(&filter);
+	array_init(&pattern);
+	add_assoc_string(&pattern, "glob", "**/*.php");
+	add_assoc_string(&pattern, "matches", "file");
+	add_assoc_zval(&filter, "pattern", &pattern);
+	add_next_index_zval(&filters, &filter);
+	add_assoc_zval(&will_rename, "filters", &filters);
+	add_assoc_zval(&file_operations, "willRename", &will_rename);
+	add_assoc_zval(&workspace, "fileOperations", &file_operations);
+	add_assoc_zval(&capabilities, "workspace", &workspace);
+
 	add_assoc_zval(return_value, "capabilities", &capabilities);
 
 	array_init(&server_info);
@@ -132,8 +180,17 @@ static inline void lsp_did_change(lsp_server *server, zval *params)
 	version = lsp_array_long(td, "version", 0);
 	uri = lsp_array_string(td, "uri");
 
-	if (changes && Z_TYPE_P(changes) == IS_ARRAY) {
-		change = zend_hash_index_find(Z_ARRVAL_P(changes), 0);
+	/* Full-document sync is advertised, so every change event carries the
+	 * whole text and the LAST event in the batch is authoritative. A change
+	 * carrying a range would be an incremental event from a non-conforming
+	 * client; treating its fragment as the full document would corrupt the
+	 * buffer, so such events are ignored. */
+	if (changes && Z_TYPE_P(changes) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(changes)) > 0) {
+		change = zend_hash_index_find(Z_ARRVAL_P(changes), zend_hash_num_elements(Z_ARRVAL_P(changes)) - 1);
+	}
+
+	if (change && lsp_array_find(change, "range")) {
+		return;
 	}
 
 	text = lsp_array_string(change, "text");
@@ -177,6 +234,9 @@ static inline void lsp_did_save(lsp_server *server, zval *params)
 	}
 
 	lsp_document_analyze(document);
+	/* Saving is the natural refresh point for the version-less analyzer type
+	 * cache entries of this document. */
+	lsp_server_evict_document_caches(server, uri, true);
 	/* Drop only the member-cache entries built from the saved file; ancestor
 	 * entries re-validate themselves through version/mtime freshness checks. */
 	lsp_member_cache_invalidate_path(server, document->path);
@@ -223,6 +283,7 @@ static inline void lsp_did_close(lsp_server *server, zval *params)
 	}
 
 	lsp_psalm_ls_document_close(server, uri);
+	lsp_server_evict_document_caches(server, uri, true);
 	zend_hash_del(&server->documents, uri);
 	lsp_publish_empty_diagnostics(uri);
 }
@@ -342,27 +403,102 @@ static inline void lsp_default_range(zval *range)
 	add_assoc_zval(range, "end", &end);
 }
 
-static inline void lsp_add_document_symbol(zval *items, zend_string *name, zend_long kind, zend_long one_based_line)
+#define LSP_SYMBOL_FRAME_MAX 16
+
+typedef struct _lsp_document_symbol_frame {
+	zval item;       /* DocumentSymbol under construction */
+	zval children;
+	zend_long body_depth;
+	size_t start_offset;
+	bool is_enum;
+	bool is_class_like;
+} lsp_document_symbol_frame;
+
+static inline void lsp_document_symbol_leaf(zval *target, lsp_document *document, zend_string *name, zend_long kind, size_t start_offset, size_t end_offset, size_t name_offset, size_t name_length)
 {
 	zval item, range, selection_range;
 
 	array_init(&item);
 	add_assoc_str(&item, "name", zend_string_copy(name));
 	add_assoc_long(&item, "kind", kind);
-	lsp_line_range(&range, zend_empty_string, one_based_line);
-	lsp_line_range(&selection_range, zend_empty_string, one_based_line);
+	lsp_range_from_offsets(document->text, start_offset, end_offset, &range);
 	add_assoc_zval(&item, "range", &range);
+	lsp_range_from_offsets(document->text, name_offset, name_offset + name_length, &selection_range);
 	add_assoc_zval(&item, "selectionRange", &selection_range);
-	add_next_index_zval(items, &item);
+	add_next_index_zval(target, &item);
 }
 
+static inline void lsp_document_symbol_frame_open(lsp_document_symbol_frame *frame, lsp_document *document, zend_string *name, zend_long kind, size_t start_offset, size_t name_offset, size_t name_length, zend_long body_depth, bool is_enum, bool is_class_like)
+{
+	zval selection_range;
+
+	array_init(&frame->item);
+	add_assoc_str(&frame->item, "name", zend_string_copy(name));
+	add_assoc_long(&frame->item, "kind", kind);
+	lsp_range_from_offsets(document->text, name_offset, name_offset + name_length, &selection_range);
+	add_assoc_zval(&frame->item, "selectionRange", &selection_range);
+	array_init(&frame->children);
+	frame->body_depth = body_depth;
+	frame->start_offset = start_offset;
+	frame->is_enum = is_enum;
+	frame->is_class_like = is_class_like;
+}
+
+static inline void lsp_document_symbol_frame_close(lsp_document_symbol_frame *frame, lsp_document *document, zval *target, size_t end_offset)
+{
+	zval range;
+
+	lsp_range_from_offsets(document->text, frame->start_offset, end_offset, &range);
+	add_assoc_zval(&frame->item, "range", &range);
+
+	if (zend_hash_num_elements(Z_ARRVAL(frame->children)) > 0) {
+		add_assoc_zval(&frame->item, "children", &frame->children);
+	} else {
+		zval_ptr_dtor(&frame->children);
+	}
+
+	add_next_index_zval(target, &frame->item);
+}
+
+/* Hierarchical DocumentSymbol tree from the token stream: classes own their
+ * methods and enum cases as children, with real ranges (declaration through
+ * closing brace) and name-based selection ranges. Token-driven so it also
+ * works on documents that do not currently parse. */
+static inline void lsp_document_symbols_uncached(zval *return_value, lsp_document *document);
+
+/* Text pointer identity keys the cache the same way the token cache does:
+ * didChange swaps document->text, naturally invalidating the memo. */
 static inline void lsp_document_symbols(zval *return_value, lsp_document *document)
 {
-	zend_long kind;
-	zend_string *label;
-	zval *tokens_zv, *token;
+	if (document->outline_cache_text == document->text && Z_TYPE(document->outline_cache) == IS_ARRAY) {
+		ZVAL_COPY(return_value, &document->outline_cache);
+
+		return;
+	}
+
+	lsp_document_symbols_uncached(return_value, document);
+
+	if (document->outline_cache_text) {
+		zend_string_release(document->outline_cache_text);
+		zval_ptr_dtor(&document->outline_cache);
+	}
+
+	document->outline_cache_text = zend_string_copy(document->text);
+	ZVAL_COPY(&document->outline_cache, return_value);
+}
+
+static inline void lsp_document_symbols_uncached(zval *return_value, lsp_document *document)
+{
+	lsp_document_symbol_frame frames[LSP_SYMBOL_FRAME_MAX];
+	zend_long depth = 0, kind, pending_kind = 0;
+	zend_string *label, *pending_name = NULL;
+	zval *tokens_zv, *token, *name_token;
+	zval *target;
 	HashTable *tokens;
-	uint32_t i, count;
+	uint32_t i, count, name_index;
+	int frame_count = 0;
+	size_t token_offset, pending_start = 0, pending_name_offset = 0, pending_name_length = 0;
+	bool pending_is_class = false, pending_active = false, previous_is_new = false;
 
 	array_init(return_value);
 	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
@@ -374,29 +510,127 @@ static inline void lsp_document_symbols(zval *return_value, lsp_document *docume
 	count = zend_hash_num_elements(tokens);
 	for (i = 0; i < count; i++) {
 		token = zend_hash_index_find(tokens, i);
-		label = NULL;
-		kind = 5;
-
 		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
 			continue;
 		}
 
-			if (lsp_token_name_equals(token, "T_FUNCTION")) {
-				label = lsp_next_string_token(tokens, i + 1);
-				kind = 12;
-			} else if (lsp_token_is_class_like(token)) {
-				label = lsp_next_string_token(tokens, i + 1);
-				kind = lsp_token_name_equals(token, "T_INTERFACE") ? 11 : (lsp_token_name_equals(token, "T_ENUM") ? 10 : 5);
+		if (lsp_token_name_equals(token, "T_WHITESPACE") || lsp_token_name_equals(token, "T_COMMENT") || lsp_token_name_equals(token, "T_DOC_COMMENT")) {
+			continue;
+		}
+
+		token_offset = (size_t) lsp_token_long(token, "offset", 0);
+
+		if (lsp_token_is_char(token, '{') || lsp_token_name_equals(token, "T_CURLY_OPEN") || lsp_token_name_equals(token, "T_DOLLAR_OPEN_CURLY_BRACES")) {
+			depth++;
+			if (pending_active && frame_count < LSP_SYMBOL_FRAME_MAX) {
+				lsp_document_symbol_frame_open(&frames[frame_count], document, pending_name, pending_kind, pending_start, pending_name_offset, pending_name_length, depth, pending_is_class && pending_kind == 10, pending_is_class);
+				frame_count++;
+				pending_active = false;
+				pending_name = NULL;
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		if (lsp_token_is_char(token, '}')) {
+			if (frame_count > 0 && frames[frame_count - 1].body_depth == depth) {
+				frame_count--;
+				target = frame_count > 0 ? &frames[frame_count - 1].children : return_value;
+				lsp_document_symbol_frame_close(&frames[frame_count], document, target, token_offset + 1);
+			}
+			if (depth > 0) {
+				depth--;
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		if (pending_active && lsp_token_is_char(token, ';')) {
+			/* Bodyless declaration (abstract/interface method). */
+			target = frame_count > 0 ? &frames[frame_count - 1].children : return_value;
+			lsp_document_symbol_leaf(target, document, pending_name, pending_kind, pending_start, token_offset + 1, pending_name_offset, pending_name_length);
+			pending_active = false;
+			pending_name = NULL;
+			continue;
+		}
+
+		if (lsp_token_is_class_like(token)) {
+			if (previous_is_new) {
+				/* Anonymous class: no symbol, braces tracked by depth. */
+				previous_is_new = false;
+				continue;
 			}
 
-		if (label) {
-			lsp_add_document_symbol(return_value, label, kind, lsp_token_long(token, "line", 1));
+			label = lsp_next_string_token(tokens, i + 1);
+			if (label) {
+				kind = lsp_token_name_equals(token, "T_INTERFACE") ? 11 : (lsp_token_name_equals(token, "T_ENUM") ? 10 : 5);
+				name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
+				pending_active = true;
+				pending_is_class = true;
+				pending_kind = kind;
+				pending_name = label;
+				pending_start = token_offset;
+				pending_name_offset = name_token ? (size_t) lsp_token_long(name_token, "offset", 0) : token_offset;
+				pending_name_length = ZSTR_LEN(label);
+			}
+			previous_is_new = false;
+			continue;
 		}
+
+		if (lsp_token_name_equals(token, "T_FUNCTION")) {
+			name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
+			label = name_token ? lsp_token_string(name_token, "text") : NULL;
+			if (label) {
+				kind = frame_count > 0 && frames[frame_count - 1].body_depth == depth && frames[frame_count - 1].is_class_like
+					? (zend_string_equals_literal(label, "__construct") ? 9 : 6)
+					: 12
+				;
+				pending_active = true;
+				pending_is_class = false;
+				pending_kind = kind;
+				pending_name = label;
+				pending_start = token_offset;
+				pending_name_offset = (size_t) lsp_token_long(name_token, "offset", 0);
+				pending_name_length = ZSTR_LEN(label);
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		if (lsp_token_name_equals(token, "T_CASE") &&
+			frame_count > 0 &&
+			frames[frame_count - 1].is_enum &&
+			frames[frame_count - 1].body_depth == depth
+		) {
+			label = lsp_next_string_token(tokens, i + 1);
+			if (label) {
+				name_token = lsp_next_function_name_token_ex(tokens, i + 1, &name_index);
+				lsp_document_symbol_leaf(&frames[frame_count - 1].children, document, label, 22,
+					token_offset,
+					(name_token ? (size_t) lsp_token_long(name_token, "offset", 0) : token_offset) + ZSTR_LEN(label),
+					name_token ? (size_t) lsp_token_long(name_token, "offset", 0) : token_offset,
+					ZSTR_LEN(label));
+			}
+			previous_is_new = false;
+			continue;
+		}
+
+		previous_is_new = lsp_token_name_equals(token, "T_NEW");
+	}
+
+	/* Close frames left open by an unfinished document. */
+	while (frame_count > 0) {
+		frame_count--;
+		target = frame_count > 0 ? &frames[frame_count - 1].children : return_value;
+		lsp_document_symbol_frame_close(&frames[frame_count], document, target, ZSTR_LEN(document->text));
 	}
 }
 
 static inline bool lsp_matches_query(const char *value, size_t value_length, zend_string *query)
 {
+	/* Case-insensitive subsequence match (every substring match is also a
+	 * subsequence match, so one pass decides). The query arrives pre-lowered
+	 * by the caller so the per-entry cost is a single tolower per byte. */
 	const char *query_value;
 	size_t i, query_length, query_offset = 0;
 
@@ -410,14 +644,8 @@ static inline bool lsp_matches_query(const char *value, size_t value_length, zen
 		return false;
 	}
 
-	for (i = 0; i + query_length <= value_length; i++) {
-		if (strncasecmp(value + i, query_value, query_length) == 0) {
-			return true;
-		}
-	}
-
 	for (i = 0; i < value_length && query_offset < query_length; i++) {
-		if (tolower((unsigned char) value[i]) == tolower((unsigned char) query_value[query_offset])) {
+		if (tolower((unsigned char) value[i]) == (unsigned char) query_value[query_offset]) {
 			query_offset++;
 		}
 	}
@@ -440,22 +668,52 @@ static inline void lsp_add_workspace_symbol(zval *items, zend_string *name, zend
 	add_next_index_zval(items, &item);
 }
 
-static inline void lsp_add_workspace_symbols_from_index_pass(lsp_server *server, zval *items, zend_string *query, bool vendor_symbols)
+/* Editors re-issue workspace/symbol on every keystroke of the picker, so the
+ * scan is capped and prioritized: one pass over the index emits project
+ * symbols directly (stopping at the cap) while vendor matches queue in a side
+ * list that only tops up remaining slots. */
+#define LSP_WORKSPACE_SYMBOL_LIMIT 256
+
+static inline void lsp_add_workspace_symbol_entry(lsp_symbol_index *region, const lsp_symbol_entry *entry, zval *items)
+{
+	zend_string *name, *uri, *path_string;
+	const char *fqcn, *path;
+
+	fqcn = lsp_symbol_entry_fqcn(region, entry);
+	path = lsp_symbol_entry_path(region, entry);
+	name = zend_string_init(fqcn, entry->fqcn_length, 0);
+	path_string = zend_string_init(path, entry->path_length, 0);
+	uri = lsp_path_to_uri(path_string);
+	lsp_add_workspace_symbol(items, name, lsp_symbol_workspace_kind((char) entry->kind), uri);
+	zend_string_release(uri);
+	zend_string_release(path_string);
+	zend_string_release(name);
+}
+
+static inline void lsp_add_workspace_symbols_from_index(lsp_server *server, zval *items, zend_string *query)
 {
 	const lsp_symbol_entry *entry;
 	lsp_symbol_index *region = &server->symbol_index;
-	zend_string *name, *uri, *path_string;
-	const char *fqcn, *path;
-	uint32_t i;
+	const char *fqcn;
+	uint32_t i, project_count, vendor_count, vendor_take;
+	uint32_t *vendor_matches;
 
 	lsp_symbol_index_table_ensure(region);
 
-	for (i = 0; i < region->entry_count; i++) {
+	vendor_matches = emalloc(sizeof(uint32_t) * LSP_WORKSPACE_SYMBOL_LIMIT);
+	project_count = 0;
+	vendor_count = 0;
+
+	for (i = 0; i < region->entry_count && project_count < LSP_WORKSPACE_SYMBOL_LIMIT; i++) {
 		entry = &region->entries[i];
-		if ((entry->flags & LSP_SYMBOL_ENTRY_DELETED) != 0 ||
-			((entry->flags & LSP_SYMBOL_ENTRY_VENDOR) != 0) != vendor_symbols
-		) {
+		if ((entry->flags & LSP_SYMBOL_ENTRY_DELETED) != 0) {
 			continue;
+		}
+
+		if ((entry->flags & LSP_SYMBOL_ENTRY_VENDOR) != 0) {
+			if (vendor_count >= LSP_WORKSPACE_SYMBOL_LIMIT) {
+				continue;
+			}
 		}
 
 		fqcn = lsp_symbol_entry_fqcn(region, entry);
@@ -463,213 +721,727 @@ static inline void lsp_add_workspace_symbols_from_index_pass(lsp_server *server,
 			continue;
 		}
 
-		path = lsp_symbol_entry_path(region, entry);
-		name = zend_string_init(fqcn, entry->fqcn_length, 0);
-		path_string = zend_string_init(path, entry->path_length, 0);
-		uri = lsp_path_to_uri(path_string);
-		lsp_add_workspace_symbol(items, name, lsp_symbol_workspace_kind((char) entry->kind), uri);
-		zend_string_release(uri);
-		zend_string_release(path_string);
-		zend_string_release(name);
+		if ((entry->flags & LSP_SYMBOL_ENTRY_VENDOR) != 0) {
+			vendor_matches[vendor_count++] = i;
+		} else {
+			lsp_add_workspace_symbol_entry(region, entry, items);
+			project_count++;
+		}
 	}
-}
 
-static inline void lsp_add_workspace_symbols_from_index(lsp_server *server, zval *items, zend_string *query)
-{
-	lsp_add_workspace_symbols_from_index_pass(server, items, query, false);
-	lsp_add_workspace_symbols_from_index_pass(server, items, query, true);
+	vendor_take = LSP_WORKSPACE_SYMBOL_LIMIT - project_count;
+	if (vendor_take > vendor_count) {
+		vendor_take = vendor_count;
+	}
+	for (i = 0; i < vendor_take; i++) {
+		lsp_add_workspace_symbol_entry(region, &region->entries[vendor_matches[i]], items);
+	}
+
+	efree(vendor_matches);
 }
 
 static inline void lsp_workspace_symbols(lsp_server *server, zval *params, zval *return_value)
 {
-	zend_string *query = lsp_array_string(params, "query");
+	zend_string *query, *lowered;
+
+	query = lsp_array_string(params, "query");
+	lowered = query ? zend_string_tolower(query) : NULL;
 
 	array_init(return_value);
 
 	lsp_index_join_worker(server);
-	lsp_add_workspace_symbols_from_index(server, return_value, query);
+	lsp_add_workspace_symbols_from_index(server, return_value, lowered);
+
+	if (lowered) {
+		zend_string_release(lowered);
+	}
 }
 
-static inline void lsp_server_handle(lsp_server *server, zend_string *method, zval *params, zval *return_value)
+/* ----------------------------------------------------------------------
+ * textDocument/selectionRange: expand-selection chains built from the word
+ * under the cursor and the enclosing bracket pairs (content first, then the
+ * pair including its delimiters), ending at the whole document.
+ * ---------------------------------------------------------------------- */
+
+#define LSP_SELECTION_STACK_MAX 128
+
+static inline void lsp_selection_push_level(zval *chain, zend_string *text, size_t start, size_t end, size_t *previous_start, size_t *previous_end)
+{
+	zval level, range;
+
+	if (start == *previous_start && end == *previous_end) {
+		return;
+	}
+
+	/* Chains must strictly widen. */
+	if (start > *previous_start || end < *previous_end) {
+		return;
+	}
+
+	array_init(&level);
+	lsp_range_from_offsets(text, start, end, &range);
+	add_assoc_zval(&level, "range", &range);
+	add_next_index_zval(chain, &level);
+	*previous_start = start;
+	*previous_end = end;
+}
+
+static inline void lsp_selection_range_for_offset(lsp_document *document, size_t offset, zval *result)
+{
+	zval *tokens_zv, *token, chain, *level, *parent_target, parent_copy;
+	zend_string *word;
+	HashTable *tokens;
+	size_t open_stack[LSP_SELECTION_STACK_MAX];
+	size_t token_offset, open_offset, previous_start, previous_end, word_start, word_end;
+	zend_long id;
+	uint32_t i, count, depth = 0, chain_count;
+
+	array_init(&chain);
+	previous_start = SIZE_MAX;
+	previous_end = 0;
+
+	word = lsp_word_at(document->text, offset);
+	if (ZSTR_LEN(word) > 0) {
+		word_start = offset;
+		while (word_start > 0 && (lsp_doc_is_identifier_char(ZSTR_VAL(document->text)[word_start - 1]) || ZSTR_VAL(document->text)[word_start - 1] == '$')) {
+			word_start--;
+		}
+		word_end = word_start + ZSTR_LEN(word);
+		previous_start = word_start;
+		previous_end = word_end;
+
+		{
+			zval level_zv, range;
+
+			array_init(&level_zv);
+			lsp_range_from_offsets(document->text, word_start, word_end, &range);
+			add_assoc_zval(&level_zv, "range", &range);
+			add_next_index_zval(&chain, &level_zv);
+		}
+	}
+	zend_string_release(word);
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (tokens_zv && Z_TYPE_P(tokens_zv) == IS_ARRAY) {
+		tokens = Z_ARRVAL_P(tokens_zv);
+		count = zend_hash_num_elements(tokens);
+		for (i = 0; i < count; i++) {
+			token = zend_hash_index_find(tokens, i);
+			if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+				continue;
+			}
+
+			id = lsp_token_long(token, "id", 0);
+			token_offset = (size_t) lsp_token_long(token, "offset", 0);
+
+			if (id == '(' || id == '[' || id == '{' || id == T_CURLY_OPEN || id == T_DOLLAR_OPEN_CURLY_BRACES || id == T_ATTRIBUTE) {
+				if (depth < LSP_SELECTION_STACK_MAX) {
+					open_stack[depth] = token_offset;
+				}
+				depth++;
+				continue;
+			}
+
+			if (id == ')' || id == ']' || id == '}') {
+				if (depth == 0) {
+					continue;
+				}
+				depth--;
+				if (depth >= LSP_SELECTION_STACK_MAX) {
+					continue;
+				}
+
+				open_offset = open_stack[depth];
+				/* Closing pairs surface innermost-first for offsets they
+				 * enclose, exactly the chain order needed. */
+				if (open_offset < offset && offset <= token_offset) {
+					lsp_selection_push_level(&chain, document->text, open_offset + 1, token_offset, &previous_start, &previous_end);
+					lsp_selection_push_level(&chain, document->text, open_offset, token_offset + 1, &previous_start, &previous_end);
+				}
+			}
+		}
+	}
+
+	lsp_selection_push_level(&chain, document->text, 0, ZSTR_LEN(document->text), &previous_start, &previous_end);
+
+	/* Fold the flat chain into the nested {range, parent} shape. */
+	chain_count = zend_hash_num_elements(Z_ARRVAL(chain));
+	if (chain_count == 0) {
+		zval range, level_zv;
+
+		array_init(result);
+		lsp_range_from_offsets(document->text, offset, offset, &range);
+		add_assoc_zval(result, "range", &range);
+		zval_ptr_dtor(&chain);
+		(void) level_zv;
+
+		return;
+	}
+
+	/* Build from the outermost inward: parent links point outward. */
+	ZVAL_UNDEF(&parent_copy);
+	parent_target = NULL;
+	for (i = chain_count; i > 0; i--) {
+		level = zend_hash_index_find(Z_ARRVAL(chain), i - 1);
+		if (!level || Z_TYPE_P(level) != IS_ARRAY) {
+			continue;
+		}
+
+		if (!Z_ISUNDEF(parent_copy)) {
+			add_assoc_zval(level, "parent", &parent_copy);
+		}
+
+		ZVAL_COPY(&parent_copy, level);
+	}
+
+	(void) parent_target;
+
+	if (!Z_ISUNDEF(parent_copy)) {
+		ZVAL_COPY(result, &parent_copy);
+		zval_ptr_dtor(&parent_copy);
+	} else {
+		array_init(result);
+	}
+
+	zval_ptr_dtor(&chain);
+}
+
+extern void lsp_lsparrot_selection_range(lsp_server *server, zval *return_value, lsp_document *document, zval *params)
+{
+	zval *positions, *position, entry;
+	zend_long line, character;
+	size_t offset;
+
+	(void) server;
+
+	array_init(return_value);
+
+	positions = lsp_array_find(params, "positions");
+	if (!positions || Z_TYPE_P(positions) != IS_ARRAY) {
+		return;
+	}
+
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(positions), position) {
+		lsp_position_from_zval(position, &line, &character);
+		offset = lsp_offset_at(document->text, line, character);
+		lsp_selection_range_for_offset(document, offset, &entry);
+		add_next_index_zval(return_value, &entry);
+	} ZEND_HASH_FOREACH_END();
+}
+
+/* ----------------------------------------------------------------------
+ * textDocument/documentLink: clickable require/include string arguments.
+ * `__DIR__ . '...'` and plain relative/absolute literals resolve against
+ * the document's directory; links only surface for files that exist.
+ * ---------------------------------------------------------------------- */
+
+static inline zend_string *lsp_document_link_dirname(zend_string *path)
+{
+	const char *value = ZSTR_VAL(path), *slash = strrchr(value, '/');
+
+	if (!slash || slash == value) {
+		return zend_string_init("/", 1, 0);
+	}
+
+	return zend_string_init(value, (size_t) (slash - value), 0);
+}
+
+extern void lsp_lsparrot_document_link(lsp_server *server, zval *return_value, lsp_document *document)
+{
+	zval *tokens_zv, *token, *string_token, link, range;
+	HashTable *tokens;
+	zend_string *literal, *base_dir, *resolved, *uri;
+	const char *inner;
+	size_t inner_length, string_offset;
+	zend_long id;
+	uint32_t i, j, count;
+	bool has_dir_prefix;
+
+	(void) server;
+
+	array_init(return_value);
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY || !document->path) {
+		return;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	base_dir = lsp_document_link_dirname(document->path);
+
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		id = lsp_token_long(token, "id", 0);
+		if (id != T_REQUIRE && id != T_REQUIRE_ONCE && id != T_INCLUDE && id != T_INCLUDE_ONCE) {
+			continue;
+		}
+
+		/* Accept: [(] [__DIR__ .] 'literal' */
+		string_token = NULL;
+		has_dir_prefix = false;
+		for (j = i + 1; j < count && j < i + 8; j++) {
+			zval *candidate = zend_hash_index_find(tokens, j);
+			zend_long candidate_id;
+
+			if (!candidate || Z_TYPE_P(candidate) != IS_ARRAY) {
+				continue;
+			}
+
+			candidate_id = lsp_token_long(candidate, "id", 0);
+			if (candidate_id == T_WHITESPACE || candidate_id == (zend_long) '(' || candidate_id == (zend_long) '.') {
+				continue;
+			}
+
+			if (candidate_id == T_DIR) {
+				has_dir_prefix = true;
+				continue;
+			}
+
+			if (candidate_id == T_CONSTANT_ENCAPSED_STRING) {
+				string_token = candidate;
+			}
+
+			break;
+		}
+
+		if (!string_token) {
+			continue;
+		}
+
+		literal = lsp_token_string(string_token, "text");
+		if (!literal || ZSTR_LEN(literal) < 3) {
+			continue;
+		}
+
+		inner = ZSTR_VAL(literal) + 1;
+		inner_length = ZSTR_LEN(literal) - 2;
+		if (inner_length == 0 || memchr(inner, '\\', inner_length) || memchr(inner, '$', inner_length)) {
+			continue;
+		}
+
+		if (has_dir_prefix || inner[0] != '/') {
+			resolved = strpprintf(0, "%s%s%.*s", ZSTR_VAL(base_dir), inner[0] == '/' ? "" : "/", (int) inner_length, inner);
+		} else {
+			resolved = zend_string_init(inner, inner_length, 0);
+		}
+
+		if (!lsp_is_regular_file(resolved)) {
+			zend_string_release(resolved);
+			continue;
+		}
+
+		string_offset = (size_t) lsp_token_long(string_token, "offset", 0);
+		uri = lsp_uri_from_path(resolved);
+		array_init(&link);
+		lsp_range_from_offsets(document->text, string_offset, string_offset + ZSTR_LEN(literal), &range);
+		add_assoc_zval(&link, "range", &range);
+		add_assoc_str(&link, "target", uri);
+		add_next_index_zval(return_value, &link);
+		zend_string_release(resolved);
+	}
+
+	zend_string_release(base_dir);
+}
+
+#define LSP_FOLDING_STACK_MAX 128
+
+static inline void lsp_folding_add_range(zval *items, zend_long start_line, zend_long end_line, const char *kind)
+{
+	zval range;
+
+	if (end_line <= start_line) {
+		return;
+	}
+
+	array_init(&range);
+	add_assoc_long(&range, "startLine", start_line);
+	add_assoc_long(&range, "endLine", end_line);
+	if (kind) {
+		add_assoc_string(&range, "kind", kind);
+	}
+	add_next_index_zval(items, &range);
+}
+
+static inline zend_long lsp_folding_token_newlines(zend_string *text)
+{
+	const char *p = ZSTR_VAL(text), *end = p + ZSTR_LEN(text);
+	zend_long count = 0;
+
+	while (p < end) {
+		p = memchr(p, '\n', (size_t) (end - p));
+		if (!p) {
+			break;
+		}
+		count++;
+		p++;
+	}
+
+	return count;
+}
+
+/* Brace/bracket/paren blocks, multi-line doc comments, heredocs, and grouped
+ * use statements fold. The closing-delimiter line stays visible (endLine =
+ * closer line - 1), matching how VSCode folds braces; comments collapse onto
+ * their first line. */
+extern void lsp_lsparrot_folding_range(lsp_server *server, zval *return_value, lsp_document *document)
+{
+	zval *tokens_zv, *token;
+	zend_string *token_text;
+	HashTable *tokens;
+	zend_long open_lines[LSP_FOLDING_STACK_MAX];
+	zend_long token_line, newlines, heredoc_start_line;
+	uint32_t i, count, depth;
+	zend_long id;
+
+	(void) server;
+
+	array_init(return_value);
+
+	tokens_zv = zend_hash_str_find(Z_ARRVAL(document->lsparrot), "tokens", sizeof("tokens") - 1);
+	if (!tokens_zv || Z_TYPE_P(tokens_zv) != IS_ARRAY) {
+		return;
+	}
+
+	tokens = Z_ARRVAL_P(tokens_zv);
+	count = zend_hash_num_elements(tokens);
+	depth = 0;
+	heredoc_start_line = -1;
+
+	for (i = 0; i < count; i++) {
+		token = zend_hash_index_find(tokens, i);
+		if (!token || Z_TYPE_P(token) != IS_ARRAY) {
+			continue;
+		}
+
+		id = lsp_token_long(token, "id", 0);
+		token_line = lsp_token_long(token, "line", 1) - 1;
+
+		if (id == T_COMMENT || id == T_DOC_COMMENT) {
+			token_text = lsp_token_string(token, "text");
+			newlines = token_text ? lsp_folding_token_newlines(token_text) : 0;
+			if (newlines > 0) {
+				lsp_folding_add_range(return_value, token_line, token_line + newlines, "comment");
+			}
+			continue;
+		}
+
+		if (id == T_START_HEREDOC) {
+			heredoc_start_line = token_line;
+			continue;
+		}
+
+		if (id == T_END_HEREDOC) {
+			if (heredoc_start_line >= 0) {
+				lsp_folding_add_range(return_value, heredoc_start_line, token_line - 1, NULL);
+				heredoc_start_line = -1;
+			}
+			continue;
+		}
+
+		if (id == '{' || id == '(' || id == '[' || id == T_ATTRIBUTE || id == T_CURLY_OPEN || id == T_DOLLAR_OPEN_CURLY_BRACES) {
+			if (depth < LSP_FOLDING_STACK_MAX) {
+				open_lines[depth] = token_line;
+			}
+			depth++;
+			continue;
+		}
+
+		if (id == '}' || id == ')' || id == ']') {
+			if (depth > 0) {
+				depth--;
+				if (depth < LSP_FOLDING_STACK_MAX) {
+					lsp_folding_add_range(return_value, open_lines[depth], token_line - 1, NULL);
+				}
+			}
+			continue;
+		}
+	}
+}
+
+static inline bool lsp_server_handle(lsp_server *server, zend_string *method, zval *params, zval *return_value)
 {
 	if (zend_string_equals_literal(method, "initialize")) {
 		lsp_initialize(server, params, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "initialized")) {
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "lsparrot.php/status")) {
 		lsp_server_status(server, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "workspace/didChangeWatchedFiles")) {
 		lsp_did_change_watched_files(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "shutdown")) {
-		server->shutdown = true;
+		/* Per the spec the server stays alive after shutdown and only the
+		 * exit notification (or EOF) ends the loop. */
 		server->saw_shutdown = true;
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "exit")) {
 		server->shutdown = true;
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didOpen")) {
 		lsp_did_open(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didChange")) {
 		lsp_did_change(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didSave")) {
 		lsp_did_save(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/didClose")) {
 		lsp_did_close(server, params);
 		ZVAL_NULL(return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/completion")) {
 		lsp_document_request(server, params, lsp_lsparrot_completion, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/hover")) {
 		lsp_document_request(server, params, lsp_lsparrot_hover, return_value);
 
-		return;
+		return true;
 	}
 
-	if (zend_string_equals_literal(method, "textDocument/definition")) {
+	if (zend_string_equals_literal(method, "textDocument/definition") ||
+		zend_string_equals_literal(method, "textDocument/declaration")
+	) {
+		/* PHP has no declaration/definition split; declaration aliases the
+		 * definition lookup. */
 		lsp_document_request(server, params, lsp_lsparrot_definition, return_value);
 
-		return;
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/typeDefinition")) {
+		lsp_document_request(server, params, lsp_lsparrot_type_definition, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/foldingRange")) {
+		lsp_document_request_no_position(server, params, lsp_lsparrot_folding_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/semanticTokens/range")) {
+		lsp_document_request_params(server, params, lsp_lsparrot_semantic_tokens_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/semanticTokens/full/delta")) {
+		lsp_document_request_params(server, params, lsp_lsparrot_semantic_tokens_full_delta, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/selectionRange")) {
+		lsp_document_request_params(server, params, lsp_lsparrot_selection_range, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/documentLink")) {
+		lsp_document_request_no_position(server, params, lsp_lsparrot_document_link, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/prepareCallHierarchy")) {
+		lsp_document_request(server, params, lsp_lsparrot_prepare_call_hierarchy, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "callHierarchy/incomingCalls")) {
+		lsp_lsparrot_call_hierarchy_incoming(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "callHierarchy/outgoingCalls")) {
+		lsp_lsparrot_call_hierarchy_outgoing(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "textDocument/prepareTypeHierarchy")) {
+		lsp_document_request(server, params, lsp_lsparrot_prepare_type_hierarchy, return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "typeHierarchy/supertypes")) {
+		lsp_lsparrot_type_hierarchy_supertypes(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "typeHierarchy/subtypes")) {
+		lsp_lsparrot_type_hierarchy_subtypes(server, return_value, params);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "workspace/didChangeConfiguration")) {
+		lsp_options_apply_runtime(&server->options, params);
+		ZVAL_NULL(return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "workspace/didChangeWorkspaceFolders")) {
+		lsp_workspace_did_change_folders(server, params);
+		ZVAL_NULL(return_value);
+
+		return true;
+	}
+
+	if (zend_string_equals_literal(method, "workspace/willRenameFiles")) {
+		lsp_lsparrot_will_rename_files(server, return_value, params);
+
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/references")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_references, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/documentHighlight")) {
 		lsp_document_request(server, params, lsp_lsparrot_document_highlight, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/implementation")) {
 		lsp_document_request(server, params, lsp_lsparrot_implementation, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/codeAction")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_code_action, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/prepareRename")) {
 		lsp_document_request(server, params, lsp_lsparrot_prepare_rename, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/rename")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_rename, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/formatting")) {
-		lsp_document_request_no_position(server, params, lsp_lsparrot_formatting, return_value);
+		lsp_document_request_params(server, params, lsp_lsparrot_formatting, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/rangeFormatting")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_range_formatting, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/inlayHint")) {
 		lsp_document_request_params(server, params, lsp_lsparrot_inlay_hint, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/codeLens")) {
 		lsp_document_request_no_position(server, params, lsp_lsparrot_code_lens, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/semanticTokens/full")) {
 		lsp_document_request_no_position(server, params, lsp_lsparrot_semantic_tokens, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/signatureHelp")) {
 		lsp_document_request(server, params, lsp_lsparrot_signature_help, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "textDocument/documentSymbol")) {
 		lsp_document_request_no_server_no_position(server, params, lsp_document_symbols, return_value);
 
-		return;
+		return true;
 	}
 
 	if (zend_string_equals_literal(method, "workspace/symbol")) {
 		lsp_workspace_symbols(server, params, return_value);
 
-		return;
+		return true;
 	}
 
 	ZVAL_NULL(return_value);
+
+	return false;
 }
 
 extern void lsp_server_loop(lsp_server *server)
 {
 	double started_at;
 	zval message, *method_zv, *params, *id, result, empty_params;
-	bool has_id;
+	bool has_id, handled;
 
 	while (!server->shutdown && lsp_protocol_next_message(server, &message)) {
 		lsp_reap_analyzer_jobs(server);
@@ -697,14 +1469,26 @@ extern void lsp_server_loop(lsp_server *server)
 			continue;
 		}
 
+		/* After shutdown only the exit notification is honored; requests get
+		 * InvalidRequest and other notifications are dropped. */
+		if (server->saw_shutdown && !zend_string_equals_literal(Z_STR_P(method_zv), "exit")) {
+			if (has_id) {
+				lsp_protocol_error(id, -32600, "Invalid Request");
+			}
+
+			zval_ptr_dtor(&message);
+
+			continue;
+		}
+
 		started_at = lsp_now_seconds();
 
 		if (!params || Z_TYPE_P(params) != IS_ARRAY) {
 			array_init(&empty_params);
-			lsp_server_handle(server, Z_STR_P(method_zv), &empty_params, &result);
+			handled = lsp_server_handle(server, Z_STR_P(method_zv), &empty_params, &result);
 			zval_ptr_dtor(&empty_params);
 		} else {
-			lsp_server_handle(server, Z_STR_P(method_zv), params, &result);
+			handled = lsp_server_handle(server, Z_STR_P(method_zv), params, &result);
 		}
 
 		lsp_perf_stats_record(server, Z_STR_P(method_zv), lsp_now_seconds() - started_at);
@@ -715,7 +1499,11 @@ extern void lsp_server_loop(lsp_server *server)
 				lsp_protocol_error(id, -32603, "Internal error");
 			}
 		} else if (has_id) {
-			lsp_protocol_respond(id, &result);
+			if (handled) {
+				lsp_protocol_respond(id, &result);
+			} else {
+				lsp_protocol_error(id, -32601, "Method not found");
+			}
 		}
 		if (!Z_ISUNDEF(result)) {
 			zval_ptr_dtor(&result);

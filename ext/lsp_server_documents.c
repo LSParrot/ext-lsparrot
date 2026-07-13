@@ -15,6 +15,38 @@
 
 extern void lsp_document_analyze(lsp_document *document);
 
+/* Completion cache keys embed ":uri:version:", so entries for older versions
+ * can never hit again and are dropped on every change. Type cache keys are
+ * deliberately version-less (an expression's analyzer type survives typing),
+ * so they are only evicted on save/close. */
+extern void lsp_server_evict_document_caches(lsp_server *server, zend_string *uri, bool include_type_cache)
+{
+	zend_string *key, *needle;
+
+	if (include_type_cache) {
+		/* didSave/didClose: drop the semantic-token delta snapshot too. */
+		lsp_semantic_tokens_cache_evict(uri);
+	}
+
+	needle = strpprintf(0, ":%s:", ZSTR_VAL(uri));
+
+	ZEND_HASH_FOREACH_STR_KEY(&server->completion_cache, key) {
+		if (key && strstr(ZSTR_VAL(key), ZSTR_VAL(needle))) {
+			zend_hash_del(&server->completion_cache, key);
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	if (include_type_cache) {
+		ZEND_HASH_FOREACH_STR_KEY(&server->type_cache, key) {
+			if (key && strstr(ZSTR_VAL(key), ZSTR_VAL(needle))) {
+				zend_hash_del(&server->type_cache, key);
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	zend_string_release(needle);
+}
+
 extern lsp_document *lsp_document_open_or_change(lsp_server *server, zend_string *uri, zend_long version, zend_string *text)
 {
 	lsp_document *document;
@@ -26,6 +58,7 @@ extern lsp_document *lsp_document_open_or_change(lsp_server *server, zend_string
 		document->text = zend_string_copy(text);
 		document->version = version;
 		lsp_document_analyze(document);
+		lsp_server_evict_document_caches(server, uri, false);
 
 		return document;
 	}
@@ -226,6 +259,23 @@ static inline const char *lsp_analyzer_finished_message(const char *analyzer)
 	return "Psalm diagnostics finished.";
 }
 
+static inline void lsp_reap_analyzer_job(lsp_server *server, lsp_analyzer_job *job, const char *analyzer);
+
+extern void lsp_reap_analyzer_job_table(lsp_server *server, HashTable *jobs, const char *analyzer)
+{
+	lsp_analyzer_job *job;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(jobs, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		job = (lsp_analyzer_job *) Z_PTR_P(value);
+		lsp_reap_analyzer_job(server, job, analyzer);
+	} ZEND_HASH_FOREACH_END();
+}
+
 static inline void lsp_reap_analyzer_job(lsp_server *server, lsp_analyzer_job *job, const char *analyzer)
 {
 	zend_string *project_root = NULL, *output_file = NULL;
@@ -265,12 +315,63 @@ static inline void lsp_reap_analyzer_job(lsp_server *server, lsp_analyzer_job *j
 	}
 }
 
+/* A deferred type query finished in the resident runner: parse the output
+ * with the analyzer that started it and publish the result into the type
+ * cache so the next completion/hover request picks it up. */
+extern void lsp_analyzer_deferred_type_completed(lsp_server *server, zval *descriptor, zend_string *output)
+{
+	zend_string *analyzer, *cache_key, *analysis_file, *expression, *type;
+	zend_long marker_line;
+	zval cache_value;
+
+	analyzer = lsp_array_string(descriptor, "analyzer");
+	cache_key = lsp_array_string(descriptor, "cacheKey");
+	analysis_file = lsp_array_string(descriptor, "analysisFile");
+	expression = lsp_array_string(descriptor, "expression");
+	marker_line = lsp_array_long(descriptor, "markerLine", 0);
+
+	type = NULL;
+	if (output && analyzer) {
+		if (zend_string_equals_literal(analyzer, "phpstan")) {
+			type = lsp_phpstan_parse_type_output(output, analysis_file, marker_line);
+		} else if (zend_string_equals_literal(analyzer, "psalm")) {
+			type = lsp_psalm_parse_type_output(output, expression, marker_line);
+		}
+	}
+
+	if (lsp_type_is_unhelpful(type)) {
+		if (type) {
+			zend_string_release(type);
+		}
+		type = NULL;
+	}
+
+	if (cache_key) {
+		if (type) {
+			ZVAL_STR_COPY(&cache_value, type);
+		} else {
+			ZVAL_FALSE(&cache_value);
+		}
+		zend_hash_update(&server->type_cache, cache_key, &cache_value);
+	}
+
+	if (type) {
+		zend_string_release(type);
+	}
+
+	if (analysis_file) {
+		VCWD_UNLINK(ZSTR_VAL(analysis_file));
+	}
+}
+
 extern void lsp_reap_analyzer_jobs(lsp_server *server)
 {
 	lsp_index_poll_worker(server);
-	lsp_reap_analyzer_job(server, &server->phpstan_job, "phpstan");
-	lsp_reap_analyzer_job(server, &server->psalm_job, "psalm");
+	lsp_reap_analyzer_job_table(server, &server->phpstan_jobs, "phpstan");
+	lsp_reap_analyzer_job_table(server, &server->psalm_jobs, "psalm");
 	lsp_psalm_ls_pump(server, 0.0);
+	lsp_runner_pump_pending(server);
+	lsp_runner_reap_idle_sessions(server);
 	lsp_reap_analyzer_completion_jobs();
 }
 
@@ -465,13 +566,13 @@ extern void lsp_server_status(lsp_server *server, zval *return_value)
 	array_init(&processes);
 	add_assoc_long(&processes, "active", lsp_active_process_count(server));
 	add_assoc_long(&processes, "configured", server->options.worker_count);
-	add_assoc_bool(&processes, "phpstanRunning", server->phpstan_job.running);
-	add_assoc_bool(&processes, "psalmRunning", server->psalm_job.running);
+	add_assoc_bool(&processes, "phpstanRunning", lsp_analyzer_job_table_running(&server->phpstan_jobs));
+	add_assoc_bool(&processes, "psalmRunning", lsp_analyzer_job_table_running(&server->psalm_jobs));
 	add_assoc_zval(return_value, "processes", &processes);
 
 	array_init(&analyzers);
-	lsp_add_analyzer_status_entry(&analyzers, "phpstan", server->phpstan_enabled, server->phpstan_job.running, &server->phpstan_projects);
-	lsp_add_analyzer_status_entry(&analyzers, "psalm", server->psalm_enabled, server->psalm_job.running, &server->psalm_projects);
+	lsp_add_analyzer_status_entry(&analyzers, "phpstan", server->phpstan_enabled, lsp_analyzer_job_table_running(&server->phpstan_jobs), &server->phpstan_projects);
+	lsp_add_analyzer_status_entry(&analyzers, "psalm", server->psalm_enabled, lsp_analyzer_job_table_running(&server->psalm_jobs), &server->psalm_projects);
 	lsp_add_analyzer_status_entry(&analyzers, "psalm-ls", server->psalm_ls_enabled, false, &server->psalm_ls_project_states);
 	add_assoc_zval(return_value, "analyzers", &analyzers);
 
@@ -545,10 +646,17 @@ static inline void lsp_rx_compact(void)
 	lsp_rx_offset = 0;
 }
 
+typedef enum _lsp_frame_result {
+	LSP_FRAME_INCOMPLETE = 0, /* need more bytes before anything can parse */
+	LSP_FRAME_MESSAGE,        /* a message was produced */
+	LSP_FRAME_SKIPPED,        /* a bad frame was consumed; try the next one */
+} lsp_frame_result;
+
 /* Parse one complete Content-Length framed message from the receive buffer.
- * Accepts both \r\n and bare \n header line endings. Returns false when the
- * buffered bytes do not yet contain a complete frame. */
-static inline bool lsp_transport_parse_frame(zval *message)
+ * Accepts both \r\n and bare \n header line endings. Distinguishes "not
+ * enough bytes yet" from "consumed a malformed/undecodable frame" so frames
+ * queued behind a bad one are still drained. */
+static inline lsp_frame_result lsp_transport_parse_frame(zval *message)
 {
 	const char *data, *line_start, *line_end, *headers_end = NULL;
 	char *body;
@@ -556,7 +664,7 @@ static inline bool lsp_transport_parse_frame(zval *message)
 	bool has_length = false;
 
 	if (!lsp_rx_buffer.s) {
-		return false;
+		return LSP_FRAME_INCOMPLETE;
 	}
 
 	data = ZSTR_VAL(lsp_rx_buffer.s) + lsp_rx_offset;
@@ -566,7 +674,7 @@ static inline bool lsp_transport_parse_frame(zval *message)
 	while ((size_t) (line_start - data) < available) {
 		line_end = memchr(line_start, '\n', available - (line_start - data));
 		if (!line_end) {
-			return false;
+			return LSP_FRAME_INCOMPLETE;
 		}
 
 		if (line_start == line_end || (line_end - line_start == 1 && line_start[0] == '\r')) {
@@ -588,14 +696,16 @@ static inline bool lsp_transport_parse_frame(zval *message)
 		if (headers_end) {
 			/* Skip a malformed frame header so the stream can resynchronize. */
 			lsp_rx_offset += headers_end - data;
+
+			return LSP_FRAME_SKIPPED;
 		}
 
-		return false;
+		return LSP_FRAME_INCOMPLETE;
 	}
 
 	header_size = headers_end - data;
 	if (available < header_size + content_length) {
-		return false;
+		return LSP_FRAME_INCOMPLETE;
 	}
 
 	/* The JSON scanner requires a NUL sentinel at body[length]; the framed
@@ -616,19 +726,22 @@ static inline bool lsp_transport_parse_frame(zval *message)
 		}
 		ZVAL_UNDEF(message);
 
-		return false;
+		return LSP_FRAME_SKIPPED;
 	}
 
-	return true;
+	return LSP_FRAME_MESSAGE;
 }
 
 static inline void lsp_transport_drain_frames(void)
 {
+	lsp_frame_result parsed;
 	zval message;
 
 	lsp_transport_ensure_initialized();
-	while (lsp_transport_parse_frame(&message)) {
-		add_next_index_zval(&lsp_pending_messages, &message);
+	while ((parsed = lsp_transport_parse_frame(&message)) != LSP_FRAME_INCOMPLETE) {
+		if (parsed == LSP_FRAME_MESSAGE) {
+			add_next_index_zval(&lsp_pending_messages, &message);
+		}
 	}
 }
 
@@ -770,11 +883,12 @@ static inline int lsp_transport_fill(double timeout_seconds)
 static inline bool lsp_server_has_background_work(lsp_server *server)
 {
 	return server->index_worker_running ||
-		server->phpstan_job.running ||
-		server->psalm_job.running ||
+		lsp_analyzer_job_table_running(&server->phpstan_jobs) ||
+		lsp_analyzer_job_table_running(&server->psalm_jobs) ||
 		server->phpstan_completion_job.running ||
 		server->psalm_completion_job.running ||
-		zend_hash_num_elements(&server->psalm_ls_projects) > 0
+		zend_hash_num_elements(&server->psalm_ls_projects) > 0 ||
+		lsp_runner_pending_count(server) > 0
 	;
 }
 
@@ -989,6 +1103,12 @@ extern bool lsp_protocol_next_message(lsp_server *server, zval *message)
 			return false;
 		}
 
+		/* SIGTERM: stop as if the client had sent exit; teardown still
+		 * runs so caches persist and children are stopped cleanly. */
+		if (lsp_terminate_requested()) {
+			return false;
+		}
+
 		timeout = lsp_server_has_background_work(server) ? 0.05 : -1.0;
 		filled = lsp_transport_fill(timeout);
 		if (filled == 0) {
@@ -1008,7 +1128,7 @@ extern void lsp_document_analyze(lsp_document *document)
 	}
 
 	lsp_document_derived_invalidate(document);
-	lsp_lsparrot_parse_to_zval(&document->lsparrot, document->text, document->uri);
+	lsp_lsparrot_parse_to_zval_ex(&document->lsparrot, document->text, document->uri, false);
 }
 
 extern void lsp_document_derived_invalidate(lsp_document *document)
@@ -1039,7 +1159,7 @@ extern void lsp_document_derived_ensure(lsp_document *document)
 
 	document->derived_namespace = lsp_document_namespace(document->text);
 	document->derived_imports = emalloc(sizeof(HashTable));
-	zend_hash_init(document->derived_imports, 8, NULL, NULL, 0);
+	zend_hash_init(document->derived_imports, 8, NULL, ZVAL_PTR_DTOR, 0);
 	lsp_document_collect_imports(document->text, document->derived_imports);
 	document->derived_import_insert_offset = lsp_import_insert_offset(document->text, &document->derived_import_after_use);
 	document->derived_valid = true;

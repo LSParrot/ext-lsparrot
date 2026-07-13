@@ -704,40 +704,18 @@ static inline zend_string *lsp_psalm_config_append_type_shadow_ignores(zend_stri
 
 extern void lsp_composer_analysis_paths(zend_string *project_root, zval *paths)
 {
-	zend_string *composer_json, *contents;
-	zval decoded, *autoload, *autoload_dev;
+	zval *decoded, *autoload, *autoload_dev;
 
 	array_init(paths);
-	composer_json = lsp_join_path2(project_root, "composer.json");
-	if (!lsp_is_regular_file(composer_json)) {
-		zend_string_release(composer_json);
-
+	decoded = lsp_composer_json_decoded(project_root);
+	if (!decoded) {
 		return;
 	}
 
-	contents = lsp_read_file(composer_json);
-	zend_string_release(composer_json);
-	if (contents == zend_empty_string) {
-		return;
-	}
-
-	ZVAL_UNDEF(&decoded);
-	php_json_decode_ex(&decoded, ZSTR_VAL(contents), ZSTR_LEN(contents), PHP_JSON_OBJECT_AS_ARRAY, 512);
-	zend_string_release(contents);
-	if (Z_TYPE(decoded) != IS_ARRAY) {
-		if (!Z_ISUNDEF(decoded)) {
-			zval_ptr_dtor(&decoded);
-		}
-
-		return;
-	}
-
-	autoload = zend_hash_str_find(Z_ARRVAL(decoded), "autoload", sizeof("autoload") - 1);
-	autoload_dev = zend_hash_str_find(Z_ARRVAL(decoded), "autoload-dev", sizeof("autoload-dev") - 1);
+	autoload = zend_hash_str_find(Z_ARRVAL_P(decoded), "autoload", sizeof("autoload") - 1);
+	autoload_dev = zend_hash_str_find(Z_ARRVAL_P(decoded), "autoload-dev", sizeof("autoload-dev") - 1);
 	lsp_composer_collect_autoload_section(project_root, paths, autoload);
 	lsp_composer_collect_autoload_section(project_root, paths, autoload_dev);
-
-	zval_ptr_dtor(&decoded);
 }
 
 extern bool lsp_composer_project_has_analysis_paths(zend_string *project_root)

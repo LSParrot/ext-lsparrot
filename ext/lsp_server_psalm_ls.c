@@ -36,6 +36,8 @@ typedef struct _lsp_psalm_ls_session {
 	bool running;
 	bool initialized;
 	bool failed;
+	uint32_t restart_count;
+	double started_at;
 	HashTable diagnostics;
 	HashTable pending;
 	lsp_psalm_ls_buffer output_buffer;
@@ -1028,6 +1030,11 @@ static inline void lsp_psalm_ls_reap_session(lsp_server *server, lsp_psalm_ls_se
 		session->failed = true;
 		lsp_process_close(session->pid);
 		session->pid = LSP_INVALID_PROCESS_ID;
+		/* A session that gives up on restarts can linger in the table for
+		 * the rest of the server's life; its pipes must not. */
+		lsp_pipe_close(&session->input_pipe);
+		lsp_pipe_close(&session->output_pipe);
+		lsp_pipe_close(&session->error_pipe);
 		lsp_analyzer_project_state(server, "psalm-ls", session->root, LSP_ANALYZER_PROJECT_ERROR);
 		message = lsp_psalm_ls_error_message(&session->error_buffer);
 		lsp_analyzer_project_status("psalm-ls", "error", ZSTR_VAL(message), session->root);
@@ -1119,6 +1126,25 @@ extern void lsp_psalm_ls_project_destroy(zval *value)
 	}
 }
 
+/* See lsp_runner_close_pipes_in_child: forked index workers must not hold
+ * references to the psalm-ls pipes. */
+extern void lsp_psalm_ls_close_pipes_in_child(lsp_server *server)
+{
+	lsp_psalm_ls_session *session;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(&server->psalm_ls_projects, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		session = (lsp_psalm_ls_session *) Z_PTR_P(value);
+		lsp_pipe_close(&session->input_pipe);
+		lsp_pipe_close(&session->output_pipe);
+		lsp_pipe_close(&session->error_pipe);
+	} ZEND_HASH_FOREACH_END();
+}
+
 extern void lsp_psalm_ls_shutdown_all(lsp_server *server)
 {
 	zval *value;
@@ -1165,11 +1191,34 @@ extern void lsp_psalm_ls_pump(lsp_server *server, double timeout)
 	} while (lsp_psalm_ls_now() < deadline);
 }
 
+#define LSP_PSALM_LS_MAX_RESTARTS 3
+#define LSP_PSALM_LS_RESTART_BACKOFF_SECONDS 5.0
+#define LSP_PSALM_LS_HEALTHY_SECONDS 120.0
+
+static inline void lsp_psalm_ls_replay_open_documents(lsp_server *server, lsp_psalm_ls_session *session)
+{
+	lsp_document *document;
+	zval *value;
+
+	ZEND_HASH_FOREACH_VAL(&server->documents, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		document = (lsp_document *) Z_PTR_P(value);
+		if (document && document->path && lsp_path_is_in_composer_analysis_paths(document->path, session->root)) {
+			lsp_psalm_ls_send_document_open(session, document);
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
 extern bool lsp_psalm_ls_schedule_project(lsp_server *server, zend_string *project_root)
 {
-	lsp_psalm_ls_session *session;
+	lsp_psalm_ls_session *session, *existing_session;
 	zend_string *config, *generated_config;
 	zval value;
+	uint32_t restart_count;
+	bool restarting;
 
 	if (!lsp_psalm_ls_enabled(server)) {
 		return false;
@@ -1179,9 +1228,37 @@ extern bool lsp_psalm_ls_schedule_project(lsp_server *server, zend_string *proje
 		return false;
 	}
 
-	session = lsp_psalm_ls_find_session(server, project_root);
-	if (session) {
-		return true;
+	restarting = false;
+	restart_count = 0;
+	existing_session = lsp_psalm_ls_find_session(server, project_root);
+	if (existing_session) {
+		if (existing_session->running || !existing_session->failed) {
+			return true;
+		}
+
+		/* A run that stayed healthy long enough clears earlier strikes, so
+		 * three crashes spread over a long session don't permanently disable
+		 * the project. */
+		if (existing_session->restart_count > 0 &&
+			lsp_psalm_ls_now() - existing_session->started_at > LSP_PSALM_LS_HEALTHY_SECONDS
+		) {
+			existing_session->restart_count = 0;
+		}
+
+		/* The language server crashed. Restart with a bounded backoff so a
+		 * transient failure recovers while a reproducible crash does not
+		 * spawn processes forever. */
+		if (existing_session->restart_count >= LSP_PSALM_LS_MAX_RESTARTS ||
+			lsp_psalm_ls_now() - existing_session->started_at < LSP_PSALM_LS_RESTART_BACKOFF_SECONDS
+		) {
+			return true;
+		}
+
+		restart_count = existing_session->restart_count + 1;
+		restarting = true;
+		/* The dead session stays in the table (carrying the backoff
+		 * bookkeeping) until the replacement actually starts; a failed spawn
+		 * must not reset the strike counter. */
 	}
 
 	if (server->options.analyzer_auto && server->options.psalm_transport == LSP_PSALM_TRANSPORT_AUTO && !lsp_psalm_ls_project_tool_available(project_root)) {
@@ -1191,6 +1268,10 @@ extern bool lsp_psalm_ls_schedule_project(lsp_server *server, zend_string *proje
 	config = lsp_psalm_config_file(project_root);
 	generated_config = lsp_psalm_ls_config_file(project_root, config, lsp_project_psalm_level(server, project_root), server->options.psalm_live_dead_code_diagnostics);
 	if (!generated_config && !config) {
+		if (restarting && existing_session) {
+			existing_session->restart_count = restart_count;
+			existing_session->started_at = lsp_psalm_ls_now();
+		}
 		lsp_analyzer_project_state(server, "psalm-ls", project_root, LSP_ANALYZER_PROJECT_ERROR);
 		lsp_analyzer_project_status("psalm-ls", "error", "Psalm config file could not be generated; skipping Psalm language server.", project_root);
 
@@ -1209,6 +1290,11 @@ extern bool lsp_psalm_ls_schedule_project(lsp_server *server, zend_string *proje
 	if (!lsp_psalm_ls_start_process(server, session)) {
 		lsp_psalm_ls_session_free(session);
 
+		if (restarting && existing_session) {
+			existing_session->restart_count = restart_count;
+			existing_session->started_at = lsp_psalm_ls_now();
+		}
+
 		if (server->options.psalm_transport == LSP_PSALM_TRANSPORT_AUTO) {
 			return false;
 		}
@@ -1219,12 +1305,19 @@ extern bool lsp_psalm_ls_schedule_project(lsp_server *server, zend_string *proje
 		return true;
 	}
 
+	session->restart_count = restart_count;
+	session->started_at = lsp_psalm_ls_now();
 	ZVAL_PTR(&value, session);
 	zend_hash_update(&server->psalm_ls_projects, project_root, &value);
 	lsp_analyzer_project_state(server, "psalm-ls", project_root, LSP_ANALYZER_PROJECT_RUNNING);
-	lsp_analyzer_project_status("psalm-ls", "running", "Starting Psalm language server.", project_root);
+	lsp_analyzer_project_status("psalm-ls", "running", restarting ? "Restarting Psalm language server." : "Starting Psalm language server.", project_root);
 	lsp_psalm_ls_send_initialize(session);
 	lsp_psalm_ls_pump(server, 0.05);
+
+	if (restarting) {
+		/* The fresh process knows nothing about already-open editors. */
+		lsp_psalm_ls_replay_open_documents(server, session);
+	}
 
 	return true;
 }
@@ -1251,7 +1344,7 @@ extern void lsp_psalm_ls_document_open(lsp_server *server, lsp_document *documen
 	if (session && session->running && !session->initialized) {
 		lsp_psalm_ls_pump(server, 0.05);
 	}
-	if (session) {
+	if (session && session->running) {
 		lsp_psalm_ls_send_document_open(session, document);
 	}
 
@@ -1278,7 +1371,7 @@ extern void lsp_psalm_ls_document_change(lsp_server *server, lsp_document *docum
 	if (session && session->running && !session->initialized) {
 		lsp_psalm_ls_pump(server, 0.05);
 	}
-	if (session) {
+	if (session && session->running) {
 		lsp_psalm_ls_send_document_change(session, document);
 
 		if (session->initialized) {
@@ -1312,7 +1405,7 @@ extern void lsp_psalm_ls_document_save(lsp_server *server, lsp_document *documen
 	if (session && session->running && !session->initialized) {
 		lsp_psalm_ls_pump(server, 0.05);
 	}
-	if (session) {
+	if (session && session->running) {
 		lsp_psalm_ls_send_document_save(session, document);
 		if (session->initialized) {
 			lsp_analyzer_project_state(server, "psalm-ls", project_root, LSP_ANALYZER_PROJECT_RUNNING);

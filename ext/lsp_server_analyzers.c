@@ -69,44 +69,115 @@ static inline bool lsp_is_php_script(zend_string *path)
 	return result;
 }
 
-extern zend_string *lsp_composer_config_string(zend_string *root, const char *key)
+/* composer.json is consulted constantly (vendor-dir resolution walks path
+ * ancestors, analysis-path checks run per request), so decoded documents are
+ * memoized per project root and validated against the file's stat signature
+ * instead of being re-read and re-parsed on every call. */
+static HashTable lsp_composer_cache;
+static bool lsp_composer_cache_live = false;
+
+extern void lsp_composer_cache_clear(void)
 {
-	zend_string *composer_json, *contents, *result = NULL;
-	zval decoded, *config, *value;
+	if (lsp_composer_cache_live) {
+		zend_hash_destroy(&lsp_composer_cache);
+		lsp_composer_cache_live = false;
+	}
+}
 
-	composer_json = lsp_join_path2(root, "composer.json");
+static inline bool lsp_composer_cache_entry_is_fresh(zval *entry, zend_stat_t *st)
+{
+	zval *mtime, *nsec, *size;
 
-	if (!lsp_is_regular_file(composer_json)) {
+	if (!entry || Z_TYPE_P(entry) != IS_ARRAY) {
+		return false;
+	}
+
+	mtime = zend_hash_str_find(Z_ARRVAL_P(entry), "mtime", sizeof("mtime") - 1);
+	nsec = zend_hash_str_find(Z_ARRVAL_P(entry), "mtimeNsec", sizeof("mtimeNsec") - 1);
+	size = zend_hash_str_find(Z_ARRVAL_P(entry), "size", sizeof("size") - 1);
+
+	return mtime && Z_TYPE_P(mtime) == IS_LONG && Z_LVAL_P(mtime) == (zend_long) st->st_mtime &&
+		nsec && Z_TYPE_P(nsec) == IS_LONG && Z_LVAL_P(nsec) == lsp_stat_mtime_nsec(st) &&
+		size && Z_TYPE_P(size) == IS_LONG && Z_LVAL_P(size) == (zend_long) st->st_size
+	;
+}
+
+/* Returns the decoded composer.json for the project root, or NULL when the
+ * file is missing or invalid. The returned zval is BORROWED from the cache:
+ * treat it as read-only and do not release it. */
+extern zval *lsp_composer_json_decoded(zend_string *project_root)
+{
+	zend_string *composer_json, *contents;
+	zend_stat_t st;
+	zval *entry, *data, new_entry, decoded;
+
+	composer_json = lsp_join_path2(project_root, "composer.json");
+	if (VCWD_STAT(ZSTR_VAL(composer_json), &st) != 0 || !S_ISREG(st.st_mode)) {
+		if (lsp_composer_cache_live) {
+			zend_hash_del(&lsp_composer_cache, composer_json);
+		}
 		zend_string_release(composer_json);
 
 		return NULL;
 	}
 
-	contents = lsp_read_file(composer_json);
-	zend_string_release(composer_json);
-
-	if (contents == zend_empty_string) {
-		return NULL;
+	if (!lsp_composer_cache_live) {
+		zend_hash_init(&lsp_composer_cache, 8, NULL, ZVAL_PTR_DTOR, 0);
+		lsp_composer_cache_live = true;
 	}
 
+	entry = zend_hash_find(&lsp_composer_cache, composer_json);
+	if (entry && lsp_composer_cache_entry_is_fresh(entry, &st)) {
+		zend_string_release(composer_json);
+		data = zend_hash_str_find(Z_ARRVAL_P(entry), "data", sizeof("data") - 1);
+
+		return data && Z_TYPE_P(data) == IS_ARRAY ? data : NULL;
+	}
+
+	contents = lsp_read_file(composer_json);
 	ZVAL_UNDEF(&decoded);
-	php_json_decode_ex(&decoded, ZSTR_VAL(contents), ZSTR_LEN(contents), PHP_JSON_OBJECT_AS_ARRAY, 512);
-	zend_string_release(contents);
-	if (Z_TYPE(decoded) != IS_ARRAY) {
+	if (contents != zend_empty_string) {
+		php_json_decode_ex(&decoded, ZSTR_VAL(contents), ZSTR_LEN(contents), PHP_JSON_OBJECT_AS_ARRAY, 512);
+		zend_string_release(contents);
+	}
+
+	array_init(&new_entry);
+	add_assoc_long(&new_entry, "mtime", (zend_long) st.st_mtime);
+	add_assoc_long(&new_entry, "mtimeNsec", lsp_stat_mtime_nsec(&st));
+	add_assoc_long(&new_entry, "size", (zend_long) st.st_size);
+	if (Z_TYPE(decoded) == IS_ARRAY) {
+		add_assoc_zval(&new_entry, "data", &decoded);
+	} else {
+		/* Invalid or non-object composer.json: cache the miss so repeated
+		 * lookups stay cheap until the file changes. */
+		add_assoc_bool(&new_entry, "data", false);
 		if (!Z_ISUNDEF(decoded)) {
 			zval_ptr_dtor(&decoded);
 		}
+	}
 
+	entry = zend_hash_update(&lsp_composer_cache, composer_json, &new_entry);
+	zend_string_release(composer_json);
+	data = zend_hash_str_find(Z_ARRVAL_P(entry), "data", sizeof("data") - 1);
+
+	return data && Z_TYPE_P(data) == IS_ARRAY ? data : NULL;
+}
+
+extern zend_string *lsp_composer_config_string(zend_string *root, const char *key)
+{
+	zend_string *result = NULL;
+	zval *decoded, *config, *value;
+
+	decoded = lsp_composer_json_decoded(root);
+	if (!decoded) {
 		return NULL;
 	}
 
-	config = zend_hash_str_find(Z_ARRVAL(decoded), "config", sizeof("config") - 1);
+	config = zend_hash_str_find(Z_ARRVAL_P(decoded), "config", sizeof("config") - 1);
 	value = config && Z_TYPE_P(config) == IS_ARRAY ? zend_hash_str_find(Z_ARRVAL_P(config), key, strlen(key)) : NULL;
 	if (value && Z_TYPE_P(value) == IS_STRING && Z_STRLEN_P(value) > 0) {
 		result = zend_string_copy(Z_STR_P(value));
 	}
-
-	zval_ptr_dtor(&decoded);
 
 	return result;
 }
@@ -495,6 +566,64 @@ extern zend_string *lsp_document_project_root(lsp_server *server, lsp_document *
 	return zend_string_copy(server->root);
 }
 
+/* Like lsp_line_range but honoring 1-based column bounds when the analyzer
+ * provides them (Psalm's column_from/column_to); PhpStorm-style precise
+ * squiggles instead of whole-line noise. Invalid columns fall back to the
+ * full line. */
+extern void lsp_line_range_columns(zval *range, zend_string *text, zend_long one_based_line, zend_long column_from, zend_long column_to)
+{
+	const char *next;
+	zend_long line = one_based_line > 0 ? one_based_line - 1 : 0, current;
+	zval start, end;
+	size_t offset = 0, line_start, line_end, from_offset, to_offset, length = ZSTR_LEN(text);
+
+	for (current = 0; current < line; current++) {
+		next = memchr(ZSTR_VAL(text) + offset, '\n', length - offset);
+		if (!next) {
+			offset = length;
+			break;
+		}
+
+		offset = (size_t) (next - ZSTR_VAL(text)) + 1;
+	}
+
+	line_start = offset;
+	while (offset < length && ZSTR_VAL(text)[offset] != '\n' && ZSTR_VAL(text)[offset] != '\r') {
+		offset++;
+	}
+	line_end = offset;
+
+	if (column_from < 1 || column_to < column_from) {
+		lsp_line_range(range, text, one_based_line);
+
+		return;
+	}
+
+	from_offset = line_start + (size_t) (column_from - 1);
+	to_offset = line_start + (size_t) (column_to - 1);
+	if (from_offset > line_end) {
+		from_offset = line_end;
+	}
+	if (to_offset > line_end) {
+		to_offset = line_end;
+	}
+	if (to_offset <= from_offset) {
+		lsp_line_range(range, text, one_based_line);
+
+		return;
+	}
+
+	array_init(range);
+	array_init(&start);
+	add_assoc_long(&start, "line", line);
+	add_assoc_long(&start, "character", (zend_long) lsp_byte_offset_to_utf16_units(ZSTR_VAL(text), line_start, from_offset));
+	array_init(&end);
+	add_assoc_long(&end, "line", line);
+	add_assoc_long(&end, "character", (zend_long) lsp_byte_offset_to_utf16_units(ZSTR_VAL(text), line_start, to_offset));
+	add_assoc_zval(range, "start", &start);
+	add_assoc_zval(range, "end", &end);
+}
+
 extern void lsp_line_range(zval *range, zend_string *text, zend_long one_based_line)
 {
 	const char *next;
@@ -524,14 +653,33 @@ extern void lsp_line_range(zval *range, zend_string *text, zend_long one_based_l
 	add_assoc_long(&start, "character", 0);
 	array_init(&end);
 	add_assoc_long(&end, "line", line);
-	add_assoc_long(&end, "character", (zend_long) (end_offset > start_offset ? end_offset - start_offset : 1));
+	add_assoc_long(&end, "character", end_offset > start_offset
+		? lsp_byte_offset_to_utf16_units(ZSTR_VAL(text), start_offset, end_offset)
+		: 1);
 	add_assoc_zval(range, "start", &start);
 	add_assoc_zval(range, "end", &end);
 }
 
+static inline bool lsp_diagnostic_code_contains_ci(zend_string *code, const char *needle)
+{
+	size_t needle_length = strlen(needle), i;
+
+	if (ZSTR_LEN(code) < needle_length) {
+		return false;
+	}
+
+	for (i = 0; i + needle_length <= ZSTR_LEN(code); i++) {
+		if (strncasecmp(ZSTR_VAL(code) + i, needle, needle_length) == 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 extern void lsp_add_analyzer_diagnostic(zval *diagnostics, const char *source, zend_string *message, zend_string *code, zval *range, zend_long severity)
 {
-	zval diagnostic;
+	zval diagnostic, tags;
 
 	array_init(&diagnostic);
 	add_assoc_string(&diagnostic, "source", source);
@@ -539,6 +687,20 @@ extern void lsp_add_analyzer_diagnostic(zval *diagnostics, const char *source, z
 
 	if (code && ZSTR_LEN(code) > 0) {
 		add_assoc_str(&diagnostic, "code", zend_string_copy(code));
+
+		/* Psalm issue types (DeprecatedMethod, UnusedVariable, ...) and
+		 * PHPStan identifiers (method.deprecated, deadCode.unusedVariable)
+		 * map onto LSP DiagnosticTags so editors can strike through or fade
+		 * the offending code. */
+		if (lsp_diagnostic_code_contains_ci(code, "deprecated")) {
+			array_init(&tags);
+			add_next_index_long(&tags, 2);
+			add_assoc_zval(&diagnostic, "tags", &tags);
+		} else if (lsp_diagnostic_code_contains_ci(code, "unused") || lsp_diagnostic_code_contains_ci(code, "deadcode")) {
+			array_init(&tags);
+			add_next_index_long(&tags, 1);
+			add_assoc_zval(&diagnostic, "tags", &tags);
+		}
 	}
 
 	add_assoc_long(&diagnostic, "severity", severity);
@@ -713,9 +875,72 @@ static inline HashTable *lsp_analyzer_project_table(lsp_server *server, const ch
 	return &server->psalm_projects;
 }
 
-static inline lsp_analyzer_job *lsp_analyzer_project_job(lsp_server *server, const char *analyzer)
+extern HashTable *lsp_analyzer_job_table(lsp_server *server, const char *analyzer)
 {
-	return strcmp(analyzer, "phpstan") == 0 ? &server->phpstan_job : &server->psalm_job;
+	return strcmp(analyzer, "phpstan") == 0 ? &server->phpstan_jobs : &server->psalm_jobs;
+}
+
+extern void lsp_analyzer_job_entry_destroy(zval *value)
+{
+	lsp_analyzer_job *job;
+
+	if (Z_TYPE_P(value) != IS_PTR) {
+		return;
+	}
+
+	job = (lsp_analyzer_job *) Z_PTR_P(value);
+	lsp_analyzer_job_destroy(job);
+	efree(job);
+}
+
+extern lsp_analyzer_job *lsp_analyzer_job_slot(lsp_server *server, const char *analyzer, zend_string *project_root)
+{
+	HashTable *jobs = lsp_analyzer_job_table(server, analyzer);
+	lsp_analyzer_job *job;
+	zval *existing, value;
+
+	existing = zend_hash_find(jobs, project_root);
+	if (existing && Z_TYPE_P(existing) == IS_PTR) {
+		return (lsp_analyzer_job *) Z_PTR_P(existing);
+	}
+
+	job = ecalloc(1, sizeof(*job));
+	ZVAL_PTR(&value, job);
+	zend_hash_update(jobs, project_root, &value);
+
+	return job;
+}
+
+static inline uint32_t lsp_analyzer_job_table_running_count(HashTable *jobs)
+{
+	lsp_analyzer_job *job;
+	zval *value;
+	uint32_t count = 0;
+
+	ZEND_HASH_FOREACH_VAL(jobs, value) {
+		if (Z_TYPE_P(value) != IS_PTR) {
+			continue;
+		}
+
+		job = (lsp_analyzer_job *) Z_PTR_P(value);
+		if (job->running && lsp_process_id_valid(job->pid)) {
+			count++;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return count;
+}
+
+extern bool lsp_analyzer_job_table_running(HashTable *jobs)
+{
+	return lsp_analyzer_job_table_running_count(jobs) > 0;
+}
+
+extern uint32_t lsp_analyzer_running_project_jobs(lsp_server *server)
+{
+	return lsp_analyzer_job_table_running_count(&server->phpstan_jobs) +
+		lsp_analyzer_job_table_running_count(&server->psalm_jobs)
+	;
 }
 
 extern zend_string *lsp_analyzer_project_output_file(zend_string *project_root, const char *analyzer)
@@ -794,7 +1019,7 @@ extern bool lsp_start_analyzer_project_job(lsp_server *server, const char *analy
 	zend_string *temporary_file;
 	lsp_process_id pid;
 
-	job = lsp_analyzer_project_job(server, analyzer);
+	job = lsp_analyzer_job_slot(server, analyzer, project_root);
 	if (job->running) {
 		return false;
 	}
@@ -948,9 +1173,16 @@ extern void lsp_analyzer_project_finished(lsp_server *server, const char *analyz
 	}
 }
 
+static void lsp_schedule_workspace_analyzers_root(lsp_server *server, zend_string *root, void *context)
+{
+	(void) context;
+
+	lsp_schedule_workspace_analyzer_projects(server, root, 0);
+}
+
 extern void lsp_schedule_workspace_analyzers(lsp_server *server)
 {
-	lsp_schedule_workspace_analyzer_projects(server, server->root, 0);
+	lsp_workspace_roots_each(server, lsp_schedule_workspace_analyzers_root, NULL);
 }
 
 extern void lsp_schedule_project_analyzers(lsp_server *server, lsp_document *document)

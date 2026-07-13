@@ -102,6 +102,23 @@ static inline bool lsp_process_set_nonblock(lsp_pipe_handle pipe)
 	return fcntl((int) pipe, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+/* Parent-side pipe ends must not leak into later fork+exec children: an
+ * unrelated child holding a stray write end delays EOF detection (a capture
+ * then spins until its deadline), and a stray read end keeps buffers alive. */
+static inline void lsp_process_set_cloexec(lsp_pipe_handle pipe)
+{
+	int flags;
+
+	if (!lsp_pipe_handle_valid(pipe)) {
+		return;
+	}
+
+	flags = fcntl((int) pipe, F_GETFD, 0);
+	if (flags >= 0) {
+		(void) fcntl((int) pipe, F_SETFD, flags | FD_CLOEXEC);
+	}
+}
+
 static inline void lsp_process_child_dup2_or_exit(int source, int target)
 {
 	if (source == target) {
@@ -727,6 +744,9 @@ extern bool lsp_process_spawn_piped(lsp_command *command, zend_string *cwd, lsp_
 	lsp_process_set_nonblock(input_write);
 	lsp_process_set_nonblock(output_read);
 	lsp_process_set_nonblock(error_read);
+	lsp_process_set_cloexec(input_write);
+	lsp_process_set_cloexec(output_read);
+	lsp_process_set_cloexec(error_read);
 	pipes->input = input_write;
 	pipes->output = output_read;
 	pipes->error = error_read;
@@ -843,8 +863,17 @@ extern zend_string *lsp_process_run_capture(lsp_command *command, zend_string *c
 			break;
 		}
 		if (lsp_now_seconds() >= deadline) {
-			lsp_process_terminate(pipes.process);
-			lsp_process_wait(pipes.process, &status);
+			/* The pipes can outlive the child when a descendant inherited
+			 * the write ends. Once the child has been reaped its pid may
+			 * already belong to an unrelated process, so it must never be
+			 * signalled again — just stop reading. */
+			if (!exited) {
+				lsp_process_terminate(pipes.process);
+				if (!lsp_process_wait_timeout(pipes.process, &status, 2.0)) {
+					lsp_process_terminate_force(pipes.process);
+					lsp_process_wait_timeout(pipes.process, &status, 2.0);
+				}
+			}
 			break;
 		}
 		lsp_sleep_milliseconds(10);
@@ -986,4 +1015,68 @@ extern void lsp_process_close(lsp_process_id process)
 #else
 	(void) process;
 #endif
+}
+
+/* ----------------------------------------------------------------------
+ * SIGTERM guard
+ *
+ * Editors commonly stop a language server with SIGTERM. Dying mid-way
+ * through a request or through teardown loses the on-disk index cache and
+ * leaves child processes to escalation timeouts, so while the server loop
+ * owns the process a SIGTERM only records a stop request: the loop exits
+ * gracefully at the next wakeup and teardown runs to completion even when
+ * the signal arrives during it. The previous disposition is restored when
+ * the server returns. SIGKILL remains available as the hard stop.
+ * ---------------------------------------------------------------------- */
+
+static volatile sig_atomic_t lsp_terminate_requested_flag = 0;
+
+#if !defined(_WIN32)
+static struct sigaction lsp_previous_sigterm_action;
+static bool lsp_sigterm_guard_active = false;
+
+static void lsp_sigterm_guard_handler(int signo)
+{
+	(void) signo;
+	lsp_terminate_requested_flag = 1;
+}
+#endif
+
+extern void lsp_terminate_guard_install(void)
+{
+#if !defined(_WIN32)
+	struct sigaction action;
+
+	if (lsp_sigterm_guard_active) {
+		return;
+	}
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = lsp_sigterm_guard_handler;
+	sigemptyset(&action.sa_mask);
+	/* No SA_RESTART: the signal must interrupt poll() so the loop notices
+	 * the stop request promptly. */
+	action.sa_flags = 0;
+	if (sigaction(SIGTERM, &action, &lsp_previous_sigterm_action) == 0) {
+		lsp_sigterm_guard_active = true;
+	}
+#endif
+	lsp_terminate_requested_flag = 0;
+}
+
+extern void lsp_terminate_guard_restore(void)
+{
+#if !defined(_WIN32)
+	if (!lsp_sigterm_guard_active) {
+		return;
+	}
+
+	sigaction(SIGTERM, &lsp_previous_sigterm_action, NULL);
+	lsp_sigterm_guard_active = false;
+#endif
+}
+
+extern bool lsp_terminate_requested(void)
+{
+	return lsp_terminate_requested_flag != 0;
 }

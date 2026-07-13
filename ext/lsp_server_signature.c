@@ -13,15 +13,16 @@
 
 #include "lsp_internal.h"
 
-static inline bool lsp_signature_call_context(zend_string *text, size_t offset, size_t *paren, zend_string **name, size_t *active_parameter)
+static inline bool lsp_signature_call_context(zend_string *text, size_t offset, size_t *paren, zend_string **name, size_t *active_parameter, zend_string **named_argument)
 {
 	const char *value = ZSTR_VAL(text);
-	size_t i, name_start, name_end, depth = 0;
+	size_t i, name_start, name_end, depth = 0, argument_start, cursor;
 	char c;
 
 	*paren = (size_t) -1;
 	*name = NULL;
 	*active_parameter = 0;
+	*named_argument = NULL;
 
 	if (offset == 0) {
 		return false;
@@ -44,6 +45,7 @@ static inline bool lsp_signature_call_context(zend_string *text, size_t offset, 
 		return false;
 	}
 
+	argument_start = *paren + 1;
 	for (i = *paren + 1, depth = 0; i < offset; i++) {
 		if (value[i] == '(' || value[i] == '[' || value[i] == '{') {
 			depth++;
@@ -51,7 +53,22 @@ static inline bool lsp_signature_call_context(zend_string *text, size_t offset, 
 			depth--;
 		} else if (value[i] == ',' && depth == 0) {
 			(*active_parameter)++;
+			argument_start = i + 1;
 		}
+	}
+
+	/* PHP 8 named argument in the slot being typed: `name:` binds a specific
+	 * parameter, so the positional comma count is not the active one. */
+	cursor = argument_start;
+	while (cursor < offset && isspace((unsigned char) value[cursor])) {
+		cursor++;
+	}
+	i = cursor;
+	while (i < offset && (isalnum((unsigned char) value[i]) || value[i] == '_')) {
+		i++;
+	}
+	if (i > cursor && i < offset && value[i] == ':' && (i + 1 >= offset || value[i + 1] != ':')) {
+		*named_argument = zend_string_init(value + cursor, i - cursor, 0);
 	}
 
 	name_end = *paren;
@@ -444,15 +461,46 @@ static inline void lsp_signature_result(zval *return_value, zend_string *label, 
 	add_assoc_long(return_value, "activeParameter", (zend_long) active_parameter);
 }
 
+/* Index of parameter `$name` inside a rendered signature label such as
+ * "function foo(int $a, string $b = '')", or -1 when absent. */
+static inline zend_long lsp_signature_parameter_index(zend_string *label, zend_string *parameter_name)
+{
+	const char *value = ZSTR_VAL(label), *end = value + ZSTR_LEN(label), *open, *p;
+	zend_long index = 0;
+	size_t name_length = ZSTR_LEN(parameter_name);
+
+	open = memchr(value, '(', ZSTR_LEN(label));
+	if (!open) {
+		return -1;
+	}
+
+	for (p = open + 1; p < end; p++) {
+		if (*p != '$') {
+			continue;
+		}
+
+		if ((size_t) (end - p - 1) >= name_length &&
+			memcmp(p + 1, ZSTR_VAL(parameter_name), name_length) == 0 &&
+			(p + 1 + name_length >= end || !(isalnum((unsigned char) p[1 + name_length]) || p[1 + name_length] == '_'))
+		) {
+			return index;
+		}
+
+		index++;
+	}
+
+	return -1;
+}
+
 extern void lsp_lsparrot_signature_help(lsp_server *server, zval *return_value, lsp_document *document, zval *position)
 {
-	zend_long line, character;
-	zend_string *name, *label;
+	zend_long line, character, named_index;
+	zend_string *name, *label, *named_argument;
 	size_t offset, paren = (size_t) -1, active_parameter = 0;
 
 	lsp_position_from_zval(position, &line, &character);
 	offset = lsp_offset_at(document->text, line, character);
-	if (!lsp_signature_call_context(document->text, offset, &paren, &name, &active_parameter)) {
+	if (!lsp_signature_call_context(document->text, offset, &paren, &name, &active_parameter, &named_argument)) {
 		ZVAL_NULL(return_value);
 
 		return;
@@ -469,6 +517,14 @@ extern void lsp_lsparrot_signature_help(lsp_server *server, zval *return_value, 
 
 	if (!label) {
 		label = strpprintf(0, "%s(...)", ZSTR_VAL(name));
+	}
+
+	if (named_argument) {
+		named_index = lsp_signature_parameter_index(label, named_argument);
+		if (named_index >= 0) {
+			active_parameter = (size_t) named_index;
+		}
+		zend_string_release(named_argument);
 	}
 
 	lsp_signature_result(return_value, label, active_parameter);
