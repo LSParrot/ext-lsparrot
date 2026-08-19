@@ -209,7 +209,7 @@ jobs:
           perl -0ne 'exit(!(m|\/\*\s*LSPARROT_[BV]ERSION_BEGIN\s*\*\/\s*"\Q$ENV{RELEASE_VERSION}\E"\s*\/\*\s*LSPARROT_VERSION_END\s*\*\/|))' ext/php_lsparrot.h
       - name: Build and upload PIE binary
         id: pie-builder
-        uses: php/pie-ext-binary-builder@5298761950f63c7e9565ed7004e922b346e4386c # 0.0.3
+        uses: php/pie-ext-binary-builder@cbe134360897f23793f23c2edc7602261d205a25 # 0.0.4
         with:
           release-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
