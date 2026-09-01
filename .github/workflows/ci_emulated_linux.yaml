@@ -34,7 +34,7 @@ jobs:
           tar -xzf "${ARCHIVE_PATH}" --strip-components=1 -C "${GITHUB_WORKSPACE}"
           rm -f "${ARCHIVE_PATH}"
       - name: Setup QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
         with:
           platforms: "s390x"
           cache-image: false
