@@ -18,7 +18,7 @@ on:
         type: string
 jobs:
   init:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       needs-init: ${{ steps.check.outputs.needs-init }}
     steps:
@@ -117,7 +117,7 @@ jobs:
     needs:
       - init
       - coverage
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     if: github.ref == 'refs/heads/main'
     environment:
       name: github-pages
