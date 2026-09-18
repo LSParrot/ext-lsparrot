@@ -14,7 +14,7 @@ on:
 jobs:
   disabled:
     if: ${{ false }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - run: echo "This reusable workflow is disabled until the next version."
   # init:
